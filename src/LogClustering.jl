@@ -1,5 +1,8 @@
 module LogClustering
 
-    include("KATE.jl")
+include("KATE.jl")
+using .KATE
 
-end # module
+export KATE
+
+end # module LogClustering
