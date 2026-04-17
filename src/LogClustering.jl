@@ -21,8 +21,14 @@ using .SeqLSTM
 include("Eval/Metrics.jl")
 using .Metrics
 
+include("Eval/Compression.jl")
+using .Compression
+
 include("Eval/Harness.jl")
 using .Harness
+
+include("Eval/CV.jl")
+using .CV
 
 include("Cluster/Sparsity.jl")
 using .Sparsity
@@ -34,6 +40,6 @@ include("Rust.jl")
 using .Rust
 
 export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM,
-       Metrics, Harness, Sparsity, Pipeline, Rust
+       Metrics, Compression, Harness, CV, Sparsity, Pipeline, Rust
 
 end # module LogClustering
