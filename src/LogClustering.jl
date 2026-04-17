@@ -30,6 +30,9 @@ using .Harness
 include("Eval/CV.jl")
 using .CV
 
+include("Parsers/Drain.jl")
+using .Drain3
+
 include("Cluster/Sparsity.jl")
 using .Sparsity
 
@@ -40,7 +43,8 @@ include("Rust.jl")
 using .Rust
 
 export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM,
-       Metrics, Compression, Harness, CV, Sparsity, Pipeline, Rust
+       Metrics, Compression, Harness, CV, Sparsity, Pipeline,
+       Drain3, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
