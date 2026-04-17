@@ -13,6 +13,7 @@ using LogClustering
     include("test_preproc.jl")
     include("test_featurise.jl")
     include("test_episodes.jl")
+    include("test_baselines.jl")
     include("test_eval.jl")
     include("test_compression.jl")
     include("test_cv.jl")

@@ -182,8 +182,19 @@ miners (ported from Quellcode 3.11–3.14):
 
 Both accept seed `prefixes`, and both are pure-Julia (no Rust crossing)
 since the inner loops are already vector-index operations on `Vector{Int}`.
-PrefixSpan / SPADE / CM-SPADE remain on the roadmap as external
-baselines to compare against.
+
+**Baselines landed.** `src/Mining/Baselines.jl` adds [`prefixspan`]
+(Pei et al. 2001), [`spade`] (Zaki 2001), and [`cmspade`]
+(Fournier-Viger et al. 2014), all adapted to single-sequence
+serial-episode mining with the same `(sequence; min_sup, max_gap,
+max_time_duration)` keyword surface as `mv_span`. Output shape
+matches `mv_span`'s (`OrderedDict{Vector{Int}, Vector{Vector{Int}}}`)
+so the four miners are directly comparable. They use strictly
+non-overlapping minimal occurrences (a more conservative count than
+MV-Span's), which means each baseline's pattern *set* may differ
+from MV-Span's even on the same input — that difference is
+exactly the methodological lever the comparison was meant to
+expose.
 
 ### Stage E — Clustering & downstream
 
@@ -388,7 +399,8 @@ src/
   Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl, Embedders.jl,
           SeqLSTM.jl (ported, thesis §3.2.8), SeqTransformer.jl, SeqMamba.jl}
   Cluster/{Pipeline.jl, Sparsity.jl}
-  Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, ported)
+  Mining/{Episodes.jl,              # MV-Span / MT-Span (thesis §3.2.7, ported)
+          Baselines.jl}             # PrefixSpan, SPADE, CM-SPADE (Stage E baselines)
   Anomaly/{Instance.jl (ported, thesis §3.2.5), Sequence.jl}
   RCA/{Graph.jl, CausalDiscovery.jl}
   Eval/{Metrics.jl, Harness.jl, CV.jl}

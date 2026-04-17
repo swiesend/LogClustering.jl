@@ -24,6 +24,9 @@ using .Featurise
 include("Mining/Episodes.jl")
 using .Episodes
 
+include("Mining/Baselines.jl")
+using .Baselines
+
 include("Anomaly/Instance.jl")
 using .Instance
 
@@ -77,9 +80,9 @@ include("Cluster/Pipeline.jl")
 using .Pipeline
 
 export KATE, DeepKATE, Framing, Masking, Dedup, Featurise, Episodes,
-       Instance, SeqLSTM, VQVAE, SimCSE, Metrics, Compression, Harness,
-       CV, Sparsity, Pipeline, Drain3, Canonical, Persistence,
-       PersistenceGlue, AutoTune, CLI, Rust
+       Baselines, Instance, SeqLSTM, VQVAE, SimCSE, Metrics,
+       Compression, Harness, CV, Sparsity, Pipeline, Drain3, Canonical,
+       Persistence, PersistenceGlue, AutoTune, CLI, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
