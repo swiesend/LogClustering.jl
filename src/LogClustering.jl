@@ -27,6 +27,9 @@ using .Instance
 include("Models/SeqLSTM.jl")
 using .SeqLSTM
 
+include("Models/VQVAE.jl")
+using .VQVAE
+
 include("Eval/Metrics.jl")
 using .Metrics
 
@@ -52,7 +55,7 @@ include("Cluster/Pipeline.jl")
 using .Pipeline
 
 export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
-       SeqLSTM, Metrics, Compression, Harness, CV, Sparsity, Pipeline,
+       SeqLSTM, VQVAE, Metrics, Compression, Harness, CV, Sparsity, Pipeline,
        Drain3, Canonical, Rust
 
 # ---------------------------------------------------------------------------
