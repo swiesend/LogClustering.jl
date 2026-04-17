@@ -18,9 +18,16 @@ using .Instance
 include("Models/SeqLSTM.jl")
 using .SeqLSTM
 
+include("Eval/Metrics.jl")
+using .Metrics
+
+include("Eval/Harness.jl")
+using .Harness
+
 include("Rust.jl")
 using .Rust
 
-export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM, Rust
+export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM,
+       Metrics, Harness, Rust
 
 end # module LogClustering
