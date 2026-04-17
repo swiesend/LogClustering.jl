@@ -2,66 +2,192 @@
     SeqLSTM
 
 Port of the thesis's next-event predictor (§3.2.8, *Eventvoraussage*) to
-Lux. The original model used Flux.jl LSTMs wrapped in a custom
-`Parallel` struct to build bi-directional stacks; Lux provides both
-[`Lux.Recurrence`](@ref) and [`Lux.BidirectionalRNN`](@ref) natively, so
-the port is a thin layer.
+Lux, with the thesis's bi-directional and peephole variants included.
 
-`seq_lstm(vocab_size; hidden, bidirectional)` returns a Lux `Chain`
-whose forward takes a `(sequence_length, batch)` matrix of 1-based
-event ids and emits `(vocab_size, batch)` unnormalised logits over the
-next event.
-
-Training / prediction helpers:
-
-- [`seq_lstm_loss`] — cross-entropy between the final logits of a
-  length-`T` sliced input `(1:T-1, :)` and the last-event target
-  `sequence[T, :]`. Matches the thesis's "predict the next event in a
-  window" objective.
-- [`predict_next`] — argmax of the softmax over the logits (useful for
-  qualitative inspection; stochastic sampling is trivially expressed
-  on top of the logits via `softmax`).
-
-Peephole LSTM (Gers & Schmidhuber 2000, thesis ref [22]) is still TODO
-— Lux's stock `LSTMCell` is the plain Hochreiter & Schmidhuber 1997
-variant, which is what the thesis compared against.
+- [`seq_lstm`] is the main entry point; `bidirectional=true` stacks two
+  Lux `LSTMCell`s inside a `BidirectionalRNN` and pools the last time
+  step, while `peephole=true` swaps the cell for [`PeepholeLSTM`], the
+  Gers & Schmidhuber 2000 variant.
+- [`PeepholeLSTM`] is a full-sequence layer (not a Lux `AbstractRecurrentCell`)
+  implementing peephole gates `i`, `f`, `o` with per-unit diagonal
+  weights `V_i`, `V_f`, `V_o` from the cell state.
+- [`seq_lstm_loss`] — negative log-likelihood of `sequence[end, :]`
+  given `sequence[1:end-1, :]`.
+- [`predict_next`] — greedy argmax over the softmax of the logits.
 """
 module SeqLSTM
 
 using Lux
+using LuxCore: LuxCore, AbstractLuxLayer
 using Random
 using Statistics
-using NNlib: logsoftmax
+using WeightInitializers: glorot_uniform, zeros32
+using NNlib: logsoftmax, sigmoid
 
-export seq_lstm, seq_lstm_loss, predict_next
+export seq_lstm, seq_lstm_loss, predict_next, PeepholeLSTM
 
 # ---------------------------------------------------------------------------
-# Model
+# Peephole LSTM (thesis ref [22]: Gers & Schmidhuber 2000)
 # ---------------------------------------------------------------------------
 
 """
-    seq_lstm(vocab_size; embed = 32, hidden = 64) -> Chain
+    PeepholeLSTM(in => out; init_weight = glorot_uniform,
+                 init_peep = glorot_uniform, init_bias = zeros32)
 
-Build a next-event predictor for a vocabulary of `vocab_size` distinct
-events. Input: `(sequence_length, batch)` integer matrix of 1-based ids.
-Output: `(vocab_size, batch)` logits over the next event.
+Peephole LSTM (Gers & Schmidhuber 2000). Runs the recurrence internally
+over the whole sequence and returns only the final hidden state, mirroring
+`Lux.Recurrence(LSTMCell(...); return_sequence = false)`.
 
-`embed` is the embedding dimension, `hidden` the LSTM hidden size.
+Gate equations:
 
-A bi-directional variant using [`Lux.BidirectionalRNN`](@ref) is still
-open — Lux's `BidirectionalRNN` returns a 3-D `(features, seq, batch)`
-tensor that needs a pooling step before the projection head. That
-plumbing plus the thesis's peephole LSTM (Gers & Schmidhuber 2000,
-thesis ref [22]) will land in a follow-up.
+```
+i = σ(W_i·x + U_i·h + V_i ⊙ c_{t-1} + b_i)
+f = σ(W_f·x + U_f·h + V_f ⊙ c_{t-1} + b_f)
+c̃ = tanh(W_c·x + U_c·h + b_c)
+c = f ⊙ c_{t-1} + i ⊙ c̃
+o = σ(W_o·x + U_o·h + V_o ⊙ c + b_o)       (peephole on *current* c)
+h = o ⊙ tanh(c)
+```
+
+Parameters: `weight_i` `(4·out, in)`, `weight_h` `(4·out, out)`,
+`peep_i`/`peep_f`/`peep_o` `(out,)`, `bias` `(4·out,)`. Input shape
+`(in, T, batch)`; output shape `(out, batch)`.
+"""
+struct PeepholeLSTM{IW, HW, PV, BI} <: AbstractLuxLayer
+    in_dims::Int
+    out_dims::Int
+    init_weight::IW
+    init_peep::PV
+    init_hidden::HW
+    init_bias::BI
+end
+
+function PeepholeLSTM(
+    pair::Pair{<:Integer, <:Integer};
+    init_weight = glorot_uniform,
+    init_peep = glorot_uniform,
+    init_bias = zeros32,
+)
+    return PeepholeLSTM(Int(pair.first), Int(pair.second),
+                        init_weight, init_peep, init_weight, init_bias)
+end
+
+function LuxCore.initialparameters(rng::AbstractRNG, l::PeepholeLSTM)
+    H, I = l.out_dims, l.in_dims
+    return (
+        weight_i = l.init_weight(rng, 4H, I),
+        weight_h = l.init_hidden(rng, 4H, H),
+        peep_i   = l.init_peep(rng, H),
+        peep_f   = l.init_peep(rng, H),
+        peep_o   = l.init_peep(rng, H),
+        bias     = l.init_bias(rng, 4H),
+    )
+end
+
+LuxCore.initialstates(::AbstractRNG, ::PeepholeLSTM) = NamedTuple()
+LuxCore.parameterlength(l::PeepholeLSTM) =
+    4l.out_dims * (l.in_dims + l.out_dims + 1) + 3l.out_dims
+LuxCore.statelength(::PeepholeLSTM) = 0
+
+function Base.show(io::IO, l::PeepholeLSTM)
+    print(io, "PeepholeLSTM(", l.in_dims, " => ", l.out_dims, ")")
+end
+
+function (l::PeepholeLSTM)(x::AbstractArray{T, 3}, ps, st::NamedTuple) where {T}
+    H = l.out_dims
+    _, seqlen, batch = size(x)
+    h = zeros(T, H, batch)
+    c = zeros(T, H, batch)
+    @inbounds for t in 1:seqlen
+        xt = @view x[:, t, :]
+        z = ps.weight_i * xt .+ ps.weight_h * h .+ ps.bias
+        zi = @view z[1:H, :]
+        zf = @view z[H+1:2H, :]
+        zc = @view z[2H+1:3H, :]
+        zo = @view z[3H+1:4H, :]
+        i = sigmoid.(zi .+ ps.peep_i .* c)
+        f = sigmoid.(zf .+ ps.peep_f .* c)
+        c = f .* c .+ i .* tanh.(zc)
+        o = sigmoid.(zo .+ ps.peep_o .* c)
+        h = o .* tanh.(c)
+    end
+    return h, st
+end
+
+# ---------------------------------------------------------------------------
+# LastTimeStep — tiny pool to collapse (features, T, batch) to (features, batch)
+# ---------------------------------------------------------------------------
+
+"""
+    LastTimeStep()
+
+Return the last element of a `Vector{Matrix}` time sequence (Lux's
+`BidirectionalRNN` output) or the last time slice of a 3-D tensor. Used
+as the pool between a bidirectional recurrence and the projection head.
+"""
+struct LastTimeStep <: AbstractLuxLayer end
+
+LuxCore.initialparameters(::AbstractRNG, ::LastTimeStep) = NamedTuple()
+LuxCore.initialstates(::AbstractRNG, ::LastTimeStep) = NamedTuple()
+LuxCore.parameterlength(::LastTimeStep) = 0
+LuxCore.statelength(::LastTimeStep) = 0
+
+(l::LastTimeStep)(xs::AbstractVector{<:AbstractMatrix}, _, st) = (xs[end], st)
+(l::LastTimeStep)(xs::AbstractArray{<:Any, 3}, _, st) = (xs[:, end, :], st)
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+"""
+    seq_lstm(vocab_size; embed = 32, hidden = 64,
+             bidirectional = false, peephole = false) -> Chain
+
+Build a next-event predictor. Input: `(sequence_length, batch)` integer
+matrix of 1-based ids. Output: `(vocab_size, batch)` logits.
+
+- `bidirectional = true` — stack a Lux `BidirectionalRNN(LSTMCell)` and
+  pool the last time step before the projection (`2·hidden → vocab`).
+- `peephole = true` — swap the stock `LSTMCell` for [`PeepholeLSTM`]
+  (Gers & Schmidhuber 2000).
+- The two flags are orthogonal; enabling both gives a bidirectional
+  peephole LSTM.
 """
 function seq_lstm(vocab_size::Integer;
                   embed::Integer = 32,
-                  hidden::Integer = 64)
+                  hidden::Integer = 64,
+                  bidirectional::Bool = false,
+                  peephole::Bool = false)
+    rnn, proj_in = _rnn_block(Int(embed), Int(hidden), bidirectional, peephole)
     return Chain(
         Embedding(vocab_size => embed),
-        Recurrence(LSTMCell(embed => hidden)),
-        Dense(hidden => vocab_size),
+        rnn,
+        Dense(proj_in => vocab_size),
     )
+end
+
+function _rnn_block(embed::Int, hidden::Int, bidirectional::Bool, peephole::Bool)
+    if bidirectional && peephole
+        # Two independent peephole passes — forward and on a reversed copy.
+        # LastTimeStep on each, then concat over features.
+        return (Parallel(
+            vcat,
+            forward  = PeepholeLSTM(embed => hidden),
+            backward = Chain(
+                ReverseSequence(2),
+                PeepholeLSTM(embed => hidden),
+            ),
+        ), 2 * hidden)
+    elseif bidirectional
+        return (Chain(
+            BidirectionalRNN(LSTMCell(embed => hidden)),
+            LastTimeStep(),
+        ), 2 * hidden)
+    elseif peephole
+        return (PeepholeLSTM(embed => hidden), hidden)
+    else
+        return (Recurrence(LSTMCell(embed => hidden)), hidden)
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -71,10 +197,7 @@ end
 """
     seq_lstm_loss(model, ps, st, sequence) -> (loss, st_new)
 
-Negative log-likelihood of `sequence[end, :]` under the model conditioned
-on `sequence[1:end-1, :]`. `sequence` is a `(T, batch)` integer matrix;
-the function slices off the last row, runs the model, and scores the
-cross-entropy against that row.
+Negative log-likelihood of `sequence[end, :]` given `sequence[1:end-1, :]`.
 """
 function seq_lstm_loss(model, ps, st, sequence::AbstractMatrix{<:Integer})
     T, B = size(sequence)
@@ -83,7 +206,6 @@ function seq_lstm_loss(model, ps, st, sequence::AbstractMatrix{<:Integer})
     targets = @view sequence[T, :]
     logits, st_new = model(inputs, ps, st)
     lp = logsoftmax(logits; dims = 1)
-    # Gather log-probabilities of the correct targets.
     total = zero(eltype(lp))
     @inbounds for b in 1:B
         total -= lp[Int(targets[b]), b]
@@ -94,16 +216,13 @@ end
 """
     predict_next(model, ps, st, sequence) -> Vector{Int}
 
-Greedy next-event prediction: argmax of the softmax over each column of
-the model's logits. `sequence` is a `(T, batch)` matrix of history;
-returns a length-`batch` vector of predicted event ids.
+Greedy next-event argmax.
 """
 function predict_next(model, ps, st, sequence::AbstractMatrix{<:Integer})
     logits, _ = model(sequence, ps, Lux.testmode(st))
     B = size(logits, 2)
     out = Vector{Int}(undef, B)
     @inbounds for b in 1:B
-        # argmax over vocabulary dimension
         best_i = 1
         best_v = logits[1, b]
         for i in 2:size(logits, 1)

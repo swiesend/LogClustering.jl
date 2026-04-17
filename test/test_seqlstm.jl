@@ -3,7 +3,7 @@ using Random
 using Lux
 using Zygote
 using LogClustering
-using LogClustering.SeqLSTM: seq_lstm, seq_lstm_loss, predict_next
+using LogClustering.SeqLSTM: seq_lstm, seq_lstm_loss, predict_next, PeepholeLSTM
 
 const RNG_SEQ = Random.MersenneTwister(11)
 
@@ -84,5 +84,57 @@ end
             final_loss = loss
         end
         @test final_loss < log(2)
+    end
+
+    @testset "PeepholeLSTM layer — forward, parameter shapes, gradients" begin
+        l = PeepholeLSTM(4 => 6)
+        ps, st = Lux.setup(RNG_SEQ, l)
+        @test size(ps.weight_i) == (24, 4)             # 4·out × in
+        @test size(ps.weight_h) == (24, 6)             # 4·out × out
+        @test size(ps.peep_i)   == (6,)
+        @test size(ps.peep_f)   == (6,)
+        @test size(ps.peep_o)   == (6,)
+        @test size(ps.bias)     == (24,)
+
+        x = randn(RNG_SEQ, Float32, 4, 7, 3)            # (in, T, batch)
+        y, _ = l(x, ps, st)
+        @test size(y) == (6, 3)                         # final hidden
+        @test all(isfinite, y)
+
+        g = Zygote.gradient(p -> sum(abs2, first(l(x, p, st))), ps)[1]
+        @test g !== nothing
+        @test any(!iszero, g.weight_i)
+        @test any(!iszero, g.peep_i) || any(!iszero, g.peep_f) || any(!iszero, g.peep_o)
+    end
+
+    @testset "bidirectional seq_lstm — forward shape and differentiability" begin
+        m = seq_lstm(8; embed = 4, hidden = 5, bidirectional = true)
+        ps, st = Lux.setup(RNG_SEQ, m)
+        x = rand(RNG_SEQ, 1:8, 4, 3)
+        y, _ = m(x, ps, st)
+        @test size(y) == (8, 3)
+        seq = rand(RNG_SEQ, 1:8, 4, 2)
+        g = Zygote.gradient(p -> first(seq_lstm_loss(m, p, st, seq)), ps)[1]
+        @test g !== nothing
+    end
+
+    @testset "peephole seq_lstm — forward shape and differentiability" begin
+        m = seq_lstm(8; embed = 4, hidden = 5, peephole = true)
+        ps, st = Lux.setup(RNG_SEQ, m)
+        x = rand(RNG_SEQ, 1:8, 4, 3)
+        y, _ = m(x, ps, st)
+        @test size(y) == (8, 3)
+        seq = rand(RNG_SEQ, 1:8, 4, 2)
+        g = Zygote.gradient(p -> first(seq_lstm_loss(m, p, st, seq)), ps)[1]
+        @test g !== nothing
+    end
+
+    @testset "bidirectional + peephole — forward shape" begin
+        m = seq_lstm(8; embed = 4, hidden = 5,
+                     bidirectional = true, peephole = true)
+        ps, st = Lux.setup(RNG_SEQ, m)
+        x = rand(RNG_SEQ, 1:8, 4, 3)
+        y, _ = m(x, ps, st)
+        @test size(y) == (8, 3)
     end
 end
