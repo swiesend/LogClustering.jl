@@ -33,6 +33,9 @@ using .Instance
 include("Models/SeqLSTM.jl")
 using .SeqLSTM
 
+include("Anomaly/Sequence.jl")
+using .Sequence
+
 include("Models/VQVAE.jl")
 using .VQVAE
 
@@ -89,7 +92,7 @@ include("Cluster/Pipeline.jl")
 using .Pipeline
 
 export KATE, DeepKATE, Framing, Masking, Dedup, Featurise, Episodes,
-       Baselines, Instance, SeqLSTM, VQVAE, SimCSE, Metrics,
+       Baselines, Instance, Sequence, SeqLSTM, VQVAE, SimCSE, Metrics,
        Compression, Harness, CV, Sparsity, Pipeline, Drain3, Canonical,
        Persistence, PersistenceGlue, AutoTune, CLI, Purity, Typing,
        Merge, Rust

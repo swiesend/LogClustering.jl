@@ -5,6 +5,7 @@ using LogClustering
     include("test_KATE.jl")
     include("test_deepkate.jl")
     include("test_anomaly.jl")
+    include("test_anomaly_sequence.jl")
     include("test_value_novelty.jl")
     include("test_seqlstm.jl")
     include("test_vqvae.jl")
