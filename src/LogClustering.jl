@@ -42,4 +42,117 @@ using .Rust
 export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM,
        Metrics, Compression, Harness, CV, Sparsity, Pipeline, Rust
 
+# ---------------------------------------------------------------------------
+# Precompile workload
+# ---------------------------------------------------------------------------
+#
+# `@compile_workload` runs at *precompile* time so the code paths it
+# touches land in the package image and first-call latency in the
+# interactive session drops close to zero. Everything expensive that
+# users actually run on the hot path belongs here; anything that
+# pulls in Python (UMAP, HDBSCAN) or the Rust crate (which may not be
+# built yet) stays out.
+using PrecompileTools: PrecompileTools
+
+PrecompileTools.@setup_workload begin
+    using Random: MersenneTwister
+    using Lux: Lux, Chain, Dense, Embedding, Recurrence, LSTMCell
+    using .Framing: parse_frame
+    using .DeepKATE: deep_kate, deep_kate_loss, latent_layer
+    using .SeqLSTM: seq_lstm, seq_lstm_loss, predict_next, PeepholeLSTM
+    using .KATE: KCompetetive
+    using .Episodes: mv_span, mt_span
+    using .Instance: anomaly_score, reconstruction_error_abs
+    using .Sparsity: sparsity_clusters
+    using .Pipeline: l2_normalise, kmeans_cluster
+    using .Metrics: parsing_accuracy, group_accuracy, grouping_f1,
+                    template_group_f1, nmi, ari, purity, v_measure, to_labels
+    using .Compression: dictionary_size, bpc_gzip, bpc_dictionary,
+                        codebook_perplexity
+    using .CV: time_ordered_split, time_ordered_kfold,
+               per_host_split, stratified_by
+
+    rng = MersenneTwister(0)
+
+    # We skip Zygote-gradient warmup in the precompile workload: Zygote
+    # generates a fresh pullback per call-site, so precompiling one
+    # gradient invocation doesn't help subsequent ones. The TTFX win
+    # comes from baking in the forward + loss paths and the Julia-side
+    # clustering/metric code — Zygote overhead stays but only bites on
+    # each new gradient call-site.
+
+    PrecompileTools.@compile_workload begin
+        # Framing — every source type gets parsed so the @inbounds
+        # byte-dispatch paths precompile.
+        parse_frame("<165>1 2024-01-01T00:00:00Z host app 1 - " *
+                    "[sd@1 k=\"v\"] msg")
+        parse_frame("2024-01-01T00:00:00.000Z stdout F hello")
+        parse_frame("{\"log\":\"x\",\"stream\":\"stdout\",\"time\":\"t\"}")
+        parse_frame("plain text line")
+
+        # DeepKATE — build + forward in testmode (Dropout / KATE
+        # competition bypassed so we don't trip the Lux "training=true
+        # outside autodiff" warning during precompile). The loss path
+        # itself is exercised in the test suite, not here.
+        m = deep_kate(16; latent = 2, k1 = 4)
+        ps, st = Lux.setup(rng, m)
+        st_eval = Lux.testmode(st)
+        x = rand(rng, Float32, 16, 2)
+        m(x, ps, st_eval)
+
+        # SeqLSTM — plain and peephole variants, testmode only.
+        m1 = seq_lstm(8; embed = 4, hidden = 6)
+        ps1, st1 = Lux.setup(rng, m1)
+        st1_eval = Lux.testmode(st1)
+        seq = rand(rng, 1:8, 3, 2)
+        seq_lstm_loss(m1, ps1, st1_eval, seq)
+        predict_next(m1, ps1, st1, seq)
+
+        m2 = seq_lstm(8; embed = 4, hidden = 6, peephole = true)
+        ps2, st2 = Lux.setup(rng, m2)
+        seq_lstm_loss(m2, ps2, Lux.testmode(st2), seq)
+
+        # Episode miners on a tiny sequence.
+        small = [1, 2, 3, 1, 2, 3]
+        mv_span(small; min_sup = 2)
+        mt_span(small, Dict(1 => 1.0, 2 => 1.0, 3 => 1.0);
+                max_time_duration = 3)
+
+        # Anomaly scoring.
+        anomaly_score(m, ps, st, x;
+                      weights = (abs = 1.0, sq = 1.0, latent = 0.0))
+
+        # Sparsity + Pipeline (Julia-only clusterers).
+        Z = rand(rng, Float32, 4, 10)
+        sparsity_clusters(Z, 2)
+        l2_normalise(Z)
+        kmeans_cluster(Z, 2)
+
+        # Metrics and compression on tiny string / int inputs.
+        pred = ["a", "a", "b", "b"]
+        gold = ["x", "x", "y", "y"]
+        parsing_accuracy(pred, gold)
+        group_accuracy(pred, gold)
+        grouping_f1(pred, gold)
+        template_group_f1(pred, gold)
+        nmi(pred, gold); ari(pred, gold); purity(pred, gold); v_measure(pred, gold)
+        to_labels(pred)
+        dictionary_size(pred)
+        bpc_gzip(["hello world" for _ in 1:4])
+        bpc_dictionary(["hello world" for _ in 1:4], pred)
+        codebook_perplexity(pred)
+
+        # CV splits.
+        time_ordered_split(10)
+        time_ordered_kfold(10, 3)
+        per_host_split(["a", "a", "b", "b", "c"]; held_out = "c")
+        stratified_by(pred; rng = rng)
+
+        # KATE layer on a small input.
+        kl = KCompetetive(8, 4, tanh)
+        psk, stk = Lux.setup(rng, kl)
+        kl(rand(rng, Float32, 8), psk, Lux.testmode(stk))
+    end
+end
+
 end # module LogClustering
