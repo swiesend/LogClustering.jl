@@ -148,6 +148,24 @@ iterations on HDFS (regression test).
 
 ---
 
+### Stage E — Episode mining  *(thesis miners landed)*
+
+**Decision.** `src/Mining/Episodes.jl` ships the thesis's two serial-episode
+miners (ported from Quellcode 3.11–3.14):
+
+- **MV-Span** — SPADE-style depth-first prefix-growth over a
+  pseudo-projected vertical database. Constraints: `min_sup`,
+  `min_utility` (external / local / average), `max_repetitions`,
+  `max_gap`, `max_time_duration`; `result_set ∈ {:all, :closed}`.
+- **MT-Span** — TSpan-derived prefix-growth with EWU + IESC upper-bound
+  pruning. Returns `(moSet, hueSet)` — minimal occurrences and the
+  high-utility episode set.
+
+Both accept seed `prefixes`, and both are pure-Julia (no Rust crossing)
+since the inner loops are already vector-index operations on `Vector{Int}`.
+PrefixSpan / SPADE / CM-SPADE remain on the roadmap as external
+baselines to compare against.
+
 ### Stage E — Clustering & downstream
 
 **Decision.** Standard pipeline for every embedder: L2-normalise → UMAP(n=15,
@@ -321,7 +339,7 @@ src/
   Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl, Embedders.jl,
           SeqLSTM.jl, SeqTransformer.jl, SeqMamba.jl}
   Cluster/{Pipeline.jl, Sparsity.jl}
-  Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, TODO)
+  Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, ported)
   Anomaly/{Instance.jl, Sequence.jl}
   RCA/{Graph.jl, CausalDiscovery.jl, LLM.jl}
   Eval/{Metrics.jl, Harness.jl, CV.jl}
