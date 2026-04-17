@@ -181,13 +181,21 @@ end
 
 """
     infer_regex(samples; replacements = String[], wildcard = ".*?",
-                classes = Dict{String,String}()) -> String
+                classes = Dict{String,String}(), align = false) -> String
 
-Log-key regex inference (thesis Algorithm 3.10 + Stage E″ class map).
+Log-key regex inference (thesis Algorithm 3.10 + Stage E″ class map
++ optional anti-unification).
+
 Given `samples`, a list of tokenised log-lines, return a regex that
-matches every sample. Tokens that agree across every sample become
-literals; tokens that differ at the same position become alternations
-`(a|b|c)`.
+matches every sample. By default — `align = false` — samples must be
+position-aligned (every sample has the same length); tokens that agree
+across every sample become literals, tokens that differ at the same
+position become alternations `(a|b|c)`.
+
+Pass `align = true` to run anti-unification first: variable-length
+samples are folded pairwise via LCS, runs of unmatched tokens collapse
+to a single wildcard. This is Stage E″ "anti-unification over aligned
+tokens" from plan 001.
 
 If `replacements` is non-empty, any token containing one of those
 substrings is rewritten to `wildcard` — this collapses descriptive
@@ -196,32 +204,30 @@ placeholders like `%RCE_DATETIME%` into `.*?`.
 If `classes` is non-empty, it maps label names (without the `%` wrappers)
 to tight regexes. A token that is exactly `%LABEL%` and has `LABEL` in
 the map is replaced by the class regex rather than the default wildcard.
-This is the MDL-ladder step described in plan 001 Stage E″: generic
-`.*?` slots are replaced with narrower classes like
-`IP → \\d{1,3}(?:\\.\\d{1,3}){3}` or `NUM → \\d+`.
 
-Adjacent identical wildcard fragments (e.g. `.*?.*?.*?` produced by
-several consecutive label tokens) are coalesced to a single copy, since
-`.*?.*?` and `.*?` match the same language.
+Adjacent identical wildcard fragments are coalesced.
 
 Metacharacters are escaped via the Rust `regex` crate's `escape`
-routine, so the result is safe to compile with RE2/Hyperscan.
+routine; the result is safe to compile with RE2/Hyperscan.
 """
 function infer_regex(
     samples::AbstractVector{<:AbstractVector{<:AbstractString}};
     replacements::AbstractVector{<:AbstractString} = String[],
     wildcard::AbstractString = ".*?",
     classes::AbstractDict = Dict{String, String}(),
+    align::Bool = false,
 )::String
     samples_buf = _encode_samples(samples)
     replacements_buf = _encode_token_list(replacements)
     wildcard_bytes = codeunits(String(wildcard))
     classes_buf = _encode_classes(classes)
 
+    sym_name = align ? :lc_rs_infer_regex_aligned : :lc_rs_infer_regex
+
     lib = _lib()
     handle = Libdl.dlopen(lib)
     try
-        sym_infer = Libdl.dlsym(handle, :lc_rs_infer_regex)
+        sym_infer = Libdl.dlsym(handle, sym_name)
         sym_free = Libdl.dlsym(handle, :lc_rs_free_bytes)
 
         raw = @ccall $sym_infer(

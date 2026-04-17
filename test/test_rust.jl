@@ -89,6 +89,33 @@ else
         @test out == raw"\S+ (x|y)"
     end
 
+    @testset "infer_regex — anti-unification on variable-length samples" begin
+        # Two samples of different length share a prefix and a suffix;
+        # the variable middle collapses to wildcards while the anchor
+        # words survive as literals. Exact whitespace placement in the
+        # emit depends on LCS tie-breaking, so we assert structure
+        # rather than byte-equality.
+        a = ["ERROR", " ", "at", " ", "a", " ", "line", " ", "42"]
+        b = ["ERROR", " ", "at", " ", "b", " ", "extra", " ", "frame",
+             " ", "line", " ", "99"]
+        out = Rust.infer_regex([a, b]; align = true)
+        @test occursin("ERROR", out) && occursin("at", out) && occursin("line", out)
+        @test occursin(".*?", out)
+
+        # Three samples of varying length, same anchor words.
+        s1 = ["user", " ", "login", " ", "ok"]
+        s2 = ["user", " ", "login", " ", "failed"]
+        s3 = ["user", " ", "tried", " ", "login", " ", "failed"]
+        out = Rust.infer_regex([s1, s2, s3]; align = true)
+        @test occursin("user", out)
+        @test occursin("login", out)
+
+        # Position-aligned mode still works on equal-length samples —
+        # anti-unification is opt-in.
+        @test Rust.infer_regex([["a", "b"], ["a", "b"]]; align = false) == "ab"
+        @test Rust.infer_regex([["a", "b"], ["a", "b"]]; align = true)  == "ab"
+    end
+
     @testset "End-to-end: parse_line feeds infer_regex" begin
         # Parse two similar lines into (timestamp label, raw tail) pairs
         # and hand the tokens to infer_regex. The label name is UPPERCASE

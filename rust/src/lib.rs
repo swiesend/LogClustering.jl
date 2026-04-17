@@ -124,6 +124,56 @@ pub unsafe extern "C" fn lc_rs_infer_regex(
     into_raw_bytes(out.into_bytes())
 }
 
+/// Anti-unification variant of [`lc_rs_infer_regex`]. Samples are
+/// aligned pairwise via LCS before position-matching, so variable-
+/// length clusters collapse runs of unmatched tokens to a single
+/// wildcard instead of padding with alternations. All other wire
+/// formats and semantics match `lc_rs_infer_regex`.
+///
+/// # Safety
+/// Same contract as `lc_rs_infer_regex`.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_infer_regex_aligned(
+    samples_ptr: *const u8,
+    samples_len: usize,
+    replacements_ptr: *const u8,
+    replacements_len: usize,
+    wildcard_ptr: *const u8,
+    wildcard_len: usize,
+    classes_ptr: *const u8,
+    classes_len: usize,
+) -> *mut LcBytes {
+    if samples_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let samples = slice::from_raw_parts(samples_ptr, samples_len);
+    let replacements = if replacements_ptr.is_null() || replacements_len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(replacements_ptr, replacements_len)
+    };
+    let wildcard = if wildcard_ptr.is_null() || wildcard_len == 0 {
+        ".*?"
+    } else {
+        match std::str::from_utf8(slice::from_raw_parts(wildcard_ptr, wildcard_len)) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    let classes = if classes_ptr.is_null() || classes_len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(classes_ptr, classes_len)
+    };
+
+    let out = match infer::infer_regex_aligned(samples, replacements, wildcard, classes) {
+        Some(s) => s,
+        None => return std::ptr::null_mut(),
+    };
+
+    into_raw_bytes(out.into_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // parse_line
 // ---------------------------------------------------------------------------

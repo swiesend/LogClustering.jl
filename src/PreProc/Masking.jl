@@ -38,20 +38,22 @@ export DEFAULT_LABELS, DEFAULT_PATTERNS, mask_line, mask_lines
 # ranked earlier.
 
 const DEFAULT_LABELS = [
-    "TIMESTAMP",   # ISO-8601 / RFC-3339
+    "TIMESTAMP",    # ISO-8601 / RFC-3339
     "IPV6",
     "IP",
     "MAC",
     "UUID",
-    "SHA",         # 40- or 64-hex-char checksum
-    "HEX",         # 0x-prefixed hex address
+    "SHA",          # 40- or 64-hex-char checksum
+    "HEX",          # 0x-prefixed hex address
     "URL",
     "EMAIL",
-    "PATH",        # unix path
-    "QUOTED",      # "…" double-quoted string (no embedded escapes handled)
-    "DURATION",    # 42ms / 13.5s / 1h / 2m
-    "SIZE",        # 12KB / 4.5GiB
-    "NUM",
+    "PATH",         # unix path
+    "QUOTED",       # "…" double-quoted string
+    "DURATION",     # 42ms / 13.5s / 1h / 2m
+    "SIZE",         # 12KB / 4.5GiB
+    "DECIMAL_EN",   # 1,234.56  — dot decimal, optional comma thousands
+    "DECIMAL_DE",   # 1.234,56  — comma decimal, optional dot thousands
+    "INT",          # 42 / 1,234 / 1.234 — no fractional part
 ]
 
 const DEFAULT_PATTERNS = [
@@ -66,9 +68,23 @@ const DEFAULT_PATTERNS = [
     raw"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
     raw"(?:^|[\s(\[=])(/[^\s\"<>'\]\)\)]*)",
     raw"\"[^\"]*\"",
-    raw"\b\d+(?:\.\d+)?(?:ms|us|ns|μs|s|m|h|d)\b",
-    raw"\b\d+(?:\.\d+)?(?:[KMGTP]i?B|[kmgtp]b)\b",
-    raw"\b-?\d+(?:\.\d+)?\b",
+    raw"\b\d+(?:[.,]\d+)?(?:ms|us|ns|μs|s|m|h|d)\b",
+    raw"\b\d+(?:[.,]\d+)?(?:[KMGTP]i?B|[kmgtp]b)\b",
+    # DECIMAL_EN: dot decimal, optional comma thousands. To avoid
+    # eating `1.234` (which is a DE-thousands-grouped integer, not an
+    # EN decimal `1.234`), the fractional part must be 1–2 or 4+
+    # digits — i.e. *not* exactly three, the length that collides
+    # with a plain thousands group. The leading `-?\b` and trailing
+    # `\b` stop the regex from chewing partial matches and leaving
+    # digit crumbs behind. Unambiguous shapes still match: `3.14`,
+    # `-0.5`, `1,234.56`, `1,234,567.8901`.
+    raw"-?\b(?:\d{1,3}(?:,\d{3})+|\d+)\.(?:\d{1,2}|\d{4,})\b",
+    # DECIMAL_DE: mirror (dot thousands, comma decimal).
+    raw"-?\b(?:\d{1,3}(?:\.\d{3})+|\d+),(?:\d{1,2}|\d{4,})\b",
+    # INT: plain or thousands-grouped integer. Ranked *after* the two
+    # decimal slots so the ambiguous `1.234` / `1,234` shapes settle
+    # here as integers rather than mis-splitting.
+    raw"-?\b(?:\d{1,3}(?:,\d{3})+|\d{1,3}(?:\.\d{3})+|\d+)\b",
 ]
 
 @assert length(DEFAULT_LABELS) == length(DEFAULT_PATTERNS)

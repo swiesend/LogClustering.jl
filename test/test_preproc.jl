@@ -16,18 +16,32 @@ using LogClustering.Dedup: DedupState, is_new!, dedup, fpr_estimate
         @test mask_line("bytes 4.5KB") == "bytes <SIZE>"
     end
 
-    @testset "ranking puts complex patterns ahead of NUM" begin
-        # IP must beat NUM — four dotted octets must *not* be masked as
-        # four separate <NUM>s.
+    @testset "ranking puts complex patterns ahead of INT/DECIMAL" begin
+        # IP must beat dotted integer groups.
         @test mask_line("from 10.0.0.1 sent") == "from <IP> sent"
-        # Timestamp must beat NUM too.
+        # Timestamp wins over any numeric.
         @test occursin("<TIMESTAMP>",
                       mask_line("ts=2024-01-01T00:00:00Z rest"))
     end
 
+    @testset "INT vs DECIMAL split (EN dot, DE comma, optional thousands)" begin
+        # Plain integers land in INT regardless of locale grouping.
+        @test mask_line("count 42") == "count <INT>"
+        @test mask_line("count 1,234") == "count <INT>"
+        @test mask_line("count 1.234") == "count <INT>"      # DE grouping of plain int
+        # Decimals go to the locale-specific slot.
+        @test mask_line("pi 3.14") == "pi <DECIMAL_EN>"
+        @test mask_line("pi 3,14") == "pi <DECIMAL_DE>"
+        @test mask_line("total 1,234.56") == "total <DECIMAL_EN>"
+        @test mask_line("total 1.234,56") == "total <DECIMAL_DE>"
+        # Signed decimals.
+        @test mask_line("delta -0.5") == "delta <DECIMAL_EN>"
+        @test mask_line("delta -0,5") == "delta <DECIMAL_DE>"
+    end
+
     @testset "template customisation" begin
         @test mask_line("user 42 ok"; template = "%\$LABEL%") ==
-              "user %NUM% ok"
+              "user %INT% ok"
     end
 
     @testset "argument validation" begin

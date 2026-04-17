@@ -12,6 +12,13 @@
 //! rewritten to the *class regex* (e.g. `IP → \d{1,3}(?:\.\d{1,3}){3}`)
 //! instead of the default wildcard. This tightens the inferred regex
 //! without changing the grouping semantics of Algorithm 3.10.
+//!
+//! `align = true` (the `infer_regex_aligned` variant) turns on
+//! anti-unification — samples of different lengths are first aligned
+//! pairwise via LCS, runs of unmatched tokens collapse to a single
+//! wildcard, and the resulting template is then emitted as a regex.
+//! This is the Stage E″ "anti-unification over aligned tokens" step
+//! from plan 001.
 
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
@@ -114,6 +121,27 @@ pub fn infer_regex(
     ))
 }
 
+pub fn infer_regex_aligned(
+    samples_buf: &[u8],
+    replacements_buf: &[u8],
+    wildcard: &str,
+    classes_buf: &[u8],
+) -> Option<String> {
+    let samples = decode_samples(samples_buf)?;
+    let replacements = if replacements_buf.is_empty() {
+        Vec::new()
+    } else {
+        decode_token_list(replacements_buf)?
+    };
+    let classes = decode_classes(classes_buf)?;
+    Some(anti_unify_regex(
+        &samples,
+        &replacements,
+        wildcard,
+        &classes,
+    ))
+}
+
 /// Core algorithm; pub for unit tests.
 pub fn infer_regex_from(
     samples: &[Vec<&str>],
@@ -169,6 +197,142 @@ pub fn infer_regex_from(
         last_emitted = Some(fragment);
     }
     out.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Anti-unification (Stage E″, step 1 of the MDL ladder)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Fragment {
+    Literal(String),
+    Wildcard,
+}
+
+/// Fold the N samples into a single sketch via pairwise LCS. Each pass
+/// aligns the running template against the next sample; runs of
+/// unmatched tokens on either side collapse to one `Wildcard`.
+fn anti_unify(samples: &[Vec<&str>]) -> Vec<Fragment> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut sketch: Vec<Fragment> = samples[0]
+        .iter()
+        .map(|t| Fragment::Literal((*t).to_string()))
+        .collect();
+    for sample in &samples[1..] {
+        sketch = align_and_merge(&sketch, sample);
+    }
+    collapse_wildcards(sketch)
+}
+
+fn anti_unify_regex(
+    samples: &[Vec<&str>],
+    replacements: &[&str],
+    wildcard: &str,
+    classes: &HashMap<&str, &str>,
+) -> String {
+    let label_re = Regex::new(LABEL_PATTERN).expect("static label regex compiles");
+    let exact_re = Regex::new(EXACT_LABEL).expect("static exact label regex compiles");
+    let sketch = anti_unify(samples);
+    let mut out = String::new();
+    for f in &sketch {
+        match f {
+            Fragment::Literal(s) => out.push_str(&encode_word(
+                s,
+                replacements,
+                &label_re,
+                &exact_re,
+                wildcard,
+                classes,
+            )),
+            Fragment::Wildcard => out.push_str(wildcard),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// LCS-align `template` against `sample`; emit a new fragment list
+/// where template literals that match a sample position are kept
+/// verbatim, Wildcard slots are kept, and every run of unmatched
+/// literals (on either side) becomes one Wildcard.
+fn align_and_merge(template: &[Fragment], sample: &[&str]) -> Vec<Fragment> {
+    let pairs = lcs_pairs(template, sample);
+    let mut out = Vec::with_capacity(template.len() + sample.len());
+    let mut ti = 0usize;
+    let mut si = 0usize;
+    for &(tp, sp) in &pairs {
+        if tp > ti || sp > si {
+            out.push(Fragment::Wildcard);
+        }
+        out.push(template[tp].clone());
+        ti = tp + 1;
+        si = sp + 1;
+    }
+    if ti < template.len() || si < sample.len() {
+        out.push(Fragment::Wildcard);
+    }
+    out
+}
+
+/// Longest common subsequence of template fragments and sample tokens.
+/// A Wildcard fragment matches *any* sample token, but with a lower
+/// weight (1) than a literal match (2) — so when a literal at position
+/// `i` could match the same sample token as a wildcard at position
+/// `j`, the alignment keeps the literal and lets the wildcard
+/// straddle the unmatched region. Without this weighting the LCS
+/// would consume leading literals against downstream wildcards.
+fn lcs_pairs(template: &[Fragment], sample: &[&str]) -> Vec<(usize, usize)> {
+    let n = template.len();
+    let m = sample.len();
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in 0..n {
+        for j in 0..m {
+            let w = match_weight(&template[i], sample[j]);
+            let diag = if w > 0 { dp[i][j] + w } else { 0 };
+            dp[i + 1][j + 1] = diag.max(dp[i + 1][j]).max(dp[i][j + 1]);
+        }
+    }
+    let mut i = n;
+    let mut j = m;
+    let mut out = Vec::new();
+    while i > 0 && j > 0 {
+        let w = match_weight(&template[i - 1], sample[j - 1]);
+        if w > 0 && dp[i][j] == dp[i - 1][j - 1] + w {
+            out.push((i - 1, j - 1));
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    out.reverse();
+    out
+}
+
+#[inline]
+fn match_weight(f: &Fragment, token: &str) -> usize {
+    match f {
+        Fragment::Literal(s) if s == token => 2,
+        Fragment::Wildcard => 1,
+        _ => 0,
+    }
+}
+
+fn collapse_wildcards(frags: Vec<Fragment>) -> Vec<Fragment> {
+    let mut out: Vec<Fragment> = Vec::with_capacity(frags.len());
+    for f in frags {
+        if matches!(f, Fragment::Wildcard) && matches!(out.last(), Some(Fragment::Wildcard)) {
+            continue;
+        }
+        out.push(f);
+    }
+    out
 }
 
 fn encode_word(
@@ -326,5 +490,52 @@ mod tests {
         classes.insert("IP", r"\d{1,3}(?:\.\d{1,3}){3}");
         let out = infer_regex_from(&samples, &replacements, ".*?", &classes);
         assert_eq!(out, r"\d{1,3}(?:\.\d{1,3}){3} done");
+    }
+
+    // ---- anti-unification --------------------------------------------------
+
+    #[test]
+    fn anti_unify_identical_samples_returns_literals() {
+        let s = vec!["foo", " ", "bar"];
+        let samples = vec![s.clone(), s];
+        let frags = anti_unify(&samples);
+        assert_eq!(
+            frags,
+            vec![
+                Fragment::Literal("foo".into()),
+                Fragment::Literal(" ".into()),
+                Fragment::Literal("bar".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn anti_unify_length_differ_by_suffix() {
+        // samples: [a, b, c]  vs  [a, b, c, d]
+        // LCS keeps a, b, c; the trailing d becomes a wildcard.
+        let samples = vec![vec!["a", "b", "c"], vec!["a", "b", "c", "d"]];
+        let out = anti_unify_regex(&samples, &[], ".*?", &no_classes());
+        assert_eq!(out, "abc.*?");
+    }
+
+    #[test]
+    fn anti_unify_insertion_in_the_middle() {
+        // samples: [a, x, b]  vs  [a, y, z, b]
+        //                         [a, b]
+        // LCS → a, b literal; everything between collapses to a single wildcard.
+        let samples = vec![
+            vec!["a", "x", "b"],
+            vec!["a", "y", "z", "b"],
+            vec!["a", "b"],
+        ];
+        let out = anti_unify_regex(&samples, &[], ".*?", &no_classes());
+        assert_eq!(out, "a.*?b");
+    }
+
+    #[test]
+    fn anti_unify_no_common_prefix_is_all_wildcard() {
+        let samples = vec![vec!["x"], vec!["y"], vec!["z"]];
+        let out = anti_unify_regex(&samples, &[], ".*?", &no_classes());
+        assert_eq!(out, ".*?");
     }
 }
