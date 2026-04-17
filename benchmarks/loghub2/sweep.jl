@@ -11,7 +11,8 @@ include(joinpath(@__DIR__, "run.jl"))
 using Printf
 
 const DATA_DIR = joinpath(@__DIR__, "data")
-const PARSERS_ORDER = ["identity", "constant", "num_mask", "mask", "drain", "mask+drain"]
+const PARSERS_ORDER = ["identity", "constant", "num_mask", "mask",
+                       "drain", "mask+drain", "our_stack"]
 
 function datasets_found()
     out = String[]

@@ -53,6 +53,24 @@ using LogClustering.Dedup: DedupState, is_new!, dedup, fpr_estimate
         out = mask_lines(lines)
         @test out == ["user <IP> ok", "user <IP> ok"]
     end
+
+    @testset "mask_line_with_values — captures slot values alongside template" begin
+        tpl, vals = Masking.mask_line_with_values("user 42 from 10.0.0.1")
+        @test tpl == "user <INT> from <IP>"
+        @test length(vals) == 2
+        @test vals[1].label == "INT" && vals[1].value == "42"
+        @test vals[2].label == "IP"  && vals[2].value == "10.0.0.1"
+        @test vals[1].start == findfirst("42", "user 42 from 10.0.0.1")[1]
+    end
+
+    @testset "mask_lines_with_values — parallel template + value vectors" begin
+        lines = ["user 10.0.0.1 ok", "user 10.0.0.2 ok"]
+        tpls, vals = Masking.mask_lines_with_values(lines)
+        @test tpls == ["user <IP> ok", "user <IP> ok"]
+        @test length(vals) == 2
+        @test vals[1][1].value == "10.0.0.1"
+        @test vals[2][1].value == "10.0.0.2"
+    end
 end
 
 @testset "PreProc.Dedup" begin

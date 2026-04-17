@@ -25,7 +25,8 @@ module Masking
 
 using ..Rust: Rust
 
-export DEFAULT_LABELS, DEFAULT_PATTERNS, mask_line, mask_lines
+export DEFAULT_LABELS, DEFAULT_PATTERNS, SlotValue,
+       mask_line, mask_lines, mask_line_with_values, mask_lines_with_values
 
 # ---------------------------------------------------------------------------
 # Default typed ranking
@@ -94,6 +95,21 @@ const DEFAULT_PATTERNS = [
 # ---------------------------------------------------------------------------
 
 """
+    SlotValue(label, value, start, stop)
+
+One captured value from [`mask_line_with_values`] — the `label` (e.g.
+`"IP"`), the raw matched substring `value`, and the 1-based inclusive
+byte range `(start, stop)` in the original line. Mirrors the thesis's
+`LogAttr` record (Quellcode 3.5) minus the occurrence-interval wrapper.
+"""
+struct SlotValue
+    label::String
+    value::String
+    start::Int
+    stop::Int
+end
+
+"""
     mask_line(line; labels = DEFAULT_LABELS, patterns = DEFAULT_PATTERNS,
               template = "<\$LABEL>") -> String
 
@@ -131,5 +147,66 @@ row-by-row to the Rust cascade.
 """
 mask_lines(lines::AbstractVector{<:AbstractString}; kwargs...) =
     [mask_line(l; kwargs...) for l in lines]
+
+"""
+    mask_line_with_values(line; labels = DEFAULT_LABELS,
+                          patterns = DEFAULT_PATTERNS,
+                          template = "<\$LABEL>")
+        -> (template::String, values::Vector{SlotValue})
+
+Same masking as [`mask_line`], plus every matched span is returned as
+a [`SlotValue`]. Downstream the template goes to the clustering /
+parser side (stable across value variation) and the values go to the
+embedding / anomaly side (so a never-before-seen IP or an out-of-range
+number still contributes a signal).
+
+```julia
+tpl, vals = mask_line_with_values("user 42 from 10.0.0.1")
+# tpl  = "user <INT> from <IP>"
+# vals = [SlotValue("INT", "42", 6, 7), SlotValue("IP", "10.0.0.1", 14, 21)]
+```
+"""
+function mask_line_with_values(line::AbstractString;
+                               labels::AbstractVector{<:AbstractString} = DEFAULT_LABELS,
+                               patterns::AbstractVector{<:AbstractString} = DEFAULT_PATTERNS,
+                               template::AbstractString = "<\$LABEL>")
+    length(labels) == length(patterns) ||
+        throw(ArgumentError("labels and patterns must have equal length"))
+    spans = Rust.parse_line(line, labels, patterns)
+    io = IOBuffer()
+    values = SlotValue[]
+    @inbounds for s in spans
+        if s.label === nothing
+            write(io, SubString(line, s.start, s.stop))
+        else
+            write(io, replace(template, "\$LABEL" => s.label))
+            push!(values, SlotValue(
+                String(s.label),
+                String(SubString(line, s.start, s.stop)),
+                s.start, s.stop,
+            ))
+        end
+    end
+    return String(take!(io)), values
+end
+
+"""
+    mask_lines_with_values(lines; kwargs...)
+        -> (templates::Vector{String}, values::Vector{Vector{SlotValue}})
+
+Batched [`mask_line_with_values`]. Parallel vectors: `templates[i]`
+pairs with `values[i]`, one slot per match in the original line.
+Keeps the parsed values around for value-level outlier detection.
+"""
+function mask_lines_with_values(lines::AbstractVector{<:AbstractString}; kwargs...)
+    templates = Vector{String}(undef, length(lines))
+    values    = Vector{Vector{SlotValue}}(undef, length(lines))
+    @inbounds for (i, l) in enumerate(lines)
+        t, v = mask_line_with_values(l; kwargs...)
+        templates[i] = t
+        values[i]    = v
+    end
+    return templates, values
+end
 
 end # module Masking

@@ -46,6 +46,34 @@ parse_mask_drain(lines) = parse_all(Drain(), mask_lines(lines))
 "Mask alone: every typed slot collapsed, literal equality groups the rest."
 parse_mask_only(lines) = mask_lines(lines)
 
+"""
+our_stack: typed-slot masking + Drain grouping + `infer_regex`
+(anti-unified) per cluster. Drain decides which lines belong together;
+anti-unification emits the per-cluster template by LCS-aligning its
+members' tokens and collapsing unmatched runs to `.*?`.
+"""
+function parse_our_stack(lines)
+    masked = mask_lines(lines)
+    d = Drain()
+    cluster_ids = Vector{Int}(undef, length(masked))
+    for (i, l) in enumerate(masked)
+        cid, _ = LogClustering.Drain3.process!(d, l)
+        cluster_ids[i] = cid
+    end
+    # Partition masked samples by cluster id and infer one regex each.
+    by_cluster = Dict{Int, Vector{Vector{String}}}()
+    for (l, cid) in zip(masked, cluster_ids)
+        push!(get!(by_cluster, cid, Vector{String}[]), String.(split(l)))
+    end
+    template_of_cluster = Dict{Int, String}()
+    for (cid, samples) in by_cluster
+        template_of_cluster[cid] = length(samples) == 1 ?
+            join(samples[1], " ") :
+            infer_regex(samples; align = true)
+    end
+    return [template_of_cluster[cid] for cid in cluster_ids]
+end
+
 const PARSERS = Dict{String, Function}(
     "identity"   => parse_identity,
     "constant"   => parse_constant,
@@ -53,6 +81,7 @@ const PARSERS = Dict{String, Function}(
     "mask"       => parse_mask_only,
     "drain"      => parse_drain,
     "mask+drain" => parse_mask_drain,
+    "our_stack"  => parse_our_stack,
 )
 
 # ---------------------------------------------------------------------------

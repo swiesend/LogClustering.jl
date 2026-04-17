@@ -43,6 +43,49 @@ using DifferentiationInterface: AutoEnzyme, gradient
 g = gradient(loss, AutoEnzyme(), ps)
 ```
 
+## Is Drain part of the pipeline?
+
+No — Drain ships as a **comparison baseline**, not a component of the
+thesis pipeline. The canonical thesis pipeline is
+`Framing → Masking → parse_line → cluster → infer_regex`, with
+`DeepKATE` / `SeqLSTM` / `Instance` on the embedding side. Drain is
+wired into `benchmarks/loghub2/run.jl` so the LogHub-2.0 sweep can
+quantify the gap between our stack and the field's deterministic
+standard; see [`BASELINES.md`](benchmarks/loghub2/BASELINES.md).
+
+The `our_stack` parser combines both — Drain for grouping, our
+`infer_regex` (anti-unified) for template rendering — and matches
+Drain on every *clustering* metric (GA 99.75, NMI 99.92 on HDFS).
+
+## Value-level outlier detection
+
+Typed-slot masking replaces every `<IP>` / `<INT>` / `<TIMESTAMP>` before
+clustering, so a never-before-seen IP or a wildly out-of-range
+number is invisible to the template-reconstruction score. To catch
+those, use [`Masking.mask_lines_with_values`](src/PreProc/Masking.jl)
+— it returns *both* the templated text (for the AE) and the captured
+slot values (for a separate value-novelty head):
+
+```julia
+using LogClustering.Masking: mask_lines_with_values
+using LogClustering.Instance: ValueNoveltyDetector, update!, combined_anomaly
+
+templates, values = mask_lines_with_values(lines)
+# Templates go into feature extraction → `X = …`
+# Values feed a per-label seen-set + running-mean/variance detector:
+det = ValueNoveltyDetector()
+for vs in train_values; update!(det, vs); end
+
+# Fuse template-reconstruction and value-novelty into one score per line.
+scores = combined_anomaly(model, ps, st, X, test_values, det;
+                          weights = (template = 0.5, values = 0.5))
+```
+
+`weights = (template = 0, values = 1)` gives pure value-outlier
+scoring; `(1, 0)` recovers plain reconstruction. Numeric z-score
+is computed against each label's empirical mean/variance; categorical
+values are flagged when unseen.
+
 ## Documentation
 
 ```sh

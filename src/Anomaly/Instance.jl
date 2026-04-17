@@ -30,9 +30,11 @@ module Instance
 using Lux
 using Statistics
 using ..DeepKATE: latent_layer
+using ..Masking: SlotValue
 
 export reconstruction_error_abs, reconstruction_error_sq,
-       latent_distance, anomaly_score
+       latent_distance, anomaly_score,
+       ValueNoveltyDetector, update!, value_novelty, combined_anomaly
 
 # ---------------------------------------------------------------------------
 # Reconstruction errors
@@ -176,6 +178,161 @@ anomaly_score(model, ps, st, x::AbstractVector; kwargs...) =
     on || return Float64.(s)
     m = maximum(s)
     return m > 0 ? Float64.(s) ./ Float64(m) : Float64.(s)
+end
+
+# ---------------------------------------------------------------------------
+# Value-novelty — catch outliers that the template route hides
+# ---------------------------------------------------------------------------
+#
+# The masking pipeline replaces every typed slot with a `<LABEL>`
+# placeholder before clustering, which means a never-before-seen IP or
+# a wildly out-of-range number looks exactly like every other IP / NUM
+# to the AE. This detector runs *in parallel* to the reconstruction
+# score and flags lines whose slot *values* are new or anomalous
+# within their label's distribution.
+#
+# Two signals:
+# - Novelty (categorical): fraction of slot values never observed for
+#   that label before. Captures new IPs, new user names, new paths.
+# - Range (numeric): absolute z-score of the slot value under the
+#   running mean/variance of its label's empirical distribution.
+#   Captures out-of-range numbers / durations / sizes.
+#
+# Stateful on purpose — calling code decides when to `update!` (e.g.
+# during a training-window pass) and when to score without updating.
+
+"""
+    ValueNoveltyDetector()
+
+Per-label memory of seen values + running mean/variance for numeric
+labels. Call [`update!`] on each training-window line, then
+[`value_novelty`] to score new lines; [`combined_anomaly`] fuses the
+template-reconstruction score with the value-novelty signal.
+"""
+mutable struct ValueNoveltyDetector
+    seen::Dict{String, Set{String}}
+    counts::Dict{String, Int}
+    sum::Dict{String, Float64}
+    sumsq::Dict{String, Float64}
+    n_numeric::Dict{String, Int}
+    ValueNoveltyDetector() = new(
+        Dict{String, Set{String}}(),
+        Dict{String, Int}(),
+        Dict{String, Float64}(),
+        Dict{String, Float64}(),
+        Dict{String, Int}(),
+    )
+end
+
+@inline function _parse_float(s::AbstractString)
+    # Accept both EN `3.14` and DE `3,14` fractional styles. Reject
+    # grouping-only integers that happen to contain separators.
+    s2 = replace(s, ',' => '.')
+    try
+        return parse(Float64, s2)
+    catch
+        return nothing
+    end
+end
+
+"""
+    update!(det::ValueNoveltyDetector, values::Vector{SlotValue})
+
+Fold a line's slot values into the detector's per-label memory. Safe
+to call many times; the detector grows monotonically.
+"""
+function update!(det::ValueNoveltyDetector, values::AbstractVector{SlotValue})
+    @inbounds for v in values
+        push!(get!(det.seen, v.label, Set{String}()), v.value)
+        det.counts[v.label] = get(det.counts, v.label, 0) + 1
+        f = _parse_float(v.value)
+        if f !== nothing
+            det.sum[v.label] = get(det.sum, v.label, 0.0) + f
+            det.sumsq[v.label] = get(det.sumsq, v.label, 0.0) + f * f
+            det.n_numeric[v.label] = get(det.n_numeric, v.label, 0) + 1
+        end
+    end
+    return det
+end
+
+"""
+    value_novelty(det, values; numeric_sigma = 3.0) -> Float64
+
+Score one line's slot values under the detector. Returns a non-negative
+float in `[0, 1+]`:
+
+- Each value not previously seen for its label contributes `1 /
+  |values|`.
+- Each numeric value with running-mean z-score `|z| > numeric_sigma`
+  contributes an additional `min(|z| / numeric_sigma, 1) /
+  |values|`.
+
+`0.0` means every slot is familiar; `≥ 1.0` means every slot is
+either unseen or strongly out-of-range. Call before [`update!`] on
+test-window lines to keep evaluation honest.
+"""
+function value_novelty(det::ValueNoveltyDetector,
+                       values::AbstractVector{SlotValue};
+                       numeric_sigma::Real = 3.0)
+    isempty(values) && return 0.0
+    n = length(values)
+    total = 0.0
+    @inbounds for v in values
+        seen_set = get(det.seen, v.label, nothing)
+        unseen = seen_set === nothing || !(v.value in seen_set)
+        if unseen
+            total += 1.0
+        end
+        f = _parse_float(v.value)
+        if f !== nothing
+            k = get(det.n_numeric, v.label, 0)
+            if k >= 2
+                μ = det.sum[v.label] / k
+                σ² = max(0.0, det.sumsq[v.label] / k - μ^2)
+                σ = sqrt(σ²)
+                if σ > 0
+                    z = abs(f - μ) / σ
+                    if z > numeric_sigma
+                        total += min(z / numeric_sigma, 1.0)
+                    end
+                end
+            end
+        end
+    end
+    return total / n
+end
+
+"""
+    combined_anomaly(model, ps, st, X, per_line_values, det;
+                     weights = (template = 0.5, values = 0.5),
+                     score_kwargs...) -> Vector{Float64}
+
+Weighted combination of the template-reconstruction score
+([`anomaly_score`]) and the [`value_novelty`] signal. `X` is the
+templated-feature matrix (what the AE sees), `per_line_values` is
+the vector-of-vectors of [`SlotValue`]s from
+[`LogClustering.Masking.mask_lines_with_values`], `det` is a
+[`ValueNoveltyDetector`] trained on a clean window. Returns one score
+per sample; higher is more anomalous.
+
+The weights are renormalised internally so `weights.template = 0`
+gives pure value-outlier scoring and `weights.values = 0` recovers
+pure template-reconstruction scoring.
+"""
+function combined_anomaly(model, ps, st, X::AbstractMatrix,
+                          per_line_values::AbstractVector{<:AbstractVector{SlotValue}},
+                          det::ValueNoveltyDetector;
+                          weights = (template = 0.5, values = 0.5),
+                          score_kwargs...)
+    size(X, 2) == length(per_line_values) ||
+        throw(DimensionMismatch("X columns ($(size(X, 2))) != values rows ($(length(per_line_values)))"))
+    template_score = anomaly_score(model, ps, st, X; score_kwargs...)
+    value_score = Float64[value_novelty(det, per_line_values[j])
+                          for j in 1:size(X, 2)]
+    total_w = weights.template + weights.values
+    total_w > 0 || throw(ArgumentError("both weights are zero"))
+    return (weights.template .* Float64.(template_score) .+
+            weights.values   .* value_score) ./ total_w
 end
 
 end # module Instance
