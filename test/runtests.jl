@@ -15,6 +15,7 @@ using LogClustering
     include("test_cv.jl")
     include("test_cluster.jl")
     include("test_drain.jl")
+    include("test_canonical.jl")
     include("test_ad.jl")
     include("test_rust.jl")
 end

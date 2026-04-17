@@ -42,6 +42,9 @@ using .CV
 include("Parsers/Drain.jl")
 using .Drain3
 
+include("PostProc/Canonical.jl")
+using .Canonical
+
 include("Cluster/Sparsity.jl")
 using .Sparsity
 
@@ -50,7 +53,7 @@ using .Pipeline
 
 export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
        SeqLSTM, Metrics, Compression, Harness, CV, Sparsity, Pipeline,
-       Drain3, Rust
+       Drain3, Canonical, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
