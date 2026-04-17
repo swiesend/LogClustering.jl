@@ -18,6 +18,31 @@ anomaly detection, sequence forecasting, episode mining) and
 [`benchmarks/loghub2/`](benchmarks/loghub2) for the LogHub-2.0 bench
 harness.
 
+## Automatic differentiation
+
+The package is AD-backend-agnostic — every loss is just plain Julia +
+`ChainRulesCore.@ignore_derivatives` on the non-differentiable
+boundaries (KATE's sort, DeepKATE's stop-gradient targets). The
+**tested** backend is [`Zygote`](https://github.com/FluxML/Zygote.jl);
+[`DifferentiationInterface`](https://github.com/JuliaDiff/DifferentiationInterface.jl)
+is a dep so users can swap in Enzyme, Mooncake, or ReverseDiff without
+changing the loss code.
+
+Regression tests (`test/test_ad.jl`) verify every loss against
+finite differences — the numerical gold standard — so a future
+backend swap that passes `julia --project -e 'using Test;
+include("test/test_ad.jl")'` agrees with the math, not just with
+itself.
+
+Enzyme isn't currently wired up because it segfaults during precompile
+in the sandbox this branch was developed in; the code is structured
+so adding it is a one-line change:
+
+```julia
+using DifferentiationInterface: AutoEnzyme, gradient
+g = gradient(loss, AutoEnzyme(), ps)
+```
+
 ## Dev-loop tips
 
 - **Full suite via `Pkg.test()` is slow** (~2 min) because it rebuilds
