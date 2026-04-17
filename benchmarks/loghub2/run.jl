@@ -17,6 +17,8 @@
 
 using LogClustering
 using LogClustering.Harness: load_loghub, run_parser, format_report, Dataset
+using LogClustering.Masking: mask_lines
+using LogClustering.Drain3: Drain, parse_all
 using LogClustering.Rust: infer_regex
 
 # ---------------------------------------------------------------------------
@@ -29,20 +31,28 @@ parse_identity(lines) = [String(l) for l in lines]
 "Even more trivial: one global template (floor for template-count)."
 parse_constant(lines) = fill("<*>", length(lines))
 
-"""
-Regex-cluster baseline: digit runs become `<NUM>`, then identical
-literal strings form the template. This is a step between `identity`
-and proper parsers like Drain — useful to sanity-check the metrics.
-"""
+"Regex-cluster baseline: digit runs become `<NUM>`, then literal equality groups."
 function parse_num_mask(lines)
     re = r"\b\d+\b"
     return [replace(String(l), re => "<NUM>") for l in lines]
 end
 
+"Drain3 — the deterministic log-parser baseline. See `src/Parsers/Drain.jl`."
+parse_drain(lines) = parse_all(Drain(), lines)
+
+"Mask-then-Drain: typed-slot masking feeds Drain with a cleaner alphabet."
+parse_mask_drain(lines) = parse_all(Drain(), mask_lines(lines))
+
+"Mask alone: every typed slot collapsed, literal equality groups the rest."
+parse_mask_only(lines) = mask_lines(lines)
+
 const PARSERS = Dict{String, Function}(
-    "identity"  => parse_identity,
-    "constant"  => parse_constant,
-    "num_mask"  => parse_num_mask,
+    "identity"   => parse_identity,
+    "constant"   => parse_constant,
+    "num_mask"   => parse_num_mask,
+    "mask"       => parse_mask_only,
+    "drain"      => parse_drain,
+    "mask+drain" => parse_mask_drain,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,4 +91,6 @@ function main(args)
     println(format_report(report))
 end
 
-isinteractive() || main(ARGS)
+if abspath(PROGRAM_FILE) == @__FILE__
+    main(ARGS)
+end

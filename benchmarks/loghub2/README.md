@@ -79,14 +79,28 @@ Your function must return one template string per input line, in order.
 `run_parser` scores it against the ground truth and prints the
 per-dataset metrics row.
 
-## Current baselines (sanity only)
+## Current baselines
 
-| parser      | notes |
-|-------------|-------|
-| `identity`  | one template per line — floor for PA (0 % on any non-trivial dataset) |
-| `constant`  | one global template (`<*>`) — floor for template count |
-| `num_mask`  | `\\d+ → <NUM>` then literal-string grouping — first non-trivial baseline |
+Six parsers ship in `run.jl`:
 
-The plan's full baseline table (Drain, Brain, LogPPT, LILAC, BGE+HDBSCAN,
-KATE-original, KATE-modernised, VQ-VAE, SimCSE-logs) lands in follow-up
-PRs as each parser gets a concrete implementation or Python binding.
+| parser        | notes |
+|---------------|-------|
+| `identity`    | one template per line — floor for PA |
+| `constant`    | one global `<*>` template — floor for template count |
+| `num_mask`    | `\\d+ → <NUM>` then literal-string grouping |
+| `mask`        | full typed-slot battery (`src/PreProc/Masking.jl`) |
+| `drain`       | Drain3 port (`src/Parsers/Drain.jl`) |
+| `mask+drain`  | typed-slot masking feeding Drain |
+
+Run them all on every downloaded dataset:
+
+```sh
+julia --project benchmarks/loghub2/sweep.jl
+```
+
+prints a Markdown baseline table. The canonical output on HDFS_2k /
+Apache_2k / OpenSSH_2k is committed in [`BASELINES.md`](BASELINES.md).
+
+The plan's full comparison table (adding Brain, LogPPT, LILAC,
+BGE+HDBSCAN, KATE-original, KATE-modernised, VQ-VAE, SimCSE-logs) lands
+in follow-up PRs as each parser gets a concrete implementation.
