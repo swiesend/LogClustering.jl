@@ -21,7 +21,7 @@ using Libdl
 
 export parse_line, infer_regex, Span, ABI_VERSION
 
-const EXPECTED_ABI_VERSION = UInt32(1)
+const EXPECTED_ABI_VERSION = UInt32(2)
 
 # ---------------------------------------------------------------------------
 # Library discovery
@@ -180,16 +180,29 @@ struct _CBytes
 end
 
 """
-    infer_regex(samples; replacements = String[], wildcard = ".*?") -> String
+    infer_regex(samples; replacements = String[], wildcard = ".*?",
+                classes = Dict{String,String}()) -> String
 
-Log-key regex inference (thesis Algorithm 3.10). Given `samples`, a list
-of tokenised log-lines, return a regex that matches every sample. Tokens
-that agree across every sample become literals; tokens that differ at
-the same position become alternations `(a|b|c)`.
+Log-key regex inference (thesis Algorithm 3.10 + Stage E″ class map).
+Given `samples`, a list of tokenised log-lines, return a regex that
+matches every sample. Tokens that agree across every sample become
+literals; tokens that differ at the same position become alternations
+`(a|b|c)`.
 
 If `replacements` is non-empty, any token containing one of those
 substrings is rewritten to `wildcard` — this collapses descriptive
 placeholders like `%RCE_DATETIME%` into `.*?`.
+
+If `classes` is non-empty, it maps label names (without the `%` wrappers)
+to tight regexes. A token that is exactly `%LABEL%` and has `LABEL` in
+the map is replaced by the class regex rather than the default wildcard.
+This is the MDL-ladder step described in plan 001 Stage E″: generic
+`.*?` slots are replaced with narrower classes like
+`IP → \\d{1,3}(?:\\.\\d{1,3}){3}` or `NUM → \\d+`.
+
+Adjacent identical wildcard fragments (e.g. `.*?.*?.*?` produced by
+several consecutive label tokens) are coalesced to a single copy, since
+`.*?.*?` and `.*?` match the same language.
 
 Metacharacters are escaped via the Rust `regex` crate's `escape`
 routine, so the result is safe to compile with RE2/Hyperscan.
@@ -198,10 +211,12 @@ function infer_regex(
     samples::AbstractVector{<:AbstractVector{<:AbstractString}};
     replacements::AbstractVector{<:AbstractString} = String[],
     wildcard::AbstractString = ".*?",
+    classes::AbstractDict = Dict{String, String}(),
 )::String
     samples_buf = _encode_samples(samples)
     replacements_buf = _encode_token_list(replacements)
     wildcard_bytes = codeunits(String(wildcard))
+    classes_buf = _encode_classes(classes)
 
     lib = _lib()
     handle = Libdl.dlopen(lib)
@@ -216,6 +231,8 @@ function infer_regex(
             Csize_t(length(replacements_buf))::Csize_t,
             pointer(wildcard_bytes)::Ptr{UInt8},
             Csize_t(length(wildcard_bytes))::Csize_t,
+            pointer(classes_buf)::Ptr{UInt8},
+            Csize_t(length(classes_buf))::Csize_t,
         )::Ptr{_CBytes}
         raw == C_NULL && error("lc_rs_infer_regex failed (malformed input)")
         try
@@ -227,6 +244,20 @@ function infer_regex(
     finally
         Libdl.dlclose(handle)
     end
+end
+
+function _encode_classes(classes::AbstractDict)
+    out = UInt8[]
+    _push_u32!(out, UInt32(length(classes)))
+    for (k, v) in classes
+        kb = codeunits(String(k))
+        vb = codeunits(String(v))
+        _push_u32!(out, UInt32(length(kb)))
+        append!(out, kb)
+        _push_u32!(out, UInt32(length(vb)))
+        append!(out, vb)
+    end
+    return out
 end
 
 # Wire format: see rust/src/lib.rs — little-endian u32 counts.

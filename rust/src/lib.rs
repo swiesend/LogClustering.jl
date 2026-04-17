@@ -27,7 +27,7 @@ mod parse_line;
 /// layout or function signature changes in a way that breaks callers.
 #[no_mangle]
 pub extern "C" fn lc_rs_abi_version() -> u32 {
-    1
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +61,21 @@ pub struct LcBytes {
 /// `wildcard_ptr` / `wildcard_len` gives the regex fragment substituted for
 /// replacement-token matches. Pass `""` / `0` to use the default `.*?`.
 ///
+/// `classes_buf` is an optional label → tight-regex map (Stage E″ MDL
+/// ladder). Wire format:
+///
+/// ```text
+/// u32 num_classes
+/// num_classes × {
+///     u32 name_len;    u8[name_len]    name
+///     u32 pattern_len; u8[pattern_len] pattern
+/// }
+/// ```
+///
+/// When a token exactly equals `%NAME%` and `NAME` is in the map, the
+/// corresponding pattern is emitted instead of the default wildcard.
+/// Pass `classes_len = 0` to skip.
+///
 /// Returns a heap-allocated `LcBytes` with the result string, or null on
 /// malformed input. The caller must release it with [`lc_rs_free_bytes`].
 ///
@@ -75,6 +90,8 @@ pub unsafe extern "C" fn lc_rs_infer_regex(
     replacements_len: usize,
     wildcard_ptr: *const u8,
     wildcard_len: usize,
+    classes_ptr: *const u8,
+    classes_len: usize,
 ) -> *mut LcBytes {
     if samples_ptr.is_null() {
         return std::ptr::null_mut();
@@ -93,8 +110,13 @@ pub unsafe extern "C" fn lc_rs_infer_regex(
             Err(_) => return std::ptr::null_mut(),
         }
     };
+    let classes = if classes_ptr.is_null() || classes_len == 0 {
+        &[][..]
+    } else {
+        slice::from_raw_parts(classes_ptr, classes_len)
+    };
 
-    let out = match infer::infer_regex(samples, replacements, wildcard) {
+    let out = match infer::infer_regex(samples, replacements, wildcard, classes) {
         Some(s) => s,
         None => return std::ptr::null_mut(),
     };
@@ -259,7 +281,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_1() {
-        assert_eq!(lc_rs_abi_version(), 1);
+    fn abi_version_matches_crate_constant() {
+        // Must equal the version documented in `lc_rs_abi_version`; the
+        // Julia side's `Rust.ABI_VERSION` tracks the same integer.
+        assert_eq!(lc_rs_abi_version(), 2);
     }
 }
