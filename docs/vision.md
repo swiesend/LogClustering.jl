@@ -142,3 +142,6 @@ These are natural follow-ons but dilute the thesis-extension narrative.
 
 - [`plans/001_upgrade-to-2026-stack.md`](plans/001_upgrade-to-2026-stack.md)
   — the concrete staged plan with decisions, modules, and verification.
+- [`plans/002_persistence-autotune-cli.md`](plans/002_persistence-autotune-cli.md)
+  — persistence / auto-tune / CLI: make every trained artifact
+  reproducible, right-sized from data, and usable from a shell.
