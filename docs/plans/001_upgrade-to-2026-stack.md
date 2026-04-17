@@ -156,7 +156,13 @@ log-count normalisation) with a layered, reorderable pipeline.
 **Pre-processing.**
 1. **Structural framing** — strip collector prefix (syslog RFC-5424,
    journald, Kubernetes CRI, Docker JSON-lines). Grammar registry in
-   `PreProc/Framing.jl`.
+   `PreProc/Framing.jl`. *Initial pass landed*: zero-copy
+   recursive-descent parser for RFC 5424 (incl. nested STRUCTURED-DATA
+   with escaped PARAM-VALUEs), Kubernetes CRI, and Docker json-file;
+   `parse_frame` dispatches on the first byte and returns a `Frame` of
+   `SubString` views. Hot-path allocation is constant in input length
+   (≤ 512 B per call, dominated by the returned `Frame` itself).
+   Journald export format is still TODO.
 2. **Unicode NFKC** + optional case folding (preserve case for identifiers).
 3. **Typed-slot masking** — ordered battery of pre-compiled regexes (IP/IPv6,
    MAC, UUID, SHA-1/256 hex, hex-address, paths, URLs, email, ISO/Unix

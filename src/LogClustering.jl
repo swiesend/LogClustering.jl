@@ -3,6 +3,9 @@ module LogClustering
 include("KATE.jl")
 using .KATE
 
-export KATE
+include("PreProc/Framing.jl")
+using .Framing
+
+export KATE, Framing
 
 end # module LogClustering
