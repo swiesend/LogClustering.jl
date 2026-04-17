@@ -2,6 +2,7 @@
 name = "logclustering-py"
 version = "0.1.0"
 description = "Python companion for LogClustering.jl: HuggingFace-only pieces (embedders, UMAP-learn, HDBSCAN, LILAC)."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
@@ -13,16 +14,15 @@ dependencies = [
     "scikit-learn>=1.4",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
 ]
 
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["logclustering_py*"]
+[tool.hatch.build.targets.wheel]
+packages = ["logclustering_py"]

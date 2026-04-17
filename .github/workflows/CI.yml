@@ -43,3 +43,17 @@ jobs:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
         continue-on-error: true
+
+  python:
+    name: Python (uv)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv sync --locked --group dev

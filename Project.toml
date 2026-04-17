@@ -5,7 +5,6 @@ version = "0.2.0-DEV"
 
 [deps]
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-CondaPkg = "992eb4ea-22a4-4c89-a5bb-47a3300528ab"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 LuxCore = "bb33d45b-7691-41d6-9220-0943567d0623"
@@ -16,7 +15,6 @@ WeightInitializers = "d49dbf32-c5c2-4618-8acc-27bb2598ef2d"
 
 [compat]
 ChainRulesCore = "1"
-CondaPkg = "0.2"
 Lux = "1"
 LuxCore = "1"
 PythonCall = "0.9"

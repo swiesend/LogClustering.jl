@@ -1,7 +1,0 @@
-channels = ["conda-forge"]
-
-[deps]
-python = ">=3.10,<3.13"
-
-[pip.deps]
-logclustering-py = { path = "py", editable = true }

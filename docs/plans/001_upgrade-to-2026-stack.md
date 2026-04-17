@@ -45,8 +45,10 @@ non-differentiable boundary — Lux makes that explicit.
   (`.github/workflows/CI.yml`; `appveyor.yml` removed).
 - [x] Add `Manifest.toml` after first successful `Pkg.instantiate()` on
   Julia 1.10.11 (corrects stale `LuxCore` UUID).
-- [x] Wire a `py/` companion project (pyproject.toml + `PythonCall.jl` +
-  `CondaPkg.toml`) for embedders, UMAP-learn, HDBSCAN, LILAC.
+- [x] Wire a `py/` companion project (uv-managed `pyproject.toml` +
+  `uv.lock`, driven through `PythonCall.jl` with
+  `JULIA_CONDAPKG_BACKEND=Null` + `JULIA_PYTHONCALL_EXE` pointing at
+  `py/.venv`) for embedders, UMAP-learn, HDBSCAN, LILAC.
 
 **Files touched.** `Project.toml`, `src/KATE.jl`, `src/LogClustering.jl`,
 `test/runtests.jl`, `test/test_KATE.jl`, `.github/workflows/CI.yml` (new),
