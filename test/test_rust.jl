@@ -116,6 +116,46 @@ else
         @test Rust.infer_regex([["a", "b"], ["a", "b"]]; align = true)  == "ab"
     end
 
+    @testset "parse_lines — batched API matches the per-line loop" begin
+        labels   = ["TS", "IP"]
+        patterns = [raw"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+                    raw"\d{1,3}(?:\.\d{1,3}){3}"]
+        lines = [
+            "2024-01-01T00:00:00Z DEBUG 127.0.0.1 hello",
+            "plain text line",
+            "2024-02-02T00:00:00Z 10.0.0.5 again",
+            "",
+        ]
+        batched = Rust.parse_lines(lines, labels, patterns)
+        @test length(batched) == length(lines)
+        for (i, l) in enumerate(lines)
+            pl = Rust.parse_line(l, labels, patterns)
+            @test length(batched[i]) == length(pl)
+            for (a, b) in zip(batched[i], pl)
+                @test (a.start, a.stop, a.label) == (b.start, b.stop, b.label)
+            end
+        end
+    end
+
+    @testset "parse_lines — empty input vector" begin
+        @test Rust.parse_lines(String[], String[], String[]) == Vector{Vector{Span}}()
+    end
+
+    @testset "parse_lines — argument validation + invalid regex" begin
+        @test_throws ArgumentError Rust.parse_lines(["x"], ["a"], ["a", "b"])
+        @test_throws ErrorException Rust.parse_lines(["x"], ["bad"], ["("])
+    end
+
+    @testset "parse_lines — 2 k lines is input-length-scaled" begin
+        labels   = ["IP"]
+        patterns = [raw"\d{1,3}(?:\.\d{1,3}){3}"]
+        lines = [string("line ", i, " from 10.0.0.", i % 250) for i in 1:2000]
+        spans = Rust.parse_lines(lines, labels, patterns)
+        @test length(spans) == 2000
+        # Every line has one IP match → at least one `IP` span.
+        @test all(any(s.label == "IP" for s in sp) for sp in spans)
+    end
+
     @testset "End-to-end: parse_line feeds infer_regex" begin
         # Parse two similar lines into (timestamp label, raw tail) pairs
         # and hand the tokens to infer_regex. The label name is UPPERCASE

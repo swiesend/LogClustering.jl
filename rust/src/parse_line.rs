@@ -30,6 +30,73 @@ pub fn parse_line(line: &[u8], _labels: &[&str], patterns: &[&str]) -> Option<Ve
     Some(out)
 }
 
+/// Batched form of [`parse_line`]. Compiles the regex battery *once*
+/// and runs it over each line in the packed `lines_buf`; returns a
+/// flat span list tagged with a `line_idx` so the caller can split
+/// back out in O(total_spans).
+///
+/// `lines_buf` wire format: `u32 num_lines` followed by each line as
+/// `u32 len` + `len` UTF-8 bytes.
+pub fn parse_lines(
+    lines_buf: &[u8],
+    _labels: &[&str],
+    patterns: &[&str],
+) -> Option<(Vec<crate::LcLineSpan>, Vec<u32>)> {
+    let compiled: Result<Vec<Regex>, _> = patterns.iter().map(|p| Regex::new(p)).collect();
+    let compiled = compiled.ok()?;
+
+    let lines = decode_lines(lines_buf)?;
+    let mut spans = Vec::with_capacity(lines.len() * 4);
+    // Prefix-sum layout: offsets[i..i+1] brackets the spans for line i.
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    offsets.push(0u32);
+    let mut scratch: Vec<LcSpan> = Vec::new();
+    for (line_idx, line) in lines.iter().enumerate() {
+        scratch.clear();
+        descend(line, 0, &compiled, 0, &mut scratch);
+        scratch.retain(|s| s.end > s.start || s.label_idx >= 0);
+        for s in &scratch {
+            spans.push(crate::LcLineSpan {
+                line_idx: line_idx as u32,
+                start: s.start,
+                end: s.end,
+                label_idx: s.label_idx,
+            });
+        }
+        offsets.push(spans.len() as u32);
+    }
+    Some((spans, offsets))
+}
+
+/// Parse the `u32 num_lines` + length-prefixed lines wire format into
+/// a vector of `&str`s (borrowed from the input buffer).
+fn decode_lines(buf: &[u8]) -> Option<Vec<&str>> {
+    let mut cursor = 0usize;
+    if buf.len() < 4 {
+        return None;
+    }
+    let num = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    cursor += 4;
+    let mut out = Vec::with_capacity(num);
+    for _ in 0..num {
+        if cursor + 4 > buf.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().ok()?) as usize;
+        cursor += 4;
+        if cursor + len > buf.len() {
+            return None;
+        }
+        let s = std::str::from_utf8(&buf[cursor..cursor + len]).ok()?;
+        cursor += len;
+        out.push(s);
+    }
+    if cursor != buf.len() {
+        return None;
+    }
+    Some(out)
+}
+
 fn descend(
     text: &str,
     absolute_offset: u32,

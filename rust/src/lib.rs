@@ -198,6 +198,28 @@ pub struct LcSpans {
     cap: usize,
 }
 
+/// One span tagged with its source-line index for the batched parser.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LcLineSpan {
+    pub line_idx: u32,
+    pub start: u32,
+    pub end: u32,
+    pub label_idx: i32,
+}
+
+#[repr(C)]
+pub struct LcLineSpans {
+    pub spans_ptr: *mut LcLineSpan,
+    pub spans_len: usize,
+    spans_cap: usize,
+    /// Prefix-sum layout: line `i`'s spans are `spans_ptr[offsets[i]..offsets[i+1]]`.
+    /// Has length `num_lines + 1`.
+    pub offsets_ptr: *mut u32,
+    pub offsets_len: usize,
+    offsets_cap: usize,
+}
+
 /// Port of thesis Algorithm 3.1: recursive regex-cascade parser.
 ///
 /// For each `label`, the parser finds all non-overlapping matches of the
@@ -278,6 +300,75 @@ pub unsafe extern "C" fn lc_rs_free_spans(ptr: *mut LcSpans) {
     }
     let b = Box::from_raw(ptr);
     let _ = Vec::from_raw_parts(b.ptr, b.len, b.cap);
+}
+
+/// Release an `LcLineSpans` returned by `lc_rs_parse_lines`. Accepts null.
+///
+/// # Safety
+/// `ptr` must originate from this crate's allocator; never call twice.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_free_line_spans(ptr: *mut LcLineSpans) {
+    if ptr.is_null() {
+        return;
+    }
+    let b = Box::from_raw(ptr);
+    let _ = Vec::from_raw_parts(b.spans_ptr, b.spans_len, b.spans_cap);
+    let _ = Vec::from_raw_parts(b.offsets_ptr, b.offsets_len, b.offsets_cap);
+}
+
+/// Batched form of [`lc_rs_parse_line`]. Compiles each regex once and
+/// runs the cascade over every line in `lines_buf`. Returns a
+/// prefix-sum view: the spans for line `i` are
+/// `spans[offsets[i]..offsets[i+1]]`.
+///
+/// `lines_buf` wire format: `u32 num_lines` followed by each line as
+/// `u32 len` + `len` UTF-8 bytes.
+///
+/// # Safety
+/// - All pointers must be valid for the stated lengths.
+/// - `lines_buf` must encode the wire format above.
+/// - Free with [`lc_rs_free_line_spans`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_parse_lines(
+    lines_buf_ptr: *const u8,
+    lines_buf_len: usize,
+    labels_ptr: *const *const u8,
+    labels_len_ptr: *const usize,
+    patterns_ptr: *const *const u8,
+    patterns_len_ptr: *const usize,
+    num_labels: usize,
+) -> *mut LcLineSpans {
+    if lines_buf_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let buf = slice::from_raw_parts(lines_buf_ptr, lines_buf_len);
+    let labels_names = slice_of_strs(labels_ptr, labels_len_ptr, num_labels);
+    let pattern_strs = slice_of_strs(patterns_ptr, patterns_len_ptr, num_labels);
+    let (labels_names, pattern_strs) = match (labels_names, pattern_strs) {
+        (Some(a), Some(b)) if a.len() == b.len() => (a, b),
+        _ => return std::ptr::null_mut(),
+    };
+    let (mut spans, mut offsets) = match parse_line::parse_lines(buf, &labels_names, &pattern_strs)
+    {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let spans_ptr = spans.as_mut_ptr();
+    let spans_len = spans.len();
+    let spans_cap = spans.capacity();
+    std::mem::forget(spans);
+    let offsets_ptr = offsets.as_mut_ptr();
+    let offsets_len = offsets.len();
+    let offsets_cap = offsets.capacity();
+    std::mem::forget(offsets);
+    Box::into_raw(Box::new(LcLineSpans {
+        spans_ptr,
+        spans_len,
+        spans_cap,
+        offsets_ptr,
+        offsets_len,
+        offsets_cap,
+    }))
 }
 
 // ---------------------------------------------------------------------------
