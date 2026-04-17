@@ -57,6 +57,15 @@ using .Drain3
 include("PostProc/Canonical.jl")
 using .Canonical
 
+include("PostProc/Purity.jl")
+using .Purity
+
+include("PostProc/Typing.jl")
+using .Typing
+
+include("PostProc/Merge.jl")
+using .Merge
+
 include("Persistence.jl")
 using .Persistence
 
@@ -82,7 +91,8 @@ using .Pipeline
 export KATE, DeepKATE, Framing, Masking, Dedup, Featurise, Episodes,
        Baselines, Instance, SeqLSTM, VQVAE, SimCSE, Metrics,
        Compression, Harness, CV, Sparsity, Pipeline, Drain3, Canonical,
-       Persistence, PersistenceGlue, AutoTune, CLI, Rust
+       Persistence, PersistenceGlue, AutoTune, CLI, Purity, Typing,
+       Merge, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload

@@ -20,6 +20,7 @@ using LogClustering
     include("test_cluster.jl")
     include("test_drain.jl")
     include("test_canonical.jl")
+    include("test_postproc.jl")
     include("test_persistence.jl")
     include("test_autotune.jl")
     include("test_cli.jl")
