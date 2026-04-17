@@ -57,6 +57,9 @@ using .Persistence
 include("PersistenceGlue.jl")
 using .PersistenceGlue
 
+include("AutoTune.jl")
+using .AutoTune
+
 function __init__()
     PersistenceGlue.register_all!()
 end
@@ -70,7 +73,7 @@ using .Pipeline
 export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
        SeqLSTM, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
        Sparsity, Pipeline, Drain3, Canonical, Persistence,
-       PersistenceGlue, Rust
+       PersistenceGlue, AutoTune, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
