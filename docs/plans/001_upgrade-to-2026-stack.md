@@ -345,7 +345,7 @@ src/
          Hyperscan.jl, Verify.jl}
   Parsers/{Drain.jl, Brain.jl, LogPPT.jl, LILAC.jl}
   Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl, Embedders.jl,
-          SeqLSTM.jl, SeqTransformer.jl, SeqMamba.jl}
+          SeqLSTM.jl (ported, thesis §3.2.8), SeqTransformer.jl, SeqMamba.jl}
   Cluster/{Pipeline.jl, Sparsity.jl}
   Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, ported)
   Anomaly/{Instance.jl (ported, thesis §3.2.5), Sequence.jl}

@@ -15,9 +15,12 @@ using .Episodes
 include("Anomaly/Instance.jl")
 using .Instance
 
+include("Models/SeqLSTM.jl")
+using .SeqLSTM
+
 include("Rust.jl")
 using .Rust
 
-export KATE, DeepKATE, Framing, Episodes, Instance, Rust
+export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM, Rust
 
 end # module LogClustering

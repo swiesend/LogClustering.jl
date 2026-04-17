@@ -73,7 +73,7 @@ Log ─► Event-Log Parsing ─► Event-Log ─► Event-Log Corpus
 | **Clustering** | Group similar events | HDBSCAN default; k-means + sparsity-based (KATE argmax) as comparators |
 | **Clustering Validierung** | Validate assignment against log-keys | PA/GA/FGA/FTA/NMI/ARI/homogeneity; iterative re-embedding on low-purity clusters |
 | **Episode Mining** | Frequent sequential patterns | Thesis's MV-Span (SPADE-derived, projected vertical DB) + MT-Span (TSpan/EWU/IESC) ported in `src/Mining/Episodes.jl`; PrefixSpan (Pei 2001), SPADE (Zaki 2001), CM-SPADE; Transformer attention-motif mining |
-| **Sequentielles Modell (LSTM)** | Predict next event | Transformer decoder (DeepLog → LogBERT lineage); Mamba/SSM (Gu & Dao 2024); LLM with structured output. LSTM retained as baseline |
+| **Sequentielles Modell (LSTM)** | Predict next event | Transformer decoder (DeepLog → LogBERT lineage); Mamba/SSM (Gu & Dao 2024); LLM with structured output. LSTM baseline ported from the thesis in `src/Models/SeqLSTM.jl` (Lux `Recurrence(LSTMCell)` + `Embedding` + `Dense`; bi-directional + peephole variants TODO) |
 | **Kreuzvalidierung** | k-fold CV | Time-ordered / per-host splits to avoid leakage |
 | **Ausreißererkennung (Instanz)** | Detect anomalous single lines | AE/VQ-VAE reconstruction error; HDBSCAN outlier score; isolation forest; LLM-surprise |
 | **Ausreißererkennung (Sequenz)** | Detect anomalous sequences | DeepLog top-k next-event; LogBERT masked-event surprise; SeqTransformer perplexity |
