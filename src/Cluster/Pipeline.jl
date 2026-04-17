@@ -5,8 +5,10 @@ Standard clustering pipeline for plan 001 Stage E:
 
 ```
 embeddings (D × N)  →  L2-normalise  →  [optional] dim-reduction  →  clusterer
-                                                                     ├── kmeans     (Clustering.jl, native)
-                                                                     └── hdbscan    (PythonCall → hdbscan, lazy)
+                                         ├── umap   (PythonCall → umap-learn)
+                                         └── ...
+                                                                     ├── kmeans    (Clustering.jl, native)
+                                                                     └── hdbscan   (PythonCall → hdbscan)
 ```
 
 For "clustering-via-sparsity" (the KATE argmax alternative) see
@@ -14,13 +16,12 @@ For "clustering-via-sparsity" (the KATE argmax alternative) see
 
 Current implementation:
 - [`l2_normalise`] — column-wise L2 normalisation, pure Julia.
-- [`kmeans_cluster`] — wraps `Clustering.kmeans` (Clustering.jl). Uses
-  k-means++ initialisation and returns a `(assignments, centers,
-  converged)` `NamedTuple`.
-- [`hdbscan_cluster`] — stub that calls Python `hdbscan` via
-  `PythonCall`; raises a clear error when the uv virtualenv isn't
-  wired up (see `py/README.md`). UMAP integration goes in here too
-  once the Python env is present.
+- [`kmeans_cluster`] — wraps `Clustering.kmeans` (Clustering.jl).
+- [`umap_reduce`] — calls `umap-learn` through PythonCall.
+- [`hdbscan_cluster`] — calls `hdbscan` through PythonCall.
+
+The two Python paths raise a clear, actionable error when the uv
+virtualenv under `py/` isn't wired up; see `py/README.md`.
 """
 module Pipeline
 
@@ -29,7 +30,8 @@ using Distances: Distances, pairwise
 using LinearAlgebra: norm
 using Statistics
 
-export l2_normalise, l2_normalise!, kmeans_cluster, hdbscan_cluster
+export l2_normalise, l2_normalise!, kmeans_cluster,
+       umap_reduce, hdbscan_cluster, umap_hdbscan
 
 # ---------------------------------------------------------------------------
 # L2 normalise
@@ -39,8 +41,7 @@ export l2_normalise, l2_normalise!, kmeans_cluster, hdbscan_cluster
     l2_normalise(X::AbstractMatrix; ϵ = 1e-8) -> Matrix
 
 Return a column-normalised copy of `X` — every column has unit `ℓ₂`
-norm. Zero columns are left at zero (guarded by `ϵ` to avoid a divide
-by zero).
+norm. Zero columns are left at zero (guarded by `ϵ`).
 """
 function l2_normalise(X::AbstractMatrix; ϵ::Real = 1e-8)
     out = similar(X, float(eltype(X)))
@@ -74,7 +75,7 @@ end
 
 Thin wrapper over `Clustering.kmeans`. `X` is `(features, samples)`,
 returns 1-based cluster ids, the `(features, k)` centroid matrix, and
-a convergence flag. Uses k-means++ initialisation.
+a convergence flag.
 """
 function kmeans_cluster(X::AbstractMatrix, k::Integer;
                         maxiter::Integer = 100, display::Symbol = :none)
@@ -88,54 +89,149 @@ function kmeans_cluster(X::AbstractMatrix, k::Integer;
 end
 
 # ---------------------------------------------------------------------------
-# HDBSCAN (lazy via PythonCall)
+# PythonCall shared bootstrap
+# ---------------------------------------------------------------------------
+
+const _PY_MOD = Ref{Union{Nothing, Module}}(nothing)
+
+function _require_pythoncall()
+    _PY_MOD[] === nothing || return _PY_MOD[]
+    mod = try
+        Base.require(Base.PkgId(
+            Base.UUID("6099a3de-0909-46bc-b1f4-468b9a2dfc0d"), "PythonCall"))
+    catch err
+        error("""
+            PythonCall failed to load. This happens when the uv virtualenv
+            under `py/` isn't reachable. Sync and re-launch Julia:
+
+                cd py && uv sync && cd ..
+                export JULIA_CONDAPKG_BACKEND=Null
+                export JULIA_PYTHONCALL_EXE=\$(pwd)/py/.venv/bin/python
+                julia --project
+
+            Underlying error: $(sprint(showerror, err))
+        """)
+    end
+    _PY_MOD[] = mod
+    return mod
+end
+
+function _pyimport(py::Module, name::AbstractString, install_hint::AbstractString)
+    try
+        return py.pyimport(name)
+    catch err
+        error("""
+            Could not import Python module `$name`. Install it into the
+            uv virtualenv:
+
+                $install_hint
+
+            Underlying error: $(sprint(showerror, err))
+        """)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# UMAP via umap-learn
+# ---------------------------------------------------------------------------
+
+"""
+    umap_reduce(X::AbstractMatrix; n_neighbors = 15, min_dist = 0.0,
+                n_components = 15, metric = "euclidean",
+                random_state = nothing) -> Matrix{Float64}
+
+Reduce `X` (`features × samples`) to `n_components × samples` via
+Python's `umap-learn` (McInnes & Healy 2018). Defaults match the plan
+Stage E recipe (`n=15, min_dist=0.0`). Requires the uv virtualenv under
+`py/` — see the module docstring for bootstrap steps.
+"""
+function umap_reduce(X::AbstractMatrix;
+                     n_neighbors::Integer = 15,
+                     min_dist::Real = 0.0,
+                     n_components::Integer = 15,
+                     metric::AbstractString = "euclidean",
+                     random_state = nothing)
+    n_neighbors >= 2 || throw(ArgumentError("n_neighbors must be ≥ 2"))
+    n_components >= 1 || throw(ArgumentError("n_components must be ≥ 1"))
+    size(X, 2) >= n_neighbors ||
+        throw(ArgumentError("need at least n_neighbors=$(n_neighbors) samples; \
+                             got $(size(X, 2))"))
+
+    py = _require_pythoncall()
+    umap_mod = _pyimport(py, "umap", "cd py && uv add umap-learn && uv sync")
+
+    kwargs = (n_neighbors = Int(n_neighbors),
+              min_dist    = Float64(min_dist),
+              n_components = Int(n_components),
+              metric      = String(metric))
+    reducer = random_state === nothing ?
+        umap_mod.UMAP(; kwargs...) :
+        umap_mod.UMAP(; kwargs..., random_state = Int(random_state))
+
+    # umap-learn expects (samples, features); Julia is (features, samples).
+    Xt = collect(permutedims(X))
+    Y_py = reducer.fit_transform(Xt)
+    Y = py.pyconvert(Matrix{Float64}, Y_py)
+    return collect(permutedims(Y))
+end
+
+# ---------------------------------------------------------------------------
+# HDBSCAN
 # ---------------------------------------------------------------------------
 
 """
     hdbscan_cluster(X::AbstractMatrix; min_cluster_size = 10, metric = "euclidean")
         -> (assignments, outlier_scores)
 
-Run Python's `hdbscan.HDBSCAN` on `X` (features × samples) through
-`PythonCall`. Assumes the uv virtualenv in `py/` has been synced
-(see `py/README.md`) and the environment variables
-`JULIA_CONDAPKG_BACKEND=Null` + `JULIA_PYTHONCALL_EXE=<py/.venv>` are
-set before `using LogClustering`.
-
-Returns 1-based cluster ids (noise stays as `0`) and the per-sample
-outlier scores from HDBSCAN. Raises `ErrorException` with remediation
-steps if Python isn't usable.
+Python's `hdbscan.HDBSCAN` through PythonCall. `X` is
+`features × samples`. Returns 1-based cluster ids (noise stays `0`) and
+the per-sample outlier scores.
 """
 function hdbscan_cluster(X::AbstractMatrix;
                          min_cluster_size::Integer = 10,
                          metric::AbstractString = "euclidean")
-    py = try
-        Base.require(Base.PkgId(Base.UUID("6099a3de-0909-46bc-b1f4-468b9a2dfc0d"),
-                                "PythonCall"))
-    catch err
-        error("PythonCall is not loaded. Install and configure the uv \
-               virtualenv under `py/` (see py/README.md), then \
-               `using LogClustering` from a fresh Julia session.")
-    end
-    hdbscan_mod = try
-        py.pyimport("hdbscan")
-    catch err
-        error("""
-            Could not import Python `hdbscan`. Check that:
-              - `cd py && uv sync` has been run
-              - JULIA_CONDAPKG_BACKEND=Null
-              - JULIA_PYTHONCALL_EXE=$(abspath(joinpath(@__DIR__, "..", "..", "py", ".venv", "bin", "python")))
-            Underlying error: $(sprint(showerror, err))
-        """)
-    end
-    clusterer = hdbscan_mod.HDBSCAN(
+    py = _require_pythoncall()
+    hdb = _pyimport(py, "hdbscan", "cd py && uv add hdbscan && uv sync")
+    clusterer = hdb.HDBSCAN(
         min_cluster_size = Int(min_cluster_size),
         metric = String(metric),
     )
-    # HDBSCAN expects (samples, features); Julia is (features, samples).
-    labels_py = clusterer.fit_predict(py.pyrowlist(collect(permutedims(X))))
-    labels = Int.(py.pyconvert(Vector{Int}, labels_py)) .+ 1   # 0-based → 1-based, noise → 0
+    Xt = collect(permutedims(X))
+    labels_py = clusterer.fit_predict(Xt)
+    labels = py.pyconvert(Vector{Int}, labels_py) .+ 1         # 0→noise→0 after shift? fix below
+    # HDBSCAN uses -1 for noise; after +1 it becomes 0 — that's our noise tag.
     outlier = py.pyconvert(Vector{Float64}, clusterer.outlier_scores_)
     return (assignments = labels, outlier_scores = outlier)
+end
+
+# ---------------------------------------------------------------------------
+# Convenience: full plan Stage E pipeline
+# ---------------------------------------------------------------------------
+
+"""
+    umap_hdbscan(X; l2 = true,
+                 n_neighbors = 15, min_dist = 0.0, n_components = 15,
+                 min_cluster_size = 10) -> (assignments, embedding)
+
+Plan 001 Stage E default: optional L2-normalise → UMAP → HDBSCAN.
+Returns the HDBSCAN assignment vector and the UMAP `(n_components, samples)`
+embedding so downstream code can plot or score it.
+"""
+function umap_hdbscan(X::AbstractMatrix;
+                      l2::Bool = true,
+                      n_neighbors::Integer = 15,
+                      min_dist::Real = 0.0,
+                      n_components::Integer = 15,
+                      min_cluster_size::Integer = 10,
+                      random_state = nothing)
+    Xn = l2 ? l2_normalise(X) : X
+    Y = umap_reduce(Xn;
+                    n_neighbors = n_neighbors,
+                    min_dist = min_dist,
+                    n_components = n_components,
+                    random_state = random_state)
+    r = hdbscan_cluster(Y; min_cluster_size = min_cluster_size)
+    return (assignments = r.assignments, embedding = Y)
 end
 
 end # module Pipeline

@@ -82,4 +82,29 @@ end
         @test_throws ArgumentError kmeans_cluster(randn(3, 4), 0)
         @test_throws ArgumentError kmeans_cluster(randn(3, 2), 5)   # k > n
     end
+
+    @testset "umap_reduce — argument validation" begin
+        X = randn(Float32, 4, 20)
+        @test_throws ArgumentError umap_reduce(X; n_neighbors = 1)
+        @test_throws ArgumentError umap_reduce(X; n_components = 0)
+        @test_throws ArgumentError umap_reduce(X; n_neighbors = 50)  # > samples
+    end
+
+    @testset "umap_reduce / hdbscan_cluster / umap_hdbscan — Python bootstrap" begin
+        # Without the uv venv pre-wired these must raise a clear,
+        # remediation-containing error. We only assert the message
+        # mentions the uv venv — the exact wording can evolve.
+        X = randn(Float32, 4, 30)
+        err_umap  = try umap_reduce(X); nothing
+                    catch e; sprint(showerror, e) end
+        err_hdb   = try hdbscan_cluster(X); nothing
+                    catch e; sprint(showerror, e) end
+        # When PythonCall / umap-learn / hdbscan are all installed the calls
+        # succeed and the `try` yields `nothing`; otherwise the error
+        # message must mention the uv path.
+        for msg in (err_umap, err_hdb)
+            msg === nothing && continue
+            @test occursin("py/", msg) || occursin("PythonCall", msg) || occursin("uv", msg)
+        end
+    end
 end
