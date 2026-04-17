@@ -9,6 +9,15 @@ using .DeepKATE
 include("PreProc/Framing.jl")
 using .Framing
 
+include("Rust.jl")
+using .Rust
+
+include("PreProc/Masking.jl")
+using .Masking
+
+include("PreProc/Dedup.jl")
+using .Dedup
+
 include("Mining/Episodes.jl")
 using .Episodes
 
@@ -39,11 +48,8 @@ using .Sparsity
 include("Cluster/Pipeline.jl")
 using .Pipeline
 
-include("Rust.jl")
-using .Rust
-
-export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM,
-       Metrics, Compression, Harness, CV, Sparsity, Pipeline,
+export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
+       SeqLSTM, Metrics, Compression, Harness, CV, Sparsity, Pipeline,
        Drain3, Rust
 
 # ---------------------------------------------------------------------------

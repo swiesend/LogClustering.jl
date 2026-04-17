@@ -7,6 +7,7 @@ using LogClustering
     include("test_anomaly.jl")
     include("test_seqlstm.jl")
     include("test_framing.jl")
+    include("test_preproc.jl")
     include("test_episodes.jl")
     include("test_eval.jl")
     include("test_compression.jl")
