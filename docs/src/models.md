@@ -33,3 +33,21 @@ LogClustering.SeqLSTM.seq_lstm_loss
 LogClustering.SeqLSTM.predict_next
 LogClustering.SeqLSTM.PeepholeLSTM
 ```
+
+## VQ-VAE (van den Oord et al. 2017)
+
+```@docs
+LogClustering.VQVAE
+LogClustering.VQVAE.VectorQuantizer
+LogClustering.VQVAE.vq_vae
+LogClustering.VQVAE.vq_vae_loss
+LogClustering.VQVAE.assign_codes
+```
+
+## SimCSE (Gao, Yao & Chen 2021)
+
+```@docs
+LogClustering.SimCSE
+LogClustering.SimCSE.simcse_loss
+LogClustering.SimCSE.simcse_step_loss
+```

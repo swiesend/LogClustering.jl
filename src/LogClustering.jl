@@ -30,6 +30,9 @@ using .SeqLSTM
 include("Models/VQVAE.jl")
 using .VQVAE
 
+include("Models/SimCSE.jl")
+using .SimCSE
+
 include("Eval/Metrics.jl")
 using .Metrics
 
@@ -55,8 +58,8 @@ include("Cluster/Pipeline.jl")
 using .Pipeline
 
 export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
-       SeqLSTM, VQVAE, Metrics, Compression, Harness, CV, Sparsity, Pipeline,
-       Drain3, Canonical, Rust
+       SeqLSTM, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
+       Sparsity, Pipeline, Drain3, Canonical, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload

@@ -43,6 +43,20 @@ using DifferentiationInterface: AutoEnzyme, gradient
 g = gradient(loss, AutoEnzyme(), ps)
 ```
 
+## Embedders (Stage C)
+
+Three Lux autoencoders / training recipes ship:
+
+| module        | what it is | cluster-ID source |
+|---------------|------------|--------------------|
+| `DeepKATE`    | thesis §3.2.3, K-competitive + sine bottleneck | `Sparsity.sparsity_clusters` (top-k active neurons) |
+| `VQVAE`       | van den Oord 2017, discrete codebook bottleneck | `VQVAE.assign_codes` (argmin distance) |
+| `SimCSE`      | Gao 2021 InfoNCE — a training *recipe* over any Lux encoder | whatever clusterer the caller picks |
+
+`SimCSE.simcse_step_loss` runs the encoder twice so Dropout's RNG
+yields a `(h_i, h_i⁺)` positive pair for contrastive learning. `VQVAE.
+assign_codes` is the plan's "cluster id for free".
+
 ## Is Drain part of the pipeline?
 
 No — Drain ships as a **comparison baseline**, not a component of the

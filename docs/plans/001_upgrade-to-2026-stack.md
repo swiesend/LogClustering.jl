@@ -101,11 +101,20 @@ stop-gradient targets via `@ignore_derivatives`. Add three siblings:
 
 - **VQ-VAE** (van den Oord et al. 2017) — the principled descendant of
   k-winner-take-all; codebook *is* the cluster vocabulary; discrete code
-  becomes the cluster ID for free.
+  becomes the cluster ID for free. *Ported* in `src/Models/VQVAE.jl`:
+  `VectorQuantizer` Lux layer with straight-through estimator,
+  `vq_vae` Dense-encoder/decoder Chain, `vq_vae_loss` (reconstruction
+  + β·commitment + codebook — equation 3 of the paper),
+  `assign_codes` for "cluster id for free".
 - **Masked / denoising autoencoder** (Vincent 2008; He et al. MAE 2022) —
-  stronger self-supervised signal than pure reconstruction.
+  stronger self-supervised signal than pure reconstruction. TODO.
 - **Contrastive sentence encoder** (SimCSE, Gao et al. 2021) with log-specific
-  augmentations (parameter masking, timestamp dropout).
+  augmentations (parameter masking, timestamp dropout). *Ported* in
+  `src/Models/SimCSE.jl`: `simcse_loss(h, h⁺; τ)` (InfoNCE over cosine
+  similarity, deliberately backbone-agnostic) and
+  `simcse_step_loss(model, ps, st, x; τ)` (double-forward via
+  Dropout RNG). Pairs with any Lux `Chain` with at least one
+  Dropout layer.
 
 Replace the regex BoW input with **BPE** via `BytePairEncoding.jl` (or
 SentencePiece) trained per-dataset.
@@ -113,8 +122,8 @@ SentencePiece) trained per-dataset.
 **Rationale.** VQ-VAE is the clean 2020s formalisation of what KATE was reaching
 for. SimCSE empirically beats reconstruction-trained encoders on clustering.
 
-**Files (new).** `src/Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl,
-Embedders.jl}`, `src/Data/Tokenizers.jl`.
+**Files.** `src/Models/VQVAE.jl` ✓, `src/Models/SimCSE.jl` ✓;
+DenoisingAE + Embedders.jl + Data/Tokenizers.jl still TODO.
 
 **Verification.** VQ-VAE codebook perplexity stable; SimCSE NMI on HDFS
 ≥ KATE-modernised + 3 pts.
