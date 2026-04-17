@@ -18,6 +18,9 @@ using .Masking
 include("PreProc/Dedup.jl")
 using .Dedup
 
+include("Featurise.jl")
+using .Featurise
+
 include("Mining/Episodes.jl")
 using .Episodes
 
@@ -57,6 +60,9 @@ using .Persistence
 include("PersistenceGlue.jl")
 using .PersistenceGlue
 
+include("Cluster/Sparsity.jl")
+using .Sparsity
+
 include("AutoTune.jl")
 using .AutoTune
 
@@ -67,15 +73,12 @@ function __init__()
     PersistenceGlue.register_all!()
 end
 
-include("Cluster/Sparsity.jl")
-using .Sparsity
-
 include("Cluster/Pipeline.jl")
 using .Pipeline
 
-export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
-       SeqLSTM, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
-       Sparsity, Pipeline, Drain3, Canonical, Persistence,
+export KATE, DeepKATE, Framing, Masking, Dedup, Featurise, Episodes,
+       Instance, SeqLSTM, VQVAE, SimCSE, Metrics, Compression, Harness,
+       CV, Sparsity, Pipeline, Drain3, Canonical, Persistence,
        PersistenceGlue, AutoTune, CLI, Rust
 
 # ---------------------------------------------------------------------------

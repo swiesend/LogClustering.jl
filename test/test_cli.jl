@@ -173,24 +173,77 @@ end
         end
     end
 
-    @testset "train surfaces a helpful error for API-only kinds" begin
-        data = _toy_file()
-        out  = tempname() * ".jld2"
-        try
-            r = _with_captured_stdio(() -> CLI.main(["train",
-                "--kind", "deep_kate", "--data", data, "--out", out]))
-            @test r.code == 3                 # "API-only" exit code
-            @test occursin("featurised", r.err)
-        finally
-            isfile(data) && rm(data)
-            isfile(out) && rm(out)
-        end
-    end
-
     @testset "train without --out errors" begin
         r = _with_captured_stdio(() -> CLI.main(["train",
             "--kind", "drain", "--data", "nonexistent"]))
         @test r.code == 2
         @test occursin("--out", r.err)
+    end
+
+    @testset "deep_kate train + classify round-trip over raw lines" begin
+        data = _toy_file()
+        model = tempname() * ".jld2"
+        out   = tempname() * ".tsv"
+        try
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "deep_kate", "--data", data, "--out", model,
+                "--epochs", "3", "--batch", "4", "--auto", "--quiet"]))
+            @test r1.code == 0
+            @test isfile(model)
+
+            r2 = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model, "--data", data, "--out", out]))
+            @test r2.code == 0
+            rows = readlines(out)
+            @test length(rows) == length(TOY_LINES) + 1     # header + data
+            # Cluster labels look like "cluster-<id>".
+            @test all(row -> occursin("cluster-", split(row, '\t')[3]),
+                      rows[2:end])
+        finally
+            for p in (data, model, out); isfile(p) && rm(p); end
+        end
+    end
+
+    @testset "vq_vae train + classify round-trip" begin
+        data = _toy_file()
+        model = tempname() * ".jld2"
+        out   = tempname() * ".tsv"
+        try
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "vq_vae", "--data", data, "--out", model,
+                "--epochs", "5", "--batch", "4", "--auto", "--quiet"]))
+            @test r1.code == 0
+
+            r2 = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model, "--data", data, "--out", out]))
+            @test r2.code == 0
+            rows = readlines(out)
+            @test length(rows) == length(TOY_LINES) + 1
+            @test all(row -> occursin("code-", split(row, '\t')[3]),
+                      rows[2:end])
+        finally
+            for p in (data, model, out); isfile(p) && rm(p); end
+        end
+    end
+
+    @testset "seq_lstm train + classify round-trip" begin
+        data = _toy_file()
+        model = tempname() * ".jld2"
+        out   = tempname() * ".tsv"
+        try
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "seq_lstm", "--data", data, "--out", model,
+                "--epochs", "3", "--batch", "4", "--seqlen", "6",
+                "--auto", "--quiet"]))
+            @test r1.code == 0
+
+            r2 = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model, "--data", data, "--out", out]))
+            @test r2.code == 0
+            rows = readlines(out)
+            @test length(rows) == length(TOY_LINES) + 1
+        finally
+            for p in (data, model, out); isfile(p) && rm(p); end
+        end
     end
 end

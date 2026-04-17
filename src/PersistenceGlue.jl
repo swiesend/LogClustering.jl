@@ -21,6 +21,7 @@ using ..Drain3: Drain3, Drain, default_parametrize, TreeNode, LogCluster
 using ..Instance: Instance, ValueNoveltyDetector
 using ..Dedup: Dedup, DedupState
 using ..Masking: Masking, SlotValue
+using ..Featurise: Featurise, Vocabulary
 using Lux: Lux, Chain
 
 export save, name_of_activation, activation_by_name
@@ -85,8 +86,10 @@ end
 
 function save_deep_kate(path, model::Chain, ps, st;
                         n::Integer, latent::Integer, k1::Integer, p::Real,
+                        vocab::Union{Nothing, Vocabulary} = nothing,
                         metadata::AbstractDict = Dict{String, Any}())
-    spec = (n = Int(n), latent = Int(latent), k1 = Int(k1), p = Float32(p))
+    spec = (n = Int(n), latent = Int(latent), k1 = Int(k1), p = Float32(p),
+            vocab = vocab)
     Persistence.save_lux(path; kind = :deep_kate, spec = spec,
                          ps = ps, st = st, metadata = metadata)
 end
@@ -94,9 +97,11 @@ end
 function _rehydrate_deep_kate(bundle)
     sp = bundle.spec
     model = deep_kate(sp.n; latent = sp.latent, k1 = sp.k1, p = sp.p)
+    vocab = hasproperty(sp, :vocab) ? sp.vocab : nothing
     return (; model = model,
               ps = bundle.payload.ps,
-              st = bundle.payload.st)
+              st = bundle.payload.st,
+              vocab = vocab)
 end
 
 # ---------------------------------------------------------------------------
@@ -106,6 +111,8 @@ end
 function save_seq_lstm(path, model::Chain, ps, st;
                        vocab_size::Integer, embed::Integer, hidden::Integer,
                        bidirectional::Bool = false, peephole::Bool = false,
+                       vocab::Union{Nothing, Vocabulary} = nothing,
+                       seqlen::Union{Nothing, Integer} = nothing,
                        metadata::AbstractDict = Dict{String, Any}())
     spec = (
         vocab_size   = Int(vocab_size),
@@ -113,6 +120,8 @@ function save_seq_lstm(path, model::Chain, ps, st;
         hidden       = Int(hidden),
         bidirectional = bidirectional,
         peephole     = peephole,
+        vocab        = vocab,
+        seqlen       = seqlen === nothing ? nothing : Int(seqlen),
     )
     Persistence.save_lux(path; kind = :seq_lstm, spec = spec,
                          ps = ps, st = st, metadata = metadata)
@@ -125,9 +134,13 @@ function _rehydrate_seq_lstm(bundle)
                      hidden = sp.hidden,
                      bidirectional = sp.bidirectional,
                      peephole = sp.peephole)
+    vocab  = hasproperty(sp, :vocab)  ? sp.vocab  : nothing
+    seqlen = hasproperty(sp, :seqlen) ? sp.seqlen : nothing
     return (; model = model,
               ps = bundle.payload.ps,
-              st = bundle.payload.st)
+              st = bundle.payload.st,
+              vocab = vocab,
+              seqlen = seqlen)
 end
 
 # ---------------------------------------------------------------------------
@@ -137,12 +150,14 @@ end
 function save_vq_vae(path, model::Chain, ps, st;
                      n::Integer, codebook_size::Integer,
                      embed_dim::Integer, hidden::Integer,
+                     vocab::Union{Nothing, Vocabulary} = nothing,
                      metadata::AbstractDict = Dict{String, Any}())
     spec = (
         n             = Int(n),
         codebook_size = Int(codebook_size),
         embed_dim     = Int(embed_dim),
         hidden        = Int(hidden),
+        vocab         = vocab,
     )
     Persistence.save_lux(path; kind = :vq_vae, spec = spec,
                          ps = ps, st = st, metadata = metadata)
@@ -154,9 +169,11 @@ function _rehydrate_vq_vae(bundle)
                    codebook_size = sp.codebook_size,
                    embed_dim     = sp.embed_dim,
                    hidden        = sp.hidden)
+    vocab = hasproperty(sp, :vocab) ? sp.vocab : nothing
     return (; model = model,
               ps = bundle.payload.ps,
-              st = bundle.payload.st)
+              st = bundle.payload.st,
+              vocab = vocab)
 end
 
 # ---------------------------------------------------------------------------

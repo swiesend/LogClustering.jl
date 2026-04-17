@@ -62,7 +62,10 @@ assign_codes` is the plan's "cluster id for free".
 ```sh
 bin/logcluster --help                 # list subcommands
 bin/logcluster mask --data log.txt    # typed-slot masking
-bin/logcluster train --kind drain --data log.txt --out model.jld2
+bin/logcluster train --kind drain      --data log.txt --out model.jld2
+bin/logcluster train --kind deep_kate  --data log.txt --out ae.jld2    --auto
+bin/logcluster train --kind vq_vae     --data log.txt --out vq.jld2    --auto
+bin/logcluster train --kind seq_lstm   --data log.txt --out lstm.jld2  --auto
 bin/logcluster classify --model model.jld2 --data newlog.txt --format tsv
 bin/logcluster score    --detector det.jld2 --data newlog.txt
 bin/logcluster benchmark data/HDFS_2k.log_structured.csv drain

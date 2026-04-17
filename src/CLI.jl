@@ -33,15 +33,22 @@ module CLI
 using ..Harness: load_loghub, run_parser, format_report, Dataset
 using ..Masking: mask_line, mask_lines, mask_lines_with_values
 using ..Drain3: Drain, process!, parse_all
+using ..Featurise: Featurise, Vocabulary, build_vocab, bow,
+                   sequence_matrix, tokenise_ids
 using ..Persistence
 using ..PersistenceGlue
 using ..AutoTune
 using ..DeepKATE: deep_kate
-using ..VQVAE: vq_vae, assign_codes
-using ..SeqLSTM: seq_lstm
+using ..VQVAE: vq_vae, assign_codes, VectorQuantizer
+using ..SeqLSTM: seq_lstm, seq_lstm_loss
 using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly
+using ..Sparsity: sparsity_clusters
 using ..Framing: parse_frame, SOURCE_RAW
+using Lux
+using Zygote
 using JSON3
+using Random: MersenneTwister
+using Statistics: mean
 
 export main
 
@@ -241,66 +248,292 @@ end
 
 function cmd_train(args::Vector{String})::Int
     specs = [
-        ("kind",   "drain",  :string),
-        ("data",   "-",      :path),
-        ("out",    "",       :path),
-        ("auto",   false,    :bool),
-        ("budget", 0,        :int),
-        ("epochs", 1,        :int),
+        ("kind",      "drain",  :string),
+        ("data",      "-",      :path),
+        ("out",       "",       :path),
+        ("auto",      false,    :bool),
+        ("budget",    0,        :int),
+        ("epochs",    20,       :int),
+        ("batch",     64,       :int),
+        ("lr",        0.05,     :float),
+        ("seed",      0,        :int),
+        ("seqlen",    16,       :int),
+        ("max-vocab", 5000,     :int),
+        ("min-count", 1,        :int),
+        ("quiet",     false,    :bool),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_train_help(); return 0)
     isempty(opts["out"]) && throw(ArgumentError("--out is required"))
     lines = read_lines(opts["data"])
     kind = Symbol(opts["kind"])
+    rng = MersenneTwister(Int(opts["seed"]))
+
     if kind === :drain
         d = Drain()
         parse_all(d, lines)
         PersistenceGlue.save(opts["out"], d;
-                             metadata = Dict{String, Any}(
-                                 "source" => opts["data"],
-                                 "n_lines" => length(lines),
-                                 "kind"   => "drain",
-                             ))
-        println(stderr,
+                             metadata = _train_metadata(opts, lines, "drain"))
+        opts["quiet"] || println(stderr,
                 "drain: ", length(d.clusters),
                 " templates from ", length(lines), " lines → ", opts["out"])
         return 0
-    elseif kind === :deep_kate || kind === :vq_vae || kind === :seq_lstm
-        println(stderr, """
-            `train --kind $kind` needs a featurised corpus (numeric
-            Matrix or tokenised sequence), which the CLI doesn't
-            featurise from raw lines yet. Pick `--kind drain` for
-            raw lines, or use the Julia API directly:
-
-                using LogClustering
-                cfg = AutoTune.fit_hyperparams($(repr(kind)), X)
-                m = $(kind == :deep_kate ? "deep_kate" :
-                      kind == :vq_vae ? "vq_vae" : "seq_lstm")(cfg.n; …)
-                # train… save with PersistenceGlue.save(path, m, ps, st; kind, …)
-            """)
-        return 3
+    elseif kind === :deep_kate
+        return _train_deep_kate(lines, opts, rng)
+    elseif kind === :vq_vae
+        return _train_vq_vae(lines, opts, rng)
+    elseif kind === :seq_lstm
+        return _train_seq_lstm(lines, opts, rng)
     else
         throw(ArgumentError("unknown kind `$(opts["kind"])`"))
     end
 end
 
+function _train_metadata(opts, lines, kind_name::AbstractString)
+    return Dict{String, Any}(
+        "source"  => opts["data"],
+        "n_lines" => length(lines),
+        "kind"    => kind_name,
+    )
+end
+
+# --- DeepKATE ---------------------------------------------------------------
+
+function _train_deep_kate(lines::Vector{String}, opts::Dict, rng)::Int
+    vocab = build_vocab(lines; mask = true,
+                        min_count = Int(opts["min-count"]),
+                        max_vocab = Int(opts["max-vocab"]))
+    X = bow(lines, vocab; normalise = :l1)
+    cfg_base = AutoTune.fit_hyperparams(:deep_kate, X;
+                  budget = opts["auto"] ? Int(opts["budget"]) : 0,
+                  rng = rng)
+    n = size(X, 1)
+    cfg = merge(cfg_base, (n = n,))
+    model = deep_kate(cfg.n; latent = cfg.latent, k1 = cfg.k1, p = cfg.p)
+    ps, st = Lux.setup(rng, model)
+    ps = _sgd_recon!(model, ps, st, X, Int(opts["epochs"]), Int(opts["batch"]),
+                     Float32(opts["lr"]), rng; quiet = opts["quiet"],
+                     label = "deep_kate")
+    PersistenceGlue.save(opts["out"], model, ps, st;
+        kind = :deep_kate,
+        n = cfg.n, latent = cfg.latent, k1 = cfg.k1, p = cfg.p,
+        vocab = vocab,
+        metadata = _train_metadata(opts, lines, "deep_kate"))
+    opts["quiet"] || println(stderr,
+        "deep_kate: ", length(vocab), "-tok vocab, latent=", cfg.latent,
+        ", k1=", cfg.k1, " → ", opts["out"])
+    return 0
+end
+
+# --- VQ-VAE -----------------------------------------------------------------
+
+function _train_vq_vae(lines::Vector{String}, opts::Dict, rng)::Int
+    vocab = build_vocab(lines; mask = true,
+                        min_count = Int(opts["min-count"]),
+                        max_vocab = Int(opts["max-vocab"]))
+    X = bow(lines, vocab; normalise = :binary)
+    cfg_base = AutoTune.fit_hyperparams(:vq_vae, X;
+                  budget = opts["auto"] ? Int(opts["budget"]) : 0,
+                  rng = rng)
+    n = size(X, 1)
+    cfg = merge(cfg_base, (n = n,))
+    model = vq_vae(cfg.n; codebook_size = cfg.codebook_size,
+                   embed_dim = cfg.embed_dim, hidden = cfg.hidden)
+    ps, st = Lux.setup(rng, model)
+    ps = _sgd_vqvae!(model, ps, st, X, Int(opts["epochs"]), Int(opts["batch"]),
+                     Float32(opts["lr"]), rng; quiet = opts["quiet"])
+    PersistenceGlue.save(opts["out"], model, ps, st;
+        kind = :vq_vae,
+        n = cfg.n, codebook_size = cfg.codebook_size,
+        embed_dim = cfg.embed_dim, hidden = cfg.hidden,
+        vocab = vocab,
+        metadata = _train_metadata(opts, lines, "vq_vae"))
+    opts["quiet"] || println(stderr,
+        "vq_vae: ", length(vocab), "-tok vocab, codebook=", cfg.codebook_size,
+        ", embed=", cfg.embed_dim, " → ", opts["out"])
+    return 0
+end
+
+# --- SeqLSTM ----------------------------------------------------------------
+
+function _train_seq_lstm(lines::Vector{String}, opts::Dict, rng)::Int
+    vocab = build_vocab(lines; mask = true,
+                        min_count = Int(opts["min-count"]),
+                        max_vocab = Int(opts["max-vocab"]))
+    seqlen = Int(opts["seqlen"])
+    seqlen >= 2 || throw(ArgumentError("--seqlen must be ≥ 2"))
+    S = sequence_matrix(lines, vocab; seqlen = seqlen)
+    cfg = AutoTune.fit_hyperparams(:seq_lstm, S;
+                  budget = opts["auto"] ? Int(opts["budget"]) : 0,
+                  rng = rng)
+    # Respect the actual vocab size — AutoTune's `vocab_size` comes
+    # from `maximum(corpus)`, which can undershoot when a line didn't
+    # use every token.
+    vs = max(Int(cfg.vocab_size), length(vocab))
+    cfg = merge(cfg, (vocab_size = vs,))
+    model = seq_lstm(cfg.vocab_size; embed = cfg.embed, hidden = cfg.hidden)
+    ps, st = Lux.setup(rng, model)
+    ps = _sgd_seqlstm!(model, ps, st, S, Int(opts["epochs"]),
+                       Int(opts["batch"]), Float32(opts["lr"]), rng;
+                       quiet = opts["quiet"])
+    PersistenceGlue.save(opts["out"], model, ps, st;
+        kind = :seq_lstm,
+        vocab_size = cfg.vocab_size, embed = cfg.embed, hidden = cfg.hidden,
+        vocab = vocab, seqlen = seqlen,
+        metadata = _train_metadata(opts, lines, "seq_lstm"))
+    opts["quiet"] || println(stderr,
+        "seq_lstm: ", length(vocab), "-tok vocab, embed=", cfg.embed,
+        ", hidden=", cfg.hidden, ", seqlen=", seqlen, " → ", opts["out"])
+    return 0
+end
+
+# --- Shared SGD helpers -----------------------------------------------------
+
+"Apply an SGD step over a NamedTuple / Array parameter tree."
+function _apply_sgd!(ps, grads, lr)
+    grads === nothing && return ps
+    if ps isa AbstractArray
+        return ps .- lr .* grads
+    elseif ps isa NamedTuple
+        ks = keys(ps)
+        return NamedTuple{ks}(map(k -> _apply_sgd!(getfield(ps, k),
+                                                   hasproperty(grads, k) ? getfield(grads, k) : nothing,
+                                                   lr), ks))
+    else
+        return ps
+    end
+end
+
+"BCE-reconstruction SGD loop (DeepKATE)."
+function _sgd_recon!(model, ps, st, X::AbstractMatrix, epochs::Int, batch::Int,
+                     lr::Float32, rng; quiet::Bool = false,
+                     label::AbstractString = "model")
+    n = size(X, 2)
+    batch = min(batch, n)
+    eps = Float32(1e-7)
+    loss_fn = (p, Xb) -> begin
+        y, _ = model(Xb, p, Lux.testmode(st))
+        -mean(@. Xb * log(max(y, eps)) + (1 - Xb) * log(max(1 - y, eps)))
+    end
+    for epoch in 1:epochs
+        perm = randperm(rng, n)
+        total = 0.0f0
+        n_batches = 0
+        for start in 1:batch:n
+            stop = min(start + batch - 1, n)
+            cols = perm[start:stop]
+            Xb = X[:, cols]
+            (loss, back) = Zygote.pullback(p -> loss_fn(p, Xb), ps)
+            g = back(one(loss))[1]
+            ps = _apply_sgd!(ps, g, lr)
+            total += loss
+            n_batches += 1
+        end
+        if !quiet && (epoch % max(1, epochs ÷ 5) == 0 || epoch == epochs)
+            println(stderr, rpad(label, 9), "  epoch ", lpad(epoch, 3),
+                    "/", epochs, "   loss=",
+                    round(total / max(1, n_batches); digits = 4))
+        end
+    end
+    return ps
+end
+
+"VQ-VAE-specific SGD loop (uses the reconstruction + codebook + commitment loss)."
+function _sgd_vqvae!(model, ps, st, X::AbstractMatrix, epochs::Int, batch::Int,
+                     lr::Float32, rng; quiet::Bool = false)
+    n = size(X, 2)
+    batch = min(batch, n)
+    for epoch in 1:epochs
+        perm = randperm(rng, n)
+        total = 0.0f0
+        n_batches = 0
+        for start in 1:batch:n
+            stop = min(start + batch - 1, n)
+            cols = perm[start:stop]
+            Xb = X[:, cols]
+            (loss, back) = Zygote.pullback(p ->
+                first(VQVAE.vq_vae_loss(model, p, st, Xb)), ps)
+            g = back(one(loss))[1]
+            ps = _apply_sgd!(ps, g, lr)
+            total += loss
+            n_batches += 1
+        end
+        if !quiet && (epoch % max(1, epochs ÷ 5) == 0 || epoch == epochs)
+            println(stderr, "vq_vae    epoch ", lpad(epoch, 3),
+                    "/", epochs, "   loss=",
+                    round(total / max(1, n_batches); digits = 4))
+        end
+    end
+    return ps
+end
+
+"SeqLSTM next-event-NLL SGD loop over `(seqlen, batch)` integer id matrix."
+function _sgd_seqlstm!(model, ps, st, S::AbstractMatrix{<:Integer}, epochs::Int,
+                       batch::Int, lr::Float32, rng; quiet::Bool = false)
+    n = size(S, 2)
+    batch = min(batch, n)
+    for epoch in 1:epochs
+        perm = randperm(rng, n)
+        total = 0.0f0
+        n_batches = 0
+        for start in 1:batch:n
+            stop = min(start + batch - 1, n)
+            cols = perm[start:stop]
+            Sb = S[:, cols]
+            (loss, back) = Zygote.pullback(p ->
+                first(seq_lstm_loss(model, p, st, Sb)), ps)
+            g = back(one(loss))[1]
+            ps = _apply_sgd!(ps, g, lr)
+            total += loss
+            n_batches += 1
+        end
+        if !quiet && (epoch % max(1, epochs ÷ 5) == 0 || epoch == epochs)
+            println(stderr, "seq_lstm  epoch ", lpad(epoch, 3),
+                    "/", epochs, "   loss=",
+                    round(total / max(1, n_batches); digits = 4))
+        end
+    end
+    return ps
+end
+
+# We import VQVAE here because `vq_vae_loss` is referenced via the
+# module name to keep the `using` list tidy.
+using ..VQVAE: VQVAE
+
+# `randperm` is used above but not re-exported by default when the
+# imports skip `Random`.
+using Random: randperm
+
 function _print_train_help()
     println("""
     usage: logcluster train --kind KIND --data FILE --out FILE
-                            [--auto] [--budget N] [--epochs N]
+                            [--auto] [--budget N] [--epochs N] [--batch N]
+                            [--lr F] [--seed N]
+                            [--seqlen N] [--max-vocab N] [--min-count N]
+                            [--quiet]
 
     Fit and persist a model.
 
     KIND:
       drain       streaming log-template parser (no featurisation needed)
-      deep_kate   Lux autoencoder (requires a feature matrix — API-only)
-      vq_vae      Lux codebook AE (requires a feature matrix — API-only)
-      seq_lstm    Lux next-event LSTM (requires tokenised sequences — API-only)
+      deep_kate   Lux autoencoder on a log-normalised BoW matrix
+      vq_vae      Lux codebook AE on a binary BoW matrix
+      seq_lstm    Lux next-event LSTM on padded token-id sequences
 
-    --auto        use AutoTune.fit_hyperparams to pick sizes from the data.
+    All AE/LSTM kinds build a typed-slot-masked vocabulary on the
+    training corpus and persist it in the JLD2 bundle, so a later
+    `classify` pass can re-featurise new lines identically.
+
+    --auto        run AutoTune.fit_hyperparams on the featurised corpus.
     --budget N    >0 triggers random search around the heuristic seed.
-    --epochs N    training epochs (model-specific).
+    --epochs N    training epochs (default 20).
+    --batch N     mini-batch size (default 64).
+    --lr F        SGD learning rate (default 0.05).
+    --seed N      RNG seed (default 0).
+    --seqlen N    sequence length for seq_lstm (default 16).
+    --max-vocab N cap the vocabulary (default 5000).
+    --min-count N minimum token frequency to keep (default 1).
+    --quiet       suppress per-epoch loss lines.
     """)
 end
 
@@ -319,12 +552,13 @@ function cmd_classify(args::Vector{String})::Int
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_classify_help(); return 0)
     isempty(opts["model"]) && throw(ArgumentError("--model is required"))
-    artifact = Persistence.load_and_rehydrate(opts["model"])
+    bundle = Persistence.load(opts["model"])
+    artifact = Persistence.rehydrate(bundle)
 
     lines = read_lines(opts["data"])
     bodies = opts["framed"] ? [String(parse_frame(l).message) for l in lines] : lines
 
-    if artifact isa Drain
+    if bundle.kind === :drain
         ids = Int[]
         templates = String[]
         for l in bodies
@@ -333,9 +567,78 @@ function cmd_classify(args::Vector{String})::Int
         end
         _emit_classify(opts["out"], opts["format"], bodies, ids, templates)
         return 0
+    elseif bundle.kind === :deep_kate
+        return _classify_deep_kate(artifact, bundle, bodies, opts)
+    elseif bundle.kind === :vq_vae
+        return _classify_vq_vae(artifact, bundle, bodies, opts)
+    elseif bundle.kind === :seq_lstm
+        return _classify_seq_lstm(artifact, bundle, bodies, opts)
     else
-        throw(ArgumentError("model kind $(typeof(artifact)) not yet handled by classify"))
+        throw(ArgumentError(
+            "model kind $(bundle.kind) not yet handled by classify"))
     end
+end
+
+function _require_vocab(artifact, kind)
+    artifact.vocab === nothing && throw(ArgumentError(
+        "`$kind` bundle has no vocabulary; save it with " *
+        "`PersistenceGlue.save(path, model, ps, st; kind=:$kind, …, vocab=v)`"))
+    return artifact.vocab
+end
+
+# DeepKATE clusters via the thesis's sparsity-from-argmax signal: we
+# run the encoder in testmode, take the top-`k` active latent slots
+# per sample (K = 1 here — the most active neuron is the cluster id),
+# and emit `(cluster_id, "cluster-<id>")`. Drain's richer "template
+# string per cluster" representation would need a separate decoder
+# pass + template voting, which the CLI currently stops short of.
+function _classify_deep_kate(art, bundle, bodies, opts)
+    vocab = _require_vocab(art, :deep_kate)
+    X = bow(bodies, vocab; normalise = :l1)
+    latent_idx = length(art.model.layers) - 5   # position of the sine bottleneck in deep_kate
+    # Actually reach through to the Lux internals: thesis DeepKATE
+    # has `latent_layer == 5`, the Dense(5 => latent, sin) output.
+    Z = _forward_through(art.model, art.ps, Lux.testmode(art.st), X, 5)
+    assignments, _ = sparsity_clusters(Z, 1)
+    labels = ["cluster-$(i)" for i in assignments]
+    _emit_classify(opts["out"], opts["format"], bodies, assignments, labels)
+    return 0
+end
+
+function _classify_vq_vae(art, bundle, bodies, opts)
+    vocab = _require_vocab(art, :vq_vae)
+    X = bow(bodies, vocab; normalise = :binary)
+    codes = assign_codes(art.model, art.ps, art.st, X)
+    labels = ["code-$(c)" for c in codes]
+    _emit_classify(opts["out"], opts["format"], bodies, codes, labels)
+    return 0
+end
+
+function _classify_seq_lstm(art, bundle, bodies, opts)
+    vocab = _require_vocab(art, :seq_lstm)
+    seqlen = art.seqlen === nothing ? 16 : Int(art.seqlen)
+    S = sequence_matrix(bodies, vocab; seqlen = seqlen)
+    # seq_lstm output is (vocab_size, batch) logits — argmax = predicted
+    # next token's id. We emit that as the "cluster id"; the template
+    # is the predicted token string.
+    logits, _ = art.model(S, art.ps, Lux.testmode(art.st))
+    ids = Int[argmax(@view logits[:, j]) for j in axes(logits, 2)]
+    labels = [get(vocab.tokens, id, "<UNK>") for id in ids]
+    _emit_classify(opts["out"], opts["format"], bodies, ids, labels)
+    return 0
+end
+
+"Run `model`'s first `lat` layers in sequence, returning the activation."
+function _forward_through(model, ps, st, X, lat::Int)
+    out = X
+    for i in 1:lat
+        sym = Symbol(:layer_, i)
+        layer = getfield(model.layers, sym)
+        p = getfield(ps, sym)
+        s = getfield(st, sym)
+        out, _ = layer(out, p, s)
+    end
+    return out
 end
 
 function _emit_classify(out_path, fmt, lines, ids, templates)
