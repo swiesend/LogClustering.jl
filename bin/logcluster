@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+#
+# Shell shim for LogClustering.CLI.main(ARGS). Invokes julia with the
+# repo's project; see `logcluster --help` for subcommands.
+#
+# Resolves the project root from this script's location so the shim
+# works whether you call it via an absolute path, `./bin/logcluster`,
+# or a PATH-linked symlink.
+
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PROJECT="$HERE/.."
+
+exec julia --startup-file=no --project="$PROJECT" -e '
+using LogClustering
+exit(LogClustering.CLI.main(ARGS))
+' -- "$@"

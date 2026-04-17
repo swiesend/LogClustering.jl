@@ -57,6 +57,21 @@ Three Lux autoencoders / training recipes ship:
 yields a `(h_i, h_i⁺)` positive pair for contrastive learning. `VQVAE.
 assign_codes` is the plan's "cluster id for free".
 
+## CLI
+
+```sh
+bin/logcluster --help                 # list subcommands
+bin/logcluster mask --data log.txt    # typed-slot masking
+bin/logcluster train --kind drain --data log.txt --out model.jld2
+bin/logcluster classify --model model.jld2 --data newlog.txt --format tsv
+bin/logcluster score    --detector det.jld2 --data newlog.txt
+bin/logcluster benchmark data/HDFS_2k.log_structured.csv drain
+bin/logcluster download-loghub --all
+```
+
+Every subcommand also works in-process: `LogClustering.CLI.main(["mask",
+"--data", path])` returns an exit code without shelling out.
+
 ## Is Drain part of the pipeline?
 
 No — Drain ships as a **comparison baseline**, not a component of the
