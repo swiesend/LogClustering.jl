@@ -177,8 +177,17 @@ original contribution.
 sparsity-as-clustering lets us ask whether KATE's bottleneck *is* its own
 clusterer.
 
-**Files (new).** `src/Cluster/{Pipeline.jl, Sparsity.jl}`,
-`src/Anomaly/Sequence.jl`.
+**Files (new).** `src/Anomaly/Sequence.jl`.
+
+**Clustering pipeline ported.** `src/Cluster/Sparsity.jl` realises the
+thesis's native "clustering-via-sparsity" from KATE's competitive
+bottleneck — `sparsity_clusters(Z, k)` reads off each sample's top-k
+active-neuron indices as a discrete cluster label (optional `signed=true`
+keeps positive and negative winners distinct). `src/Cluster/Pipeline.jl`
+provides `l2_normalise` + `kmeans_cluster` (via `Clustering.jl`) as the
+first distance-based comparator; `hdbscan_cluster` is a lazy
+`PythonCall → hdbscan` shim that raises a remediation-step error when
+the uv venv under `py/` isn't configured. UMAP plugs in the same way.
 
 **Instance anomaly ported.** `src/Anomaly/Instance.jl` implements the
 thesis's §3.2.5 reconstruction-error scoring on top of any Lux
@@ -308,15 +317,26 @@ Emit.jl, Hyperscan.jl, Verify.jl}`.
 
 ---
 
-### Stage F — Evaluation
+### Stage F — Evaluation  *(harness landed)*
 
 **Decision.** LogHub-2.0 (Zhu et al. ISSRE 2023) as the single source of
 ground truth — all 14 datasets, ~50 k annotated lines each.
 
-**Metrics.**
-- Parsing: PA, GA, FGA, FTA (Zhu et al. 2023, current field standard).
-- Clustering: NMI, ARI, Purity, V-measure.
-- Compression: BPC of codes, codebook perplexity, dictionary size.
+**Metrics ported.** `src/Eval/Metrics.jl` implements the four parsing
+metrics (`parsing_accuracy`, `group_accuracy`, `grouping_f1` ↔ FGA,
+`template_group_f1` ↔ FTA) and the four clustering metrics
+(`normalised_mutual_information`, `adjusted_rand_index`, `purity`,
+`v_measure`). Pure Julia, dependency-free, and accept both integer
+label vectors and raw template strings.
+
+**Harness landed.** `src/Eval/Harness.jl` + `benchmarks/loghub2/run.jl`
+load a LogHub-2.0 `*_structured.csv` (dependency-free, RFC-4180–aware
+CSV reader), run a parser function `Vector{String} → Vector{String}`,
+and print a one-row TSV of all ten metrics. Three sanity baselines
+ship out of the box (`identity`, `constant`, `num_mask`); adding a
+parser is one entry in the `PARSERS` dict. Compression metrics
+(BPC, codebook perplexity, dictionary size) and `Eval/CV.jl` remain
+to land.
 
 **Baselines table** (in `README.md`): Drain, Brain, LogPPT, LILAC,
 BGE+HDBSCAN, KATE-original, KATE-modernised, VQ-VAE, SimCSE-logs across all
@@ -324,9 +344,6 @@ BGE+HDBSCAN, KATE-original, KATE-modernised, VQ-VAE, SimCSE-logs across all
 
 **Reproduction gate.** KATE-modernised matches the original KATE paper's
 20NG clustering NMI within ±2 pts as a sanity check.
-
-**Files (new).** `src/Eval/{Metrics.jl, Harness.jl, CV.jl}`,
-`benchmarks/loghub2/`.
 
 ---
 

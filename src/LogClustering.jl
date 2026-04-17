@@ -24,10 +24,16 @@ using .Metrics
 include("Eval/Harness.jl")
 using .Harness
 
+include("Cluster/Sparsity.jl")
+using .Sparsity
+
+include("Cluster/Pipeline.jl")
+using .Pipeline
+
 include("Rust.jl")
 using .Rust
 
 export KATE, DeepKATE, Framing, Episodes, Instance, SeqLSTM,
-       Metrics, Harness, Rust
+       Metrics, Harness, Sparsity, Pipeline, Rust
 
 end # module LogClustering
