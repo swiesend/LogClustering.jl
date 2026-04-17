@@ -43,6 +43,17 @@ using DifferentiationInterface: AutoEnzyme, gradient
 g = gradient(loss, AutoEnzyme(), ps)
 ```
 
+## Documentation
+
+```sh
+julia --project=docs -e 'using Pkg; Pkg.develop(path="."); Pkg.instantiate()'
+julia --project=docs docs/make.jl
+open docs/build/index.html
+```
+
+The `Documentation` CI job deploys the same output to GitHub Pages on
+every push to `main`.
+
 ## Dev-loop tips
 
 - **Full suite via `Pkg.test()` is slow** (~2 min) because it rebuilds

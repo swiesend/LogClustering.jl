@@ -21,3 +21,7 @@
 
 # CondaPkg bootstrap cache (created by PythonCall on first use)
 /.CondaPkg/
+
+# Documenter build output
+/docs/build/
+/docs/Manifest.toml
