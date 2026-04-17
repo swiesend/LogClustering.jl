@@ -19,9 +19,11 @@ module Rust
 
 using Libdl
 
-export parse_line, parse_lines, infer_regex, Span, ABI_VERSION
+export parse_line, parse_lines, infer_regex, Span, ABI_VERSION,
+       slot_ladder, alt_min, verify_pattern, mdl_cost,
+       RegexSet, regexset_match
 
-const EXPECTED_ABI_VERSION = UInt32(2)
+const EXPECTED_ABI_VERSION = UInt32(3)
 
 # ---------------------------------------------------------------------------
 # Library discovery
@@ -423,6 +425,287 @@ end
     push!(buf, (v >> 16) & 0xff)
     push!(buf, (v >> 24) & 0xff)
     return buf
+end
+
+# ---------------------------------------------------------------------------
+# Stage E″ MDL ladder
+# ---------------------------------------------------------------------------
+
+struct _CVerify
+    hits::UInt32
+    total::UInt32
+end
+
+"""
+    slot_ladder(values; typed = Pair{String,String}[],
+                enum_max = 8, wildcard = ".*?") -> String
+
+Pick the tightest pattern form covering every value in `values`:
+
+1. exact literal (all equal),
+2. enumerated alternation `(?:a|b|c)` when distinct count ≤ `enum_max`,
+3. first typed `(label, pattern)` whose anchored `^pattern\$` matches
+   every value,
+4. bounded character class (`\\d{m,n}`, `\\w{m,n}`, or
+   `[A-Za-z0-9]{m,n}`) when every char fits one class,
+5. `wildcard` fallback.
+
+`typed` is a ranked vector of `label => pattern` pairs — typically
+`collect(zip(Masking.DEFAULT_LABELS, Masking.DEFAULT_PATTERNS))`.
+"""
+function slot_ladder(
+    values::AbstractVector{<:AbstractString};
+    typed::AbstractVector{<:Pair{<:AbstractString, <:AbstractString}} =
+        Pair{String, String}[],
+    enum_max::Integer = 8,
+    wildcard::AbstractString = ".*?",
+)::String
+    values_buf = _encode_token_list(values)
+    typed_buf = _encode_pair_list(typed)
+    wildcard_bytes = codeunits(String(wildcard))
+
+    lib = _lib()
+    handle = Libdl.dlopen(lib)
+    try
+        sym = Libdl.dlsym(handle, :lc_rs_slot_ladder)
+        sym_free = Libdl.dlsym(handle, :lc_rs_free_bytes)
+
+        raw = @ccall $sym(
+            pointer(values_buf)::Ptr{UInt8},
+            Csize_t(length(values_buf))::Csize_t,
+            pointer(typed_buf)::Ptr{UInt8},
+            Csize_t(length(typed_buf))::Csize_t,
+            UInt32(enum_max)::UInt32,
+            pointer(wildcard_bytes)::Ptr{UInt8},
+            Csize_t(length(wildcard_bytes))::Csize_t,
+        )::Ptr{_CBytes}
+        raw == C_NULL && error("lc_rs_slot_ladder failed (malformed input)")
+        try
+            b = unsafe_load(raw)
+            return unsafe_string(b.ptr, b.len)
+        finally
+            @ccall $sym_free(raw::Ptr{_CBytes})::Cvoid
+        end
+    finally
+        Libdl.dlclose(handle)
+    end
+end
+
+"""
+    alt_min(alternatives; wildcard = ".*?") -> String
+
+Sort + dedup + escape the alternatives and return a canonical
+`(?:a|b|c)` group. Single-unique input returns the bare escaped
+literal; empty input returns `wildcard`.
+"""
+function alt_min(
+    alternatives::AbstractVector{<:AbstractString};
+    wildcard::AbstractString = ".*?",
+)::String
+    buf = _encode_token_list(alternatives)
+    wildcard_bytes = codeunits(String(wildcard))
+
+    lib = _lib()
+    handle = Libdl.dlopen(lib)
+    try
+        sym = Libdl.dlsym(handle, :lc_rs_alt_min)
+        sym_free = Libdl.dlsym(handle, :lc_rs_free_bytes)
+
+        raw = @ccall $sym(
+            pointer(buf)::Ptr{UInt8},
+            Csize_t(length(buf))::Csize_t,
+            pointer(wildcard_bytes)::Ptr{UInt8},
+            Csize_t(length(wildcard_bytes))::Csize_t,
+        )::Ptr{_CBytes}
+        raw == C_NULL && error("lc_rs_alt_min failed (malformed input)")
+        try
+            b = unsafe_load(raw)
+            return unsafe_string(b.ptr, b.len)
+        finally
+            @ccall $sym_free(raw::Ptr{_CBytes})::Cvoid
+        end
+    finally
+        Libdl.dlclose(handle)
+    end
+end
+
+"""
+    verify_pattern(pattern, samples) -> (hits::Int, total::Int)
+
+Compile `^(?:pattern)\$` and count how many of `samples` it matches.
+Used by the MDL ladder to confirm that a tightened pattern still
+covers every cluster member before committing to it.
+"""
+function verify_pattern(
+    pattern::AbstractString,
+    samples::AbstractVector{<:AbstractString},
+)::Tuple{Int, Int}
+    pattern_bytes = codeunits(String(pattern))
+    samples_buf = _encode_token_list(samples)
+
+    lib = _lib()
+    handle = Libdl.dlopen(lib)
+    try
+        sym = Libdl.dlsym(handle, :lc_rs_verify_pattern)
+        v = @ccall $sym(
+            pointer(pattern_bytes)::Ptr{UInt8},
+            Csize_t(length(pattern_bytes))::Csize_t,
+            pointer(samples_buf)::Ptr{UInt8},
+            Csize_t(length(samples_buf))::Csize_t,
+        )::_CVerify
+        return (Int(v.hits), Int(v.total))
+    finally
+        Libdl.dlclose(handle)
+    end
+end
+
+"""
+    mdl_cost(pattern, samples) -> Float64
+
+Two-part MDL-style cost in bits of `pattern` + the residual per
+sample. Rough but monotone — use it to rank candidate patterns from
+tight (low cost) to loose (high cost). See the Rust `mdl::mdl_cost`
+docstring for the exact formula.
+"""
+function mdl_cost(
+    pattern::AbstractString,
+    samples::AbstractVector{<:AbstractString},
+)::Float64
+    pattern_bytes = codeunits(String(pattern))
+    samples_buf = _encode_token_list(samples)
+
+    lib = _lib()
+    handle = Libdl.dlopen(lib)
+    try
+        sym = Libdl.dlsym(handle, :lc_rs_mdl_cost)
+        return @ccall $sym(
+            pointer(pattern_bytes)::Ptr{UInt8},
+            Csize_t(length(pattern_bytes))::Csize_t,
+            pointer(samples_buf)::Ptr{UInt8},
+            Csize_t(length(samples_buf))::Csize_t,
+        )::Float64
+    finally
+        Libdl.dlclose(handle)
+    end
+end
+
+"""
+    RegexSet(patterns::AbstractVector{<:AbstractString})
+
+Compile a list of patterns into a `regex::RegexSet` — the Rust
+substitute for a Hyperscan multi-pattern database. Use
+[`regexset_match`] to find the indices of every pattern that matches
+a line.
+
+The handle is freed by the finalizer; you don't have to close it
+manually.
+
+```julia
+set = Rust.RegexSet([r"\\d+", r"[a-z]+"])
+regexset_match(set, "42")      # [1]
+regexset_match(set, "hello")   # [2]
+regexset_match(set, "Hello1")  # Int[]
+```
+"""
+mutable struct RegexSet
+    handle::Ptr{Cvoid}
+    patterns::Vector{String}
+
+    function RegexSet(patterns::AbstractVector{<:AbstractString})
+        pats = String[String(p) for p in patterns]
+        buf = _encode_token_list(pats)
+
+        lib = _lib()
+        libh = Libdl.dlopen(lib)
+        raw = try
+            sym = Libdl.dlsym(libh, :lc_rs_regexset_compile)
+            @ccall $sym(
+                pointer(buf)::Ptr{UInt8},
+                Csize_t(length(buf))::Csize_t,
+            )::Ptr{Cvoid}
+        finally
+            Libdl.dlclose(libh)
+        end
+        raw == C_NULL && error("lc_rs_regexset_compile failed (one or more patterns rejected)")
+        obj = new(raw, pats)
+        finalizer(_free_regexset!, obj)
+        return obj
+    end
+end
+
+function _free_regexset!(set::RegexSet)
+    set.handle == C_NULL && return
+    lib = _lib()
+    handle = Libdl.dlopen(lib)
+    try
+        sym = Libdl.dlsym(handle, :lc_rs_free_regexset)
+        @ccall $sym(set.handle::Ptr{Cvoid})::Cvoid
+    finally
+        Libdl.dlclose(handle)
+    end
+    set.handle = C_NULL
+    return
+end
+
+"""
+    regexset_match(set::RegexSet, line) -> Vector{Int}
+
+Return 1-based indices into `set.patterns` of every pattern that
+matches `line`. Hyperscan-style multi-pattern search; useful when
+many typed-slot regexes must be evaluated together per line.
+"""
+function regexset_match(set::RegexSet, line::AbstractString)::Vector{Int}
+    set.handle == C_NULL &&
+        throw(ArgumentError("regexset_match: set was already freed"))
+    line_bytes = codeunits(String(line))
+
+    lib = _lib()
+    handle = Libdl.dlopen(lib)
+    try
+        sym = Libdl.dlsym(handle, :lc_rs_regexset_match)
+        sym_free = Libdl.dlsym(handle, :lc_rs_free_bytes)
+
+        raw = @ccall $sym(
+            set.handle::Ptr{Cvoid},
+            pointer(line_bytes)::Ptr{UInt8},
+            Csize_t(length(line_bytes))::Csize_t,
+        )::Ptr{_CBytes}
+        raw == C_NULL && error("lc_rs_regexset_match failed")
+        try
+            b = unsafe_load(raw)
+            n = div(Int(b.len), 4)
+            out = Vector{Int}(undef, n)
+            for i in 1:n
+                lo = unsafe_load(b.ptr, (i - 1) * 4 + 1)
+                m1 = unsafe_load(b.ptr, (i - 1) * 4 + 2)
+                m2 = unsafe_load(b.ptr, (i - 1) * 4 + 3)
+                hi = unsafe_load(b.ptr, (i - 1) * 4 + 4)
+                idx0 = UInt32(lo) |
+                       (UInt32(m1) << 8) |
+                       (UInt32(m2) << 16) |
+                       (UInt32(hi) << 24)
+                # Rust returns 0-based; Julia wants 1-based.
+                out[i] = Int(idx0) + 1
+            end
+            return out
+        finally
+            @ccall $sym_free(raw::Ptr{_CBytes})::Cvoid
+        end
+    finally
+        Libdl.dlclose(handle)
+    end
+end
+
+function _encode_pair_list(pairs)
+    out = UInt8[]
+    _push_u32!(out, UInt32(length(pairs)))
+    for p in pairs
+        kb = codeunits(String(first(p)))
+        vb = codeunits(String(last(p)))
+        _push_u32!(out, UInt32(length(kb))); append!(out, kb)
+        _push_u32!(out, UInt32(length(vb))); append!(out, vb)
+    end
+    return out
 end
 
 end # module Rust

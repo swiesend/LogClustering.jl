@@ -178,6 +178,83 @@ else
                                replacements = ["%"])
         @test out == raw".*?( DEBUG activemq| DEBUG common)"
     end
+
+    # -----------------------------------------------------------------
+    # Stage E″ MDL ladder bindings
+    # -----------------------------------------------------------------
+
+    @testset "slot_ladder — exact literal" begin
+        @test Rust.slot_ladder(["foo", "foo", "foo"]) == "foo"
+        @test Rust.slot_ladder(["a.b", "a.b"]) == raw"a\.b"   # metachar escaped
+    end
+
+    @testset "slot_ladder — enum under enum_max" begin
+        @test Rust.slot_ladder(["GET", "POST", "PUT"]; enum_max = 8) ==
+              "(?:GET|POST|PUT)"
+    end
+
+    @testset "slot_ladder — typed battery wins past enum_max" begin
+        typed = ["IP" => raw"\d{1,3}(?:\.\d{1,3}){3}",
+                 "INT" => raw"\d+"]
+        ips = ["10.0.0.$i" for i in 1:10]
+        @test Rust.slot_ladder(ips; typed = typed, enum_max = 4) ==
+              raw"(?:\d{1,3}(?:\.\d{1,3}){3})"
+    end
+
+    @testset "slot_ladder — bounded digit class fallback" begin
+        vals = [string(i) for i in 1000:1020]
+        @test Rust.slot_ladder(vals; enum_max = 4) == raw"\d{4}"
+    end
+
+    @testset "slot_ladder — wildcard on mixed shapes" begin
+        @test Rust.slot_ladder(["hello", "42", "!@#"]; enum_max = 2) == ".*?"
+    end
+
+    @testset "slot_ladder — empty input → wildcard" begin
+        @test Rust.slot_ladder(String[]; wildcard = "<*>") == "<*>"
+    end
+
+    @testset "alt_min — dedup + sort + escape" begin
+        @test Rust.alt_min(["c", "a", "b", "a"]) == "(?:a|b|c)"
+        @test Rust.alt_min(["only"]) == "only"
+        @test Rust.alt_min(["x.y", "x.y"]) == raw"x\.y"
+        @test Rust.alt_min(String[]; wildcard = "<*>") == "<*>"
+    end
+
+    @testset "verify_pattern — hit / total" begin
+        hits, total = Rust.verify_pattern(raw"\d{1,3}(?:\.\d{1,3}){3}",
+                                          ["10.0.0.1", "10.0.0.2", "not ip"])
+        @test (hits, total) == (2, 3)
+    end
+
+    @testset "verify_pattern — malformed is total miss" begin
+        @test Rust.verify_pattern("[broken", ["whatever"]) == (0, 1)
+    end
+
+    @testset "mdl_cost — tighter is cheaper" begin
+        samples = ["hello world", "hello world"]
+        tight = Rust.mdl_cost("hello world", samples)
+        loose = Rust.mdl_cost(".*?", samples)
+        @test tight < loose
+        @test tight > 0
+    end
+
+    @testset "RegexSet — compile + match" begin
+        set = Rust.RegexSet([raw"^\d+$", raw"^[a-z]+$", raw"^[A-Z]+$"])
+        @test Rust.regexset_match(set, "42") == [1]
+        @test Rust.regexset_match(set, "hello") == [2]
+        @test Rust.regexset_match(set, "HELLO") == [3]
+        @test isempty(Rust.regexset_match(set, "Mixed1"))
+    end
+
+    @testset "RegexSet — rejects malformed pattern" begin
+        @test_throws ErrorException Rust.RegexSet(["[broken"])
+    end
+
+    @testset "RegexSet — stores original pattern strings" begin
+        set = Rust.RegexSet([raw"^a$", raw"^b$"])
+        @test set.patterns == [raw"^a$", raw"^b$"]
+    end
 end
 
 end # if library built

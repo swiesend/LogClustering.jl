@@ -17,6 +17,7 @@
 use std::slice;
 
 mod infer;
+mod mdl;
 mod parse_line;
 
 // ---------------------------------------------------------------------------
@@ -27,7 +28,7 @@ mod parse_line;
 /// layout or function signature changes in a way that breaks callers.
 #[no_mangle]
 pub extern "C" fn lc_rs_abi_version() -> u32 {
-    2
+    3
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +392,303 @@ fn into_raw_spans(mut v: Vec<LcSpan>) -> *mut LcSpans {
     Box::into_raw(Box::new(LcSpans { ptr, len, cap }))
 }
 
+// ---------------------------------------------------------------------------
+// MDL ladder + RegexSet (Stage E″)
+// ---------------------------------------------------------------------------
+
+/// Decode a packed (u32 num + (u32 len, bytes)*) string list into
+/// owned-borrow `&str`s.
+unsafe fn decode_token_list(buf: &[u8]) -> Option<Vec<&str>> {
+    let mut cursor = 0usize;
+    if buf.len() < 4 {
+        return None;
+    }
+    let num = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    cursor += 4;
+    let mut out = Vec::with_capacity(num);
+    for _ in 0..num {
+        if cursor + 4 > buf.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().ok()?) as usize;
+        cursor += 4;
+        if cursor + len > buf.len() {
+            return None;
+        }
+        let s = std::str::from_utf8(&buf[cursor..cursor + len]).ok()?;
+        cursor += len;
+        out.push(s);
+    }
+    if cursor != buf.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Decode a packed (label, pattern) pair list matching
+/// `infer::decode_classes`' layout.
+unsafe fn decode_typed_battery(buf: &[u8]) -> Option<Vec<(&str, &str)>> {
+    let mut cursor = 0usize;
+    if buf.is_empty() {
+        return Some(Vec::new());
+    }
+    if buf.len() < 4 {
+        return None;
+    }
+    let num = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    cursor += 4;
+    let mut out = Vec::with_capacity(num);
+    for _ in 0..num {
+        let mut read_str = || -> Option<&str> {
+            if cursor + 4 > buf.len() {
+                return None;
+            }
+            let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().ok()?) as usize;
+            cursor += 4;
+            if cursor + len > buf.len() {
+                return None;
+            }
+            let s = std::str::from_utf8(&buf[cursor..cursor + len]).ok()?;
+            cursor += len;
+            Some(s)
+        };
+        let label = read_str()?;
+        let pattern = read_str()?;
+        out.push((label, pattern));
+    }
+    if cursor != buf.len() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Slot-ladder pass: given packed slot realisations and a typed
+/// battery, return the tightest regex that matches every value.
+///
+/// Wire format of both `values_buf` and `typed_buf` follows the
+/// `infer_regex` convention. `enum_max` is the maximum distinct-value
+/// cardinality at which the ladder emits an enumerated alternation.
+/// `wildcard_ptr`/`_len` is the fallback fragment (default `.*?` if
+/// null / zero-length).
+///
+/// # Safety
+/// All pointers must be valid for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_slot_ladder(
+    values_ptr: *const u8,
+    values_len: usize,
+    typed_ptr: *const u8,
+    typed_len: usize,
+    enum_max: u32,
+    wildcard_ptr: *const u8,
+    wildcard_len: usize,
+) -> *mut LcBytes {
+    if values_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let values_buf = slice::from_raw_parts(values_ptr, values_len);
+    let values = match decode_token_list(values_buf) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let typed_buf: &[u8] = if typed_ptr.is_null() || typed_len == 0 {
+        &[]
+    } else {
+        slice::from_raw_parts(typed_ptr, typed_len)
+    };
+    let typed = match decode_typed_battery(typed_buf) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let wildcard = if wildcard_ptr.is_null() || wildcard_len == 0 {
+        ".*?"
+    } else {
+        match std::str::from_utf8(slice::from_raw_parts(wildcard_ptr, wildcard_len)) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    let out = mdl::slot_ladder_pattern(&values, &typed, enum_max as usize, wildcard);
+    into_raw_bytes(out.into_bytes())
+}
+
+/// Alternation-minimiser: return a sorted, dedup'd, escaped
+/// alternation group from a packed list of strings.
+///
+/// # Safety
+/// `alts_buf` must follow the standard `u32 num + (u32 len, bytes)*`
+/// wire format.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_alt_min(
+    alts_ptr: *const u8,
+    alts_len: usize,
+    wildcard_ptr: *const u8,
+    wildcard_len: usize,
+) -> *mut LcBytes {
+    if alts_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let buf = slice::from_raw_parts(alts_ptr, alts_len);
+    let alts = match decode_token_list(buf) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    let wildcard = if wildcard_ptr.is_null() || wildcard_len == 0 {
+        ".*?"
+    } else {
+        match std::str::from_utf8(slice::from_raw_parts(wildcard_ptr, wildcard_len)) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    let out = mdl::alt_min(&alts, wildcard);
+    into_raw_bytes(out.into_bytes())
+}
+
+/// Anchored verification. Returns packed `(u32 hits, u32 total)` via
+/// the two-slot layout below.
+#[repr(C)]
+pub struct LcVerify {
+    pub hits: u32,
+    pub total: u32,
+}
+
+/// # Safety
+/// Pointers must be valid for their lengths; `samples_buf` uses the
+/// standard packed string list.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_verify_pattern(
+    pattern_ptr: *const u8,
+    pattern_len: usize,
+    samples_ptr: *const u8,
+    samples_len: usize,
+) -> LcVerify {
+    if pattern_ptr.is_null() || samples_ptr.is_null() {
+        return LcVerify { hits: 0, total: 0 };
+    }
+    let pattern =
+        match std::str::from_utf8(slice::from_raw_parts(pattern_ptr, pattern_len)) {
+            Ok(s) => s,
+            Err(_) => return LcVerify { hits: 0, total: 0 },
+        };
+    let buf = slice::from_raw_parts(samples_ptr, samples_len);
+    let samples = match decode_token_list(buf) {
+        Some(v) => v,
+        None => return LcVerify { hits: 0, total: 0 },
+    };
+    let (h, t) = mdl::verify_pattern(pattern, &samples);
+    LcVerify {
+        hits: h as u32,
+        total: t as u32,
+    }
+}
+
+/// MDL-style cost estimate in bits for `pattern` over `samples`.
+///
+/// # Safety
+/// Same contract as `lc_rs_verify_pattern`.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_mdl_cost(
+    pattern_ptr: *const u8,
+    pattern_len: usize,
+    samples_ptr: *const u8,
+    samples_len: usize,
+) -> f64 {
+    if pattern_ptr.is_null() || samples_ptr.is_null() {
+        return f64::NAN;
+    }
+    let pattern =
+        match std::str::from_utf8(slice::from_raw_parts(pattern_ptr, pattern_len)) {
+            Ok(s) => s,
+            Err(_) => return f64::NAN,
+        };
+    let buf = slice::from_raw_parts(samples_ptr, samples_len);
+    let samples = match decode_token_list(buf) {
+        Some(v) => v,
+        None => return f64::NAN,
+    };
+    mdl::mdl_cost(pattern, &samples)
+}
+
+// ---- RegexSet multi-pattern matcher ----
+
+/// Opaque handle for a compiled `regex::RegexSet`.
+#[repr(C)]
+pub struct LcRegexSet {
+    _priv: [u8; 0],
+}
+
+/// Compile a list of regexes into a `RegexSet`. Returns null if any
+/// pattern fails to parse — all-or-nothing, like Hyperscan.
+///
+/// # Safety
+/// `patterns_buf` must encode the standard packed string list.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_regexset_compile(
+    patterns_ptr: *const u8,
+    patterns_len: usize,
+) -> *mut LcRegexSet {
+    if patterns_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let buf = slice::from_raw_parts(patterns_ptr, patterns_len);
+    let patterns = match decode_token_list(buf) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+    match mdl::regexset_compile(&patterns) {
+        Some(c) => Box::into_raw(Box::new(c)) as *mut LcRegexSet,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Match `line` against every pattern in `handle`. Returns a heap
+/// `LcBytes` holding a contiguous `u32` array of matched indices
+/// (little-endian) — length is `bytes.len / 4`. Empty set → zero-length
+/// bytes. Must be freed with [`lc_rs_free_bytes`].
+///
+/// # Safety
+/// `handle` must be a live pointer returned by
+/// [`lc_rs_regexset_compile`].
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_regexset_match(
+    handle: *const LcRegexSet,
+    line_ptr: *const u8,
+    line_len: usize,
+) -> *mut LcBytes {
+    if handle.is_null() || line_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let set = &*(handle as *const mdl::CompiledRegexSet);
+    let line = match std::str::from_utf8(slice::from_raw_parts(line_ptr, line_len)) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let idxs = mdl::regexset_match(set, line);
+    let mut out = Vec::with_capacity(idxs.len() * 4);
+    for i in idxs {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    into_raw_bytes(out)
+}
+
+/// Release a `RegexSet` returned by [`lc_rs_regexset_compile`].
+///
+/// # Safety
+/// Pointer must originate from this crate's allocator; never call
+/// twice.
+#[no_mangle]
+pub unsafe extern "C" fn lc_rs_free_regexset(handle: *mut LcRegexSet) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle as *mut mdl::CompiledRegexSet));
+}
+
+// ---------------------------------------------------------------------------
+// Helpers (cont.)
+// ---------------------------------------------------------------------------
+
 unsafe fn slice_of_strs<'a>(
     ptrs: *const *const u8,
     lens: *const usize,
@@ -425,6 +723,6 @@ mod tests {
     fn abi_version_matches_crate_constant() {
         // Must equal the version documented in `lc_rs_abi_version`; the
         // Julia side's `Rust.ABI_VERSION` tracks the same integer.
-        assert_eq!(lc_rs_abi_version(), 2);
+        assert_eq!(lc_rs_abi_version(), 3);
     }
 }
