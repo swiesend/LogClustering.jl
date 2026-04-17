@@ -41,10 +41,12 @@ non-differentiable boundary — Lux makes that explicit.
   construction, parameter shapes, vector + batch forward, unit tests of the
   competition math, Zygote gradient flow, text-preprocessing utilities
   (commit `e94ed31`).
-- [ ] Convert CI from Travis/AppVeyor to GitHub Actions.
-- [ ] Add `Manifest.toml` after first successful `Pkg.instantiate()`.
-- [ ] Wire a `py/` companion project (pyproject.toml + `PythonCall.jl`) for
-  embedders, UMAP-learn, HDBSCAN, LILAC.
+- [x] Convert CI from Travis/AppVeyor to GitHub Actions
+  (`.github/workflows/CI.yml`; `appveyor.yml` removed).
+- [x] Add `Manifest.toml` after first successful `Pkg.instantiate()` on
+  Julia 1.10.11 (corrects stale `LuxCore` UUID).
+- [x] Wire a `py/` companion project (pyproject.toml + `PythonCall.jl` +
+  `CondaPkg.toml`) for embedders, UMAP-learn, HDBSCAN, LILAC.
 
 **Files touched.** `Project.toml`, `src/KATE.jl`, `src/LogClustering.jl`,
 `test/runtests.jl`, `test/test_KATE.jl`, `.github/workflows/CI.yml` (new),
