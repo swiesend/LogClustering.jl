@@ -51,6 +51,16 @@ using .Drain3
 include("PostProc/Canonical.jl")
 using .Canonical
 
+include("Persistence.jl")
+using .Persistence
+
+include("PersistenceGlue.jl")
+using .PersistenceGlue
+
+function __init__()
+    PersistenceGlue.register_all!()
+end
+
 include("Cluster/Sparsity.jl")
 using .Sparsity
 
@@ -59,7 +69,8 @@ using .Pipeline
 
 export KATE, DeepKATE, Framing, Masking, Dedup, Episodes, Instance,
        SeqLSTM, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
-       Sparsity, Pipeline, Drain3, Canonical, Rust
+       Sparsity, Pipeline, Drain3, Canonical, Persistence,
+       PersistenceGlue, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload

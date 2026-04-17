@@ -47,13 +47,28 @@ mutable struct DedupState
     observed::Int
 end
 
-function DedupState(; expected_n::Integer, fpr::Real = 1e-4)
+function DedupState(; expected_n::Union{Nothing, Integer} = nothing,
+                    fpr::Real = 1e-4,
+                    m::Union{Nothing, Integer} = nothing,
+                    k::Union{Nothing, Integer} = nothing,
+                    bits::Union{Nothing, BitVector} = nothing,
+                    observed::Integer = 0)
+    if m !== nothing && k !== nothing
+        # Restore-from-fields path (used by Persistence rehydration).
+        bv = bits === nothing ? falses(Int(m)) : bits
+        length(bv) == Int(m) ||
+            throw(ArgumentError("length(bits) ($(length(bv))) != m ($m)"))
+        return DedupState(Int(m), Int(k), bv, Int(observed))
+    end
+    # Size-from-workload path (the common call).
+    expected_n === nothing &&
+        throw(ArgumentError("supply either `expected_n` or both `m` and `k`"))
     expected_n >= 1 || throw(ArgumentError("expected_n must be ≥ 1"))
     0 < fpr < 1 || throw(ArgumentError("fpr must be in (0, 1)"))
     # Optimal-size formulas (Mitzenmacher & Upfal 2005).
-    m = max(8, ceil(Int, -expected_n * log(fpr) / (log(2)^2)))
-    k = max(1, round(Int, m / expected_n * log(2)))
-    return DedupState(m, k, falses(m), 0)
+    m′ = max(8, ceil(Int, -expected_n * log(fpr) / (log(2)^2)))
+    k′ = max(1, round(Int, m′ / expected_n * log(2)))
+    return DedupState(m′, k′, falses(m′), 0)
 end
 
 # Double hashing (Kirsch & Mitzenmacher 2006): two independent Julia
