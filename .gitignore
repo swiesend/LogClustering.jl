@@ -9,3 +9,9 @@
 *.data
 *.model
 *.ods
+
+# Rust build artefacts
+/rust/target/
+
+# uv-managed Python venv
+/py/.venv/

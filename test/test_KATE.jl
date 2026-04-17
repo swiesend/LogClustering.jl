@@ -14,9 +14,14 @@ const RNG = Random.MersenneTwister(1234)
         l = KCompetetive(100, 8)
         @test l.in_dims == 100
         @test l.out_dims == 8
+        @test l.k == 8                                       # default k = out
         @test l.alpha == 6.26f0
-        @test_throws ArgumentError KCompetetive(10, 12)      # k > in
-        @test_throws ArgumentError KCompetetive(10, 3)       # k odd
+        @test_throws ArgumentError KCompetetive(10, 12)      # out > in isn't flagged,
+                                                             # but default k=12 > in=10 is.
+        @test_throws ArgumentError KCompetetive(10, 8; k = 12)   # k > out
+        @test_throws ArgumentError KCompetetive(10, 8; k = 0)    # k < 1
+        l2 = KCompetetive(100, 100; k = 25)                  # odd k is allowed
+        @test l2.k == 25
     end
 
     @testset "parameter shapes" begin

@@ -2,10 +2,23 @@
 
 | Field | Value |
 |---|---|
-| Status | In progress (Stage A partially landed) |
+| Status | In progress (Stage A complete; thesis ports landing into B/C/E″) |
 | Scope | Revive `LogClustering.jl` and realise the full thesis pipeline on modern tooling |
 | Supersedes | — |
-| See also | [`../vision.md`](../vision.md) |
+| See also | [`../vision.md`](../vision.md), the 2018 thesis ([DLR elib 126129](https://elib.dlr.de/126129/)) |
+
+## Language boundary
+
+Main implementation is Julia. Performance-critical kernels — the recursive
+regex-cascade parser (thesis Algorithm 3.1) and the log-key regex
+inference (Algorithm 3.10) — are written in Rust in the companion crate
+`rust/logclustering_rs`, exposed through `@ccall` in `src/Rust.jl`. The
+crate uses `regex`/`regex-automata` (RE2-flavoured, linear-time matching)
+so the kernels stay composable with downstream Hyperscan/RE2 emit.
+`deps/build.jl` invokes `cargo build --release`; if `cargo` is absent the
+Rust module degrades to a runtime error and the rest of the package
+still loads. CI builds the crate in a dedicated `rust` job
+(`cargo fmt --check`, `clippy -D warnings`, `cargo test --release`).
 
 ## Context
 
@@ -78,7 +91,13 @@ on HDFS within 1 pt.
 
 ### Stage C — Compression / encoder-decoder track *(preserves thesis spirit)*
 
-**Decision.** Keep KATE-modernised as the reference. Add three siblings:
+**Decision.** Keep KATE-modernised as the reference. DeepKATE (the
+thesis's own contribution, §3.2.3, Quellcode 3.7/3.8/3.9) is *ported*
+from Flux to Lux in `src/DeepKATE.jl`: ten-layer autoencoder, two
+`KCompetetive` layers with `k < out` (this required extending
+`KCompetetive` to separate `out_dims` from `k`), sine-activated
+bottleneck, dropout, and the triplet Pareto loss (prev/ce/succ) with
+stop-gradient targets via `@ignore_derivatives`. Add three siblings:
 
 - **VQ-VAE** (van den Oord et al. 2017) — the principled descendant of
   k-winner-take-all; codebook *is* the cluster vocabulary; discrete code
@@ -163,6 +182,12 @@ log-count normalisation) with a layered, reorderable pipeline.
    `SubString` views. Hot-path allocation is constant in input length
    (≤ 512 B per call, dominated by the returned `Frame` itself).
    Journald export format is still TODO.
+   **Thesis-body parser also ported** — `src/Rust.jl` exposes
+   `parse_line`, the recursive regex-cascade descent of thesis
+   Algorithm 3.1 (ordered label battery, left/right recursion on
+   unmatched slices). Lives in the Rust crate because it's the hot
+   inner loop; Julia side returns `Vector{Span}` with 1-based byte
+   indices and the matched label (or `nothing` for raw runs).
 2. **Unicode NFKC** + optional case folding (preserve case for identifiers).
 3. **Typed-slot masking** — ordered battery of pre-compiled regexes (IP/IPv6,
    MAC, UUID, SHA-1/256 hex, hex-address, paths, URLs, email, ISO/Unix
@@ -202,6 +227,16 @@ false-positive rate ≤ 1e-4 on a 1 M-line probe.
 ---
 
 ### Stage E″ — Performant generic-regex generation
+
+**Thesis baseline already ported.** `src/Rust.jl` exposes `infer_regex`,
+a direct port of thesis Algorithm 3.10: group tokens by position, collapse
+agreements to literals, disagreements to `(a|b|c)` alternations, rewrite
+descriptive placeholders (`%RCE_DATETIME%` etc.) to a configurable
+wildcard. Metacharacter escaping is via the `regex` crate's `escape`. A
+parity test against the thesis's own Beispiel 3.1 output is in
+`test/test_rust.jl`. The full Stage E″ pipeline below *layers on top of*
+the thesis baseline; anti-unification replaces the position-aligned
+grouping when lines differ in length.
 
 **Decision.** Turn a cluster of raw lines or a template with `<*>` slots into
 a single, precise, performant regex via:
@@ -273,7 +308,9 @@ BGE+HDBSCAN, KATE-original, KATE-modernised, VQ-VAE, SimCSE-logs across all
 
 ```
 src/
-  KATE.jl                      # modernised (Stage A, done)
+  KATE.jl                      # modernised (Stage A, done; k ≠ out)
+  DeepKATE.jl                  # ported from Flux to Lux (thesis §3.2.3)
+  Rust.jl                      # @ccall bindings for rust/logclustering_rs
   LogClustering.jl             # umbrella
   Data/{LogHub.jl, Tokenizers.jl, EventLog.jl, Corpus.jl}
   PreProc/{Framing.jl, Masking.jl, Dedup.jl}
@@ -284,13 +321,16 @@ src/
   Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl, Embedders.jl,
           SeqLSTM.jl, SeqTransformer.jl, SeqMamba.jl}
   Cluster/{Pipeline.jl, Sparsity.jl}
-  Mining/{Episodes.jl}
+  Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, TODO)
   Anomaly/{Instance.jl, Sequence.jl}
   RCA/{Graph.jl, CausalDiscovery.jl, LLM.jl}
   Eval/{Metrics.jl, Harness.jl, CV.jl}
   LLM/{Loop.jl, Labeling.jl}
+rust/                          # cdylib: parse_line + infer_regex (thesis §3.2.2, §3.2.6)
+  Cargo.toml, Cargo.lock, src/{lib.rs, parse_line.rs, infer.rs}
+deps/build.jl                  # `cargo build --release`, triggered by Pkg.build
 py/
-  pyproject.toml, embedders.py, lilac_parser.py, umap_hdbscan.py
+  pyproject.toml, uv.lock, logclustering_py/*.py
 benchmarks/{loghub2/, regex/}
 docs/
   vision.md

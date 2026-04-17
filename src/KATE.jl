@@ -8,31 +8,40 @@ using ChainRulesCore: @ignore_derivatives
 export KCompetetive, count_words, normalize_log, transform_text_to_input, get_similar_words
 
 """
-    KCompetetive(in, k, σ=tanh, α=6.26; init_weight=glorot_uniform, init_bias=zeros32)
+    KCompetetive(in, out, σ=tanh, α=6.26; k=out, init_weight=glorot_uniform, init_bias=zeros32)
 
 K-competitive autoencoder layer (Chen & Zaki, KDD 2017).
 
-Computes the pre-activation `h = W*x + b`, applies k-winner-take-all competition
-separately on the positive and negative halves of `h` (keeping `k/2` winners each),
-redistributes the "energy" of the losers to the winners (scaled by `α`),
-zeroes the losers, and finally applies `σ`.
+Computes the pre-activation `h = W*x + b` (size `out`), applies
+k-winner-take-all competition separately on the positive and negative
+halves of `h` (keeping `k/2` winners each), redistributes the "energy"
+of the losers to the winners (scaled by `α`), zeroes the losers, and
+finally applies `σ`.
 
-`k` must be even. `α` is the boost factor from the paper (default 6.26).
+`k` is the number of competitive winners (not the output dimension).
+The DeepKATE topology (thesis §3.2.3) uses `k < out` so most neurons
+become losers; passing only positional arguments preserves the
+original-KATE default `k = out`. `k` must be `≤ out`. Odd `k` is
+allowed — `⌊k/2⌋` winners are kept on the positive and negative side
+each, so one slot is unused when `k` is odd.
 """
 struct KCompetetive{F, IW, IB} <: AbstractLuxLayer
     in_dims::Int
     out_dims::Int
+    k::Int
     activation::F
     alpha::Float32
     init_weight::IW
     init_bias::IB
 end
 
-function KCompetetive(in::Integer, k::Integer, σ = tanh, α::Real = 6.26f0;
+function KCompetetive(in::Integer, out::Integer, σ = tanh, α::Real = 6.26f0;
+                      k::Integer = out,
                       init_weight = glorot_uniform, init_bias = zeros32)
     k > in && throw(ArgumentError("k ($k) must not exceed in ($in)"))
-    isodd(k) && throw(ArgumentError("k ($k) must be even (splits positive/negative winners)"))
-    return KCompetetive(Int(in), Int(k), σ, Float32(α), init_weight, init_bias)
+    k > out && throw(ArgumentError("k ($k) must not exceed out ($out)"))
+    k < 1 && throw(ArgumentError("k ($k) must be ≥ 1"))
+    return KCompetetive(Int(in), Int(out), Int(k), σ, Float32(α), init_weight, init_bias)
 end
 
 function LuxCore.initialparameters(rng::AbstractRNG, l::KCompetetive)
@@ -47,7 +56,7 @@ LuxCore.statelength(::KCompetetive) = 0
 function Base.show(io::IO, l::KCompetetive)
     print(io, "KCompetetive(", l.in_dims, " => ", l.out_dims)
     l.activation === identity || print(io, ", ", l.activation)
-    print(io, "; α=", l.alpha, ")")
+    print(io, "; k=", l.k, ", α=", l.alpha, ")")
 end
 
 """
@@ -100,12 +109,12 @@ end
 
 function (l::KCompetetive)(x::AbstractVector, ps, st::NamedTuple)
     h = ps.weight * x .+ ps.bias
-    return l.activation.(_apply_kcomp(h, l.out_dims, l.alpha)), st
+    return l.activation.(_apply_kcomp(h, l.k, l.alpha)), st
 end
 
 function (l::KCompetetive)(x::AbstractMatrix, ps, st::NamedTuple)
     h = ps.weight * x .+ ps.bias
-    cols = [_apply_kcomp(view(h, :, j), l.out_dims, l.alpha) for j in axes(h, 2)]
+    cols = [_apply_kcomp(view(h, :, j), l.k, l.alpha) for j in axes(h, 2)]
     return l.activation.(reduce(hcat, cols)), st
 end
 
