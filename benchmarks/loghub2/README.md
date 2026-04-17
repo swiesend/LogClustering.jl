@@ -6,6 +6,25 @@ ground truth for every parser / clusterer in the repo.
 
 [loghub]: https://github.com/logpai/logparser
 
+## Fetch the 2k subsets
+
+The bench ships on the 2k-line annotated subsets (enough for CI,
+< 0.2 MB each) published alongside the logparser repo:
+
+```sh
+# Default: HDFS, Apache, OpenSSH — enough to run `run.jl` end-to-end.
+julia --project benchmarks/loghub2/download.jl
+
+# Full set of 14 datasets referenced in the plan.
+julia --project benchmarks/loghub2/download.jl --all
+
+# Specific subset.
+julia --project benchmarks/loghub2/download.jl HDFS Spark
+```
+
+Downloads land under `benchmarks/loghub2/data/<Dataset>/`; that
+directory is `.gitignore`d.
+
 ## One dataset, one parser
 
 ```sh

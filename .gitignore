@@ -15,3 +15,6 @@
 
 # uv-managed Python venv
 /py/.venv/
+
+# LogHub-2.0 downloads (fetched by benchmarks/loghub2/download.jl)
+/benchmarks/loghub2/data/
