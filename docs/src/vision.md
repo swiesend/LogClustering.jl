@@ -29,7 +29,7 @@ Every future extension must keep these four ideas intelligible and falsifiable.
 | No clustering step on learned embeddings | "LogClustering" name is aspirational. |
 | No log dataset loader | Evaluated on Shakespeare; log-specific behaviour unverified. |
 | No evaluation metrics | Cannot quantify whether KATE helps. |
-| No baselines | Impossible to position against Drain/Brain/LogPPT/LILAC. |
+| No baselines | Impossible to position against Drain / Brain / LogPPT (all locally-runnable). |
 | No log-aware tokeniser | Regex splits break numeric/IP/path tokens. |
 | Obsolete Flux API (Julia 0.6) | Project could not run on current Julia. |
 
@@ -64,20 +64,20 @@ Log ─► Event-Log Parsing ─► Event-Log ─► Event-Log Corpus
 
 | Thesis node (figure, German) | What it meant | Modern counterpart |
 |---|---|---|
-| **Event-Log Parsing** | Turn raw lines into structured events | Typed-slot pre-processing → Drain3 → LILAC/LLM fallback → generic regex emission |
+| **Event-Log Parsing** | Turn raw lines into structured events | Typed-slot pre-processing → Drain3 → LogPPT (local fine-tuned RoBERTa) → generic regex emission |
 | **Event-Log** | Sequence of structured events with slots | `EventSchema` (template-id, slot values, timestamp, host) |
 | **Event-Log Corpus** | Persistent, query-able corpus | Parquet + DuckDB; Arrow columnar; indexed by template-id and time |
-| **Log-Key Inferenz** | Stable IDs per distinct template | Canonical-template hash → stable integer key; LLM-named human label |
-| **Instanzbasiertes Modell (Autoencoder)** | KATE | KATE-modernised + VQ-VAE + denoising AE + SimCSE + pretrained encoders (BGE/E5/Nomic/Jina) behind a common `Embedder` interface |
+| **Log-Key Inferenz** | Stable IDs per distinct template | Canonical-template hash → stable integer key |
+| **Instanzbasiertes Modell (Autoencoder)** | KATE | KATE-modernised + VQ-VAE + denoising AE + SimCSE + locally-loadable HuggingFace encoders (BGE/E5/Nomic/Jina via downloaded weights) behind a common `Embedder` interface |
 | **Dimensionsreduktion (Einbettung)** | Project to low-D space | UMAP (McInnes 2018), PaCMAP (Wang 2021); ivis for supervised DR |
 | **Clustering** | Group similar events | HDBSCAN default; k-means + sparsity-based (KATE argmax) as comparators |
 | **Clustering Validierung** | Validate assignment against log-keys | PA/GA/FGA/FTA/NMI/ARI/homogeneity; iterative re-embedding on low-purity clusters |
 | **Episode Mining** | Frequent sequential patterns | Thesis's MV-Span (SPADE-derived, projected vertical DB) + MT-Span (TSpan/EWU/IESC) ported in `src/Mining/Episodes.jl`; PrefixSpan (Pei 2001), SPADE (Zaki 2001), CM-SPADE; Transformer attention-motif mining |
-| **Sequentielles Modell (LSTM)** | Predict next event | Transformer decoder (DeepLog → LogBERT lineage); Mamba/SSM (Gu & Dao 2024); LLM with structured output. LSTM baseline ported from the thesis in `src/Models/SeqLSTM.jl` (Lux `Recurrence(LSTMCell)` + `Embedding` + `Dense`; bi-directional + peephole variants TODO) |
+| **Sequentielles Modell (LSTM)** | Predict next event | Transformer decoder (DeepLog → LogBERT lineage); Mamba/SSM (Gu & Dao 2024). LSTM baseline ported from the thesis in `src/Models/SeqLSTM.jl` (Lux `Recurrence(LSTMCell)` + `Embedding` + `Dense`; bi-directional + peephole variants TODO) |
 | **Kreuzvalidierung** | k-fold CV | Time-ordered / per-host splits to avoid leakage |
-| **Ausreißererkennung (Instanz)** | Detect anomalous single lines | AE/VQ-VAE reconstruction error; HDBSCAN outlier score; isolation forest; LLM-surprise |
+| **Ausreißererkennung (Instanz)** | Detect anomalous single lines | AE/VQ-VAE reconstruction error; HDBSCAN outlier score; isolation forest; value-novelty over masked slots |
 | **Ausreißererkennung (Sequenz)** | Detect anomalous sequences | DeepLog top-k next-event; LogBERT masked-event surprise; SeqTransformer perplexity |
-| **Root-Cause-Analysis** | Identify causal chain | Episode-graph causal discovery (PC, LiNGAM, PCMCI+); LLM-RCA over retrieved context; counterfactual ablation |
+| **Root-Cause-Analysis** | Identify causal chain | Episode-graph causal discovery (PC, LiNGAM, PCMCI+); counterfactual ablation |
 
 ## End-to-end topology
 
@@ -89,13 +89,13 @@ raw log stream
   │
   ▼
 [Parsing]  Drain3 ───► Log-Key Inference  ─────┐
-  │      └─► LILAC (LLM, for residuals)        │
+  │      └─► LogPPT (local RoBERTa, residuals) │
   │                                            │
   ▼                                            │
 [Regex] AntiUnify → SlotLadder → RE2/Hyperscan │
   │                                            │
   ▼                                            ▼
-[Embed] KATE / VQ-VAE / SimCSE / BGE ◄─── Event-Log Corpus (Parquet + DuckDB)
+[Embed] KATE / VQ-VAE / SimCSE / BGE-local ◄─── Event-Log Corpus (Parquet + DuckDB)
   │
   ▼
 [DR]    UMAP / PaCMAP
@@ -108,11 +108,30 @@ raw log stream
   │                   │                    │
   ▼                   ▼                    ▼
 Instance         Sequence-Anomaly    Root-Cause Analysis
-Anomaly          (DeepLog/LogBERT)   (PC / LiNGAM / LLM-RCA)
+Anomaly          (DeepLog/LogBERT)   (PC / LiNGAM / counterfactual)
 ```
 
 This is the figure, extended — not replaced. Every original arrow survives;
 every original box has a modern interior.
+
+## Local-only constraint
+
+`LogClustering.jl` runs offline. The pipeline must work end-to-end on a
+laptop with no public-internet calls beyond the initial download of
+model weights / datasets — no OpenAI, Anthropic, Cohere, or other
+remote-LLM-API dependency. Anywhere a "neural inference" step appears,
+it's served by:
+
+- **Locally-loaded HuggingFace weights** — `transformers` /
+  `sentence-transformers` running through the `py/` uv venv (BGE,
+  GTE, E5, Nomic, Jina, RoBERTa-based LogPPT).
+- **Pure-Julia models** trained in this repo (KATE, DeepKATE, VQ-VAE,
+  SimCSE, SeqLSTM, peephole-LSTM).
+- **Native algorithms** (Drain, MV-Span, MT-Span, k-means, HDBSCAN
+  via Python).
+
+If a future feature genuinely needs a generative LLM, it goes through
+a *local* runtime (Ollama, llama.cpp, MLX) — never a remote API.
 
 ## Theoretical spine
 
@@ -125,8 +144,10 @@ Drain's dictionary gives the thesis the coherent spine it previously lacked.
 
 Julia stays the core (preserves thesis identity and the `KCompetetive` layer).
 A Python companion handles the HuggingFace-only pieces (embedders, UMAP-learn,
-HDBSCAN, LILAC) via `PythonCall.jl`. A full Python rewrite would erase the
+HDBSCAN, LogPPT) via `PythonCall.jl`. A full Python rewrite would erase the
 thesis; a pure-Julia rewrite would re-implement two years of HuggingFace work.
+The Python side ships through the `py/` uv venv and downloads weights once
+to a local cache — no runtime API calls.
 
 ## Out of scope
 
@@ -135,6 +156,10 @@ thesis; a pure-Julia rewrite would re-implement two years of HuggingFace work.
 - Training a log-specific foundation model from scratch — we only fine-tune
   and prompt existing ones.
 - Production-hardening (auth, multi-tenancy, storage).
+- **Cloud-LLM dependencies** (OpenAI, Anthropic, Cohere, Google Gemini, etc.).
+  Every feature must run offline once weights are cached. LILAC-style
+  prompted parsers are explicitly out — LogPPT covers the same niche
+  with a fully-local fine-tuned RoBERTa.
 
 These are natural follow-ons but dilute the thesis-extension narrative.
 
@@ -142,3 +167,6 @@ These are natural follow-ons but dilute the thesis-extension narrative.
 
 - [`plans/001_upgrade-to-2026-stack.md`](plans/001_upgrade-to-2026-stack.md)
   — the concrete staged plan with decisions, modules, and verification.
+- [`plans/002_persistence-autotune-cli.md`](plans/002_persistence-autotune-cli.md)
+  — persistence / auto-tune / CLI: make every trained artifact
+  reproducible, right-sized from data, and usable from a shell.

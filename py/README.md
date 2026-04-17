@@ -1,9 +1,10 @@
 # logclustering-py
 
 Python companion for [`LogClustering.jl`](../). Hosts the HuggingFace-only
-pieces of the pipeline — embedders (BGE / GTE / E5 / Nomic / Jina),
-UMAP-learn, HDBSCAN, and LILAC — and is called from Julia via
-`PythonCall.jl`.
+pieces of the pipeline — locally-loaded embedders (BGE / GTE / E5 /
+Nomic / Jina), UMAP-learn, HDBSCAN, and LogPPT — and is called from
+Julia via `PythonCall.jl`. No cloud-API dependency: weights are
+downloaded once to the local HuggingFace cache and used offline.
 
 ## Managed with [uv](https://docs.astral.sh/uv/)
 

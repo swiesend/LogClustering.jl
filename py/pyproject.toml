@@ -1,7 +1,7 @@
 [project]
 name = "logclustering-py"
 version = "0.1.0"
-description = "Python companion for LogClustering.jl: HuggingFace-only pieces (embedders, UMAP-learn, HDBSCAN, LILAC)."
+description = "Python companion for LogClustering.jl: locally-loaded HuggingFace pieces (embedders, UMAP-learn, HDBSCAN, LogPPT). No cloud-API dependency."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

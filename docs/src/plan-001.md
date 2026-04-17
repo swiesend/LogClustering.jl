@@ -61,7 +61,8 @@ non-differentiable boundary — Lux makes that explicit.
 - [x] Wire a `py/` companion project (uv-managed `pyproject.toml` +
   `uv.lock`, driven through `PythonCall.jl` with
   `JULIA_CONDAPKG_BACKEND=Null` + `JULIA_PYTHONCALL_EXE` pointing at
-  `py/.venv`) for embedders, UMAP-learn, HDBSCAN, LILAC.
+  `py/.venv`) for embedders, UMAP-learn, HDBSCAN, LogPPT — all
+  locally-loaded, no cloud-API dependency.
 
 **Files touched.** `Project.toml`, `src/KATE.jl`, `src/LogClustering.jl`,
 `test/runtests.jl`, `test/test_KATE.jl`, `.github/workflows/CI.yml` (new),
@@ -101,11 +102,20 @@ stop-gradient targets via `@ignore_derivatives`. Add three siblings:
 
 - **VQ-VAE** (van den Oord et al. 2017) — the principled descendant of
   k-winner-take-all; codebook *is* the cluster vocabulary; discrete code
-  becomes the cluster ID for free.
+  becomes the cluster ID for free. *Ported* in `src/Models/VQVAE.jl`:
+  `VectorQuantizer` Lux layer with straight-through estimator,
+  `vq_vae` Dense-encoder/decoder Chain, `vq_vae_loss` (reconstruction
+  + β·commitment + codebook — equation 3 of the paper),
+  `assign_codes` for "cluster id for free".
 - **Masked / denoising autoencoder** (Vincent 2008; He et al. MAE 2022) —
-  stronger self-supervised signal than pure reconstruction.
+  stronger self-supervised signal than pure reconstruction. TODO.
 - **Contrastive sentence encoder** (SimCSE, Gao et al. 2021) with log-specific
-  augmentations (parameter masking, timestamp dropout).
+  augmentations (parameter masking, timestamp dropout). *Ported* in
+  `src/Models/SimCSE.jl`: `simcse_loss(h, h⁺; τ)` (InfoNCE over cosine
+  similarity, deliberately backbone-agnostic) and
+  `simcse_step_loss(model, ps, st, x; τ)` (double-forward via
+  Dropout RNG). Pairs with any Lux `Chain` with at least one
+  Dropout layer.
 
 Replace the regex BoW input with **BPE** via `BytePairEncoding.jl` (or
 SentencePiece) trained per-dataset.
@@ -113,38 +123,47 @@ SentencePiece) trained per-dataset.
 **Rationale.** VQ-VAE is the clean 2020s formalisation of what KATE was reaching
 for. SimCSE empirically beats reconstruction-trained encoders on clustering.
 
-**Files (new).** `src/Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl,
-Embedders.jl}`, `src/Data/Tokenizers.jl`.
+**Files.** `src/Models/VQVAE.jl` ✓, `src/Models/SimCSE.jl` ✓;
+DenoisingAE + Embedders.jl + Data/Tokenizers.jl still TODO.
 
 **Verification.** VQ-VAE codebook perplexity stable; SimCSE NMI on HDFS
 ≥ KATE-modernised + 3 pts.
 
 ---
 
-### Stage D — LLM track
+### Stage D — Local-only neural track
 
-**Decision.** Ship four LLM touch-points, each bounded by a deterministic
-verifier:
+**Decision.** Cloud-LLM dependencies (OpenAI, Anthropic, Cohere, Google
+Gemini, …) are explicitly **out of scope** — see vision.md's
+"Local-only constraint" section. The original plan's LILAC parser and
+cluster-labelling / closed-loop LLM tasks are dropped. What remains is
+a fully-local neural track:
 
 1. **Embedders** — BGE-m3, GTE, multilingual-E5, Nomic-embed-v1.5,
-   Jina-embeddings-v3 — exposed behind one `Embedder` trait, selected by
-   config.
-2. **LILAC-style parser** — in-context template extraction with retrieved
-   demonstrations; small-model fallback: LogPPT.
-3. **Cluster labelling** — LLM consumes cluster medoids, returns a
-   human-readable name + canonical template.
-4. **Closed loop** — LLM proposes template → Drain validates structural
-   consistency → residuals re-embedded → repeat until coverage plateau.
+   Jina-embeddings-v3 served by `sentence-transformers` running in the
+   `py/` uv venv. Weights are downloaded once to `~/.cache/huggingface`
+   and used offline thereafter. Exposed behind one `Embedder` trait,
+   selected by config.
+2. **LogPPT parser** — Le & Zhang 2023 — a fine-tuned RoBERTa-base for
+   log-template extraction. Local; runs through `transformers`. Sits
+   alongside Drain and Brain in the parser comparison.
+3. **Optional local-LLM hooks** — if a future feature needs generative
+   text (e.g. cluster naming for human consumption), it goes through
+   a *local* runtime (Ollama, llama.cpp, MLX) — never a remote API.
+   Even those hooks must degrade gracefully: the pipeline produces
+   correct cluster ids and templates with the LLM disabled.
 
-**Rationale.** LLMs without a deterministic verifier hallucinate templates.
-Keeping Drain / the regex verifier authoritative gives us the LLM's
-generalisation without its drift.
+**Rationale.** Practitioners need to run the whole pipeline on a
+laptop without sending log data — frequently sensitive — to a third
+party. Local-only also makes the benchmarks reproducible without
+chasing API model-version drift.
 
-**Files (new).** `src/Parsers/LILAC.jl`, `src/LLM/{Loop.jl, Labeling.jl}`,
-`py/{embedders.py, lilac_parser.py}`.
+**Files (new).** `src/Models/Embedders.jl`, `src/Parsers/LogPPT.jl`,
+`py/embedders.py`, `py/logppt.py`.
 
-**Verification.** Closed-loop residual-coverage curve plateaus within ≤ 5
-iterations on HDFS (regression test).
+**Verification.** Embedder NMI on HDFS_2k matches the published
+sentence-transformers number within ±1 pt; LogPPT PA matches its
+paper number within ±2 pt.
 
 ---
 
@@ -296,9 +315,12 @@ a single, precise, performant regex via:
 7. **Cost monitoring** — reject candidates whose compiled NFA state count or
    per-match cost exceeds a budget; fall back to a simpler template.
 
-**LLM assist (bounded).** After deterministic generation, ask an LLM for a
-tighter slot class; accept only if the candidate matches 100 % of the cluster
+**LLM assist (optional, local-only).** After deterministic generation,
+optionally call out to a *local* LLM (Ollama / llama.cpp) for a tighter
+slot class; accept only if the candidate matches 100 % of the cluster
 and stays RE2-compatible. LLM proposes, deterministic verifier decides.
+The whole pipeline must work with the LLM hook disabled — see
+vision.md's "Local-only constraint" section.
 
 **Rationale.** RE2/Hyperscan give worst-case linear matching. Hyperscan scans
 the entire template set in one pass — throughput scales with *characters*, not
@@ -338,9 +360,11 @@ parser is one entry in the `PARSERS` dict. Compression metrics
 (BPC, codebook perplexity, dictionary size) and `Eval/CV.jl` remain
 to land.
 
-**Baselines table** (in `README.md`): Drain, Brain, LogPPT, LILAC,
-BGE+HDBSCAN, KATE-original, KATE-modernised, VQ-VAE, SimCSE-logs across all
-14 datasets.
+**Baselines table** (in `README.md`): Drain, Brain, LogPPT,
+BGE+HDBSCAN (local sentence-transformers), KATE-original,
+KATE-modernised, VQ-VAE, SimCSE-logs across all 14 datasets. LILAC
+and other API-bound parsers are explicitly excluded — see
+vision.md's local-only constraint.
 
 **Reproduction gate.** KATE-modernised matches the original KATE paper's
 20NG clustering NMI within ±2 pts as a sanity check.
@@ -360,15 +384,14 @@ src/
   PostProc/{Purity.jl, Typing.jl, Canonical.jl, Merge.jl}
   Regex/{AntiUnify.jl, SlotLadder.jl, Minimize.jl, Emit.jl,
          Hyperscan.jl, Verify.jl}
-  Parsers/{Drain.jl, Brain.jl, LogPPT.jl, LILAC.jl}
+  Parsers/{Drain.jl, Brain.jl, LogPPT.jl}
   Models/{VQVAE.jl, DenoisingAE.jl, SimCSE.jl, Embedders.jl,
           SeqLSTM.jl (ported, thesis §3.2.8), SeqTransformer.jl, SeqMamba.jl}
   Cluster/{Pipeline.jl, Sparsity.jl}
   Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, ported)
   Anomaly/{Instance.jl (ported, thesis §3.2.5), Sequence.jl}
-  RCA/{Graph.jl, CausalDiscovery.jl, LLM.jl}
+  RCA/{Graph.jl, CausalDiscovery.jl}
   Eval/{Metrics.jl, Harness.jl, CV.jl}
-  LLM/{Loop.jl, Labeling.jl}
 rust/                          # cdylib: parse_line + infer_regex (thesis §3.2.2, §3.2.6)
   Cargo.toml, Cargo.lock, src/{lib.rs, parse_line.rs, infer.rs}
 deps/build.jl                  # `cargo build --release`, triggered by Pkg.build
@@ -406,12 +429,15 @@ docs/
    kate_modern` produces a CSV with PA/GA/NMI filled in and no `NaN`s.
 4. KATE-modernised reproduces original KATE 20NG NMI within ±2 pts.
 5. README benchmark table complete across 14 LogHub-2.0 datasets.
-6. LLM closed-loop residual-coverage plateau within ≤ 5 iterations on HDFS.
-7. Regex-generation correctness + performance targets met.
-8. Pre/post pipeline algebraic properties hold (idempotence, retraction,
+6. Regex-generation correctness + performance targets met.
+7. Pre/post pipeline algebraic properties hold (idempotence, retraction,
    Bloom FPR).
+8. Every gate passes with the network detached after the initial weight
+   download — see vision.md's "Local-only constraint".
 
 ## What is *not* part of this plan
 
 Handled in the vision's "Out of scope" list — streaming ingestion, GUI,
-training a log FM from scratch, production hardening.
+training a log FM from scratch, production hardening, **cloud-LLM
+dependencies** (every neural step runs against locally-cached
+weights only).
