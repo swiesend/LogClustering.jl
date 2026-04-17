@@ -178,7 +178,15 @@ sparsity-as-clustering lets us ask whether KATE's bottleneck *is* its own
 clusterer.
 
 **Files (new).** `src/Cluster/{Pipeline.jl, Sparsity.jl}`,
-`src/Anomaly/{Instance.jl, Sequence.jl}`.
+`src/Anomaly/Sequence.jl`.
+
+**Instance anomaly ported.** `src/Anomaly/Instance.jl` implements the
+thesis's §3.2.5 reconstruction-error scoring on top of any Lux
+autoencoder (matched to DeepKATE by default): per-sample `E_abs`
+(Gleichung 3.3), squared variant, latent-space distance to an optional
+reference, and the weighted "Meta-Metrik" `anomaly_score`. All forward
+passes run in testmode so dropout and KATE's competitive redistribution
+are disabled at inference.
 
 **Verification.** Three clustering methods produce comparable NMI on HDFS
 (within 5 pts).
@@ -340,7 +348,7 @@ src/
           SeqLSTM.jl, SeqTransformer.jl, SeqMamba.jl}
   Cluster/{Pipeline.jl, Sparsity.jl}
   Mining/{Episodes.jl}              # MV-Span / MT-Span (thesis §3.2.7, ported)
-  Anomaly/{Instance.jl, Sequence.jl}
+  Anomaly/{Instance.jl (ported, thesis §3.2.5), Sequence.jl}
   RCA/{Graph.jl, CausalDiscovery.jl, LLM.jl}
   Eval/{Metrics.jl, Harness.jl, CV.jl}
   LLM/{Loop.jl, Labeling.jl}

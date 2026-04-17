@@ -12,9 +12,12 @@ using .Framing
 include("Mining/Episodes.jl")
 using .Episodes
 
+include("Anomaly/Instance.jl")
+using .Instance
+
 include("Rust.jl")
 using .Rust
 
-export KATE, DeepKATE, Framing, Episodes, Rust
+export KATE, DeepKATE, Framing, Episodes, Instance, Rust
 
 end # module LogClustering
