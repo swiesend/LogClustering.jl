@@ -42,6 +42,9 @@ using .VQVAE
 include("Models/SimCSE.jl")
 using .SimCSE
 
+include("Models/DenoisingAE.jl")
+using .DenoisingAE
+
 include("Eval/Metrics.jl")
 using .Metrics
 
@@ -91,11 +94,11 @@ end
 include("Cluster/Pipeline.jl")
 using .Pipeline
 
-export KATE, DeepKATE, Framing, Masking, Dedup, Featurise, Episodes,
-       Baselines, Instance, Sequence, SeqLSTM, VQVAE, SimCSE, Metrics,
-       Compression, Harness, CV, Sparsity, Pipeline, Drain3, Canonical,
-       Persistence, PersistenceGlue, AutoTune, CLI, Purity, Typing,
-       Merge, Rust
+export KATE, DeepKATE, DenoisingAE, Framing, Masking, Dedup,
+       Featurise, Episodes, Baselines, Instance, Sequence, SeqLSTM,
+       VQVAE, SimCSE, Metrics, Compression, Harness, CV, Sparsity,
+       Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
+       AutoTune, CLI, Purity, Typing, Merge, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
@@ -114,6 +117,7 @@ PrecompileTools.@setup_workload begin
     using Lux: Lux, Chain, Dense, Embedding, Recurrence, LSTMCell
     using .Framing: parse_frame
     using .DeepKATE: deep_kate, deep_kate_loss, latent_layer
+    using .DenoisingAE: denoising_ae, denoising_ae_loss
     using .SeqLSTM: seq_lstm, seq_lstm_loss, predict_next, PeepholeLSTM
     using .KATE: KCompetetive
     using .Episodes: mv_span, mt_span
@@ -154,6 +158,12 @@ PrecompileTools.@setup_workload begin
         st_eval = Lux.testmode(st)
         x = rand(rng, Float32, 16, 2)
         m(x, ps, st_eval)
+
+        # DenoisingAE — forward + loss in testmode.
+        m_d = denoising_ae(16; hidden = 8, latent = 4)
+        ps_d, st_d = Lux.setup(rng, m_d)
+        denoising_ae_loss(m_d, ps_d, Lux.testmode(st_d), x;
+                          mask_rate = 0.2, σ = 0.1, rng = rng)
 
         # SeqLSTM — plain and peephole variants, testmode only.
         m1 = seq_lstm(8; embed = 4, hidden = 6)

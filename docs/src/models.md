@@ -51,3 +51,12 @@ LogClustering.SimCSE
 LogClustering.SimCSE.simcse_loss
 LogClustering.SimCSE.simcse_step_loss
 ```
+
+## DenoisingAE (Vincent 2008; MAE He et al. 2022)
+
+```@docs
+LogClustering.DenoisingAE
+LogClustering.DenoisingAE.denoising_ae
+LogClustering.DenoisingAE.denoising_ae_loss
+LogClustering.DenoisingAE.latent_layer
+```
