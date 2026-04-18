@@ -83,11 +83,16 @@ thesis pipeline. The canonical thesis pipeline is
 `DeepKATE` / `SeqLSTM` / `Instance` on the embedding side. Drain is
 wired into `benchmarks/loghub2/run.jl` so the LogHub-2.0 sweep can
 quantify the gap between our stack and the field's deterministic
-standard; see [`BASELINES.md`](benchmarks/loghub2/BASELINES.md).
+standard. The sweep now covers **all 16 LogHub-2.0 2k subsets** —
+see [`BASELINES.md`](benchmarks/loghub2/BASELINES.md) for the
+full table (seven parsers × sixteen datasets = 112 rows).
 
 The `our_stack` parser combines both — Drain for grouping, our
 `infer_regex` (anti-unified) for template rendering — and matches
 Drain on every *clustering* metric (GA 99.75, NMI 99.92 on HDFS).
+The batched `parse_lines` FFI makes every `mask`-prefixed path run
+in well under `0.03 s` per 2 k lines (400–1000× faster than the
+per-line FFI crossings it replaced).
 
 ## Value-level outlier detection
 

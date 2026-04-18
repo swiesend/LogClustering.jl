@@ -108,7 +108,12 @@ stop-gradient targets via `@ignore_derivatives`. Add three siblings:
   + β·commitment + codebook — equation 3 of the paper),
   `assign_codes` for "cluster id for free".
 - **Masked / denoising autoencoder** (Vincent 2008; He et al. MAE 2022) —
-  stronger self-supervised signal than pure reconstruction. TODO.
+  stronger self-supervised signal than pure reconstruction. *Ported*
+  in `src/Models/DenoisingAE.jl`: small symmetric Dense encoder /
+  decoder, `denoising_ae_loss` applies either a Bernoulli
+  mask-to-zero (MAE-style, `mask_rate`) or additive Gaussian
+  noise (`σ`) — or both — and reconstructs against the clean input
+  with MSE.
 - **Contrastive sentence encoder** (SimCSE, Gao et al. 2021) with log-specific
   augmentations (parameter masking, timestamp dropout). *Ported* in
   `src/Models/SimCSE.jl`: `simcse_loss(h, h⁺; τ)` (InfoNCE over cosine
@@ -123,8 +128,9 @@ SentencePiece) trained per-dataset.
 **Rationale.** VQ-VAE is the clean 2020s formalisation of what KATE was reaching
 for. SimCSE empirically beats reconstruction-trained encoders on clustering.
 
-**Files.** `src/Models/VQVAE.jl` ✓, `src/Models/SimCSE.jl` ✓;
-DenoisingAE + Embedders.jl + Data/Tokenizers.jl still TODO.
+**Files.** `src/Models/VQVAE.jl` ✓, `src/Models/SimCSE.jl` ✓,
+`src/Models/DenoisingAE.jl` ✓; Embedders.jl + Data/Tokenizers.jl
+still TODO.
 
 **Verification.** VQ-VAE codebook perplexity stable; SimCSE NMI on HDFS
 ≥ KATE-modernised + 3 pts.
@@ -207,7 +213,16 @@ original contribution.
 sparsity-as-clustering lets us ask whether KATE's bottleneck *is* its own
 clusterer.
 
-**Files (new).** `src/Anomaly/Sequence.jl`.
+**Sequence-level anomaly detectors landed.** `src/Anomaly/Sequence.jl`
+ships three model-agnostic detectors that run against any
+`seq_lstm`-shaped predictor (LSTM, peephole, bidirectional):
+
+- `deeplog_topk_anomaly` + `deeplog_scan` — DeepLog (Du et al.
+  CCS 2017) top-k membership test + sliding-window variant.
+- `masked_surprise` — LogBERT-style (Guo et al. 2021) per-position
+  NLL; peaks localise anomalous events inside a sequence.
+- `sequence_perplexity` — SeqTransformer-style `exp(mean NLL))` per
+  column, the standard Transformer-LM anomaly score.
 
 **Clustering pipeline ported.** `src/Cluster/Sparsity.jl` realises the
 thesis's native "clustering-via-sparsity" from KATE's competitive
@@ -265,18 +280,28 @@ log-count normalisation) with a layered, reorderable pipeline.
 5. **Content-hash deduplication** — streaming xxHash64 + Bloom filter. 90 %+
    of production log volume is exact duplicates; dedup before clustering.
 
-**Post-processing.**
-1. **Slot-purity re-check** — if a slot's realisations across the cluster
-   have entropy below τ (say 0.2 bits), promote back to literal.
-2. **Slot typing** — run the typed-regex battery over each slot's
-   realisations; assign the most-specific type that matches ≥ 95 %.
-3. **Template canonicalisation** — sort alternatives lexicographically,
-   collapse whitespace, consistent placeholder style. Hash the canonical form
-   for cross-parser deduplication.
-4. **Cluster merge** — post-hoc merge clusters whose canonical templates have
-   edit-distance ≤ 1 token and whose embedding centroids cosine-match ≥ 0.98.
-5. **Regex compilation cache** — hash-indexed compiled `Regex`/Hyperscan DB,
-   shared across evaluation runs.
+**Post-processing.** Steps 1, 2, 3, 4 are all landed.
+
+1. **Slot-purity re-check** *(landed)* — `src/PostProc/Purity.jl`
+   folds low-entropy slots (Shannon entropy < τ, default 0.2 bits)
+   back to their literal mode.
+2. **Slot typing** *(landed)* — `src/PostProc/Typing.jl` runs the
+   anchored typed-regex battery from `PreProc.Masking` over each
+   slot's realisations and assigns the most-specific type whose
+   match fraction meets `min_match_fraction` (default 0.95).
+3. **Template canonicalisation** *(landed)* —
+   `src/PostProc/Canonical.jl` sorts alternatives, collapses
+   whitespace, unifies placeholder style, and exposes
+   `canonical_hash` for cross-parser deduplication.
+4. **Cluster merge** *(landed)* — `src/PostProc/Merge.jl` provides
+   `token_edit_distance`, `merge_pairs`, and `merge_clusters`:
+   canonicalised templates within `max_token_distance` + wildcard
+   budget collapse into one group via union-find; surviving
+   template is the lex-smallest canonical form.
+5. **Regex compilation cache** — hash-indexed compiled `Regex`/
+   `RegexSet` DB, shared across evaluation runs. *Partial:* the
+   compiled `Rust.RegexSet` multi-pattern matcher exists (Stage E″
+   below); the shared cross-run cache layer is TODO.
 
 **Rationale.** Log-specific tokens (IPs, paths, hex) must survive tokenisation
 intact; downstream embedders cannot undo a botched split. Dedup is free
@@ -304,27 +329,38 @@ the thesis baseline; anti-unification replaces the position-aligned
 grouping when lines differ in length.
 
 **Decision.** Turn a cluster of raw lines or a template with `<*>` slots into
-a single, precise, performant regex via:
+a single, precise, performant regex via the seven-stage ladder below.
+Stages 1-7 are all landed (stages 5 uses `RegexSet` as a local,
+library-free substitute for Hyperscan — swap is a one-file change
+behind the same Julia API).
 
-1. **Anti-unification over aligned tokens** — token-level greedy LCS across
-   deduplicated cluster representatives (m ≤ ~50). Positions where all lines
-   agree → literal; positions where they disagree → slot. Deterministic.
-2. **Per-slot regex inference (MDL ladder)** — for each slot, pick the
-   tightest regex from an increasingly general ladder: exact-literal → enum
-   `(a|b|c)` (if |S| ≤ K) → typed class (IP/UUID/NUM/HEX/PATH) → bounded
-   `[A-Za-z0-9_.-]{min,max}` → unbounded.
-3. **Alternation minimisation** — merge sibling templates that differ in
-   exactly one slot; run to fixpoint.
-4. **Emit RE2** by default — linear-time, no backrefs, no lookaround. No
-   catastrophic backtracking by construction.
-5. **Multi-pattern hot path** — compile the full regex set into a single
-   **Hyperscan** database (Intel, SIMD, multi-GB/s). Fallback: `Automa.jl`
-   (pure-Julia DFA source-gen) or Go `regexp`.
-6. **Verification pass** — each regex must match 100 % of its training
-   cluster and ≤ ε of negatives from other clusters. Failures tighten the
-   slot class and retry.
-7. **Cost monitoring** — reject candidates whose compiled NFA state count or
-   per-match cost exceeds a budget; fall back to a simpler template.
+1. **Anti-unification over aligned tokens** *(landed)* — token-level
+   greedy LCS across deduplicated cluster representatives. Exposed
+   via `Rust.infer_regex(samples; align = true)`.
+2. **Per-slot regex inference (MDL ladder)** *(landed)* —
+   `Rust.slot_ladder(values; typed, enum_max)` picks the tightest
+   regex from exact-literal → enum `(?:a|b|c)` → typed class (via
+   `PreProc.Masking`'s ranked battery) → bounded `\d{m,n}` /
+   `\w{m,n}` / `[A-Za-z0-9]{m,n}` → unbounded wildcard.
+3. **Alternation minimisation** *(landed)* — `Rust.alt_min(alts)`
+   dedups + sorts + escapes a list of alternatives into a canonical
+   `(?:a|b|c)` group.
+4. **Emit RE2** *(landed)* — every `Rust.*` emitter is already
+   RE2-compatible (Rust `regex` crate is a direct RE2 descendant).
+5. **Multi-pattern hot path** *(landed as `RegexSet`; Hyperscan
+   optional)* — `Rust.RegexSet([patterns...])` compiles the whole
+   set into a single linear-time matcher; `regexset_match(set, line)`
+   returns the 1-based indices of every pattern that matched. This
+   substitutes for Hyperscan on systems without `libhs`. A
+   Hyperscan-backed variant is a one-file swap behind the same
+   Julia API.
+6. **Verification pass** *(landed)* — `Rust.verify_pattern(pattern,
+   samples) -> (hits, total)` gives anchored coverage counts over
+   a cluster.
+7. **Cost monitoring** *(landed)* — `Rust.mdl_cost(pattern, samples)`
+   returns a two-part MDL-style bit cost (pattern length × 7 + Σ
+   residual × 7). Monotone but rough; enough to rank candidates so
+   the ladder picks tight over loose at equal coverage.
 
 **LLM assist (optional, local-only).** After deterministic generation,
 optionally call out to a *local* LLM (Ollama / llama.cpp) for a tighter
@@ -338,8 +374,13 @@ the entire template set in one pass — throughput scales with *characters*, not
 templates. MoLFI-style evolutionary search is explicitly rejected: slow and
 unnecessary once anti-unification + typed slots are in place.
 
-**Files (new).** `src/Regex/{AntiUnify.jl, SlotLadder.jl, Minimize.jl,
-Emit.jl, Hyperscan.jl, Verify.jl}`.
+**Files.** Stage E″ lives in Rust (`rust/src/mdl.rs`,
+`rust/src/infer.rs`) behind Julia wrappers in `src/Rust.jl`
+(`slot_ladder`, `alt_min`, `verify_pattern`, `mdl_cost`, `RegexSet`,
+`regexset_match`, `infer_regex`). The originally-planned
+`src/Regex/*.jl` tree collapsed into those bindings — the
+"Rust-does-the-hot-loop, Julia-does-the-orchestration" split from
+plan 002 applies here too.
 
 **Verification.**
 - Correctness: generated regex matches 100 % of training cluster and ≤ ε on
