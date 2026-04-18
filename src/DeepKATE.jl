@@ -145,6 +145,37 @@ function deep_kate_loss(
     return prev + ce + succ, st
 end
 
+"""
+    deep_kate_loss(model, ps, st, X::AbstractMatrix; lat = latent_layer(model))
+        -> (loss, st)
+
+Single-batch overload. Drops the thesis's `prev`/`succ` temporal
+sub-objectives and returns **only** the binary-cross-entropy
+reconstruction of `X` — the standard autoencoder signal.
+
+Use this when you're training on a shuffled batch without access
+to each sample's event-stream neighbours (e.g. BoW over a whole
+dataset, the case the CLI's `train --kind deep_kate` drives).
+For a time-ordered trace where `prev` / `succ` are meaningful,
+call the six-argument form `deep_kate_loss(model, ps, st, a, b, c)`
+directly.
+
+The returned `st` is the state from the reconstruction pass; no
+stop-gradient book-keeping happens here (there are no ignored
+target branches).
+"""
+function deep_kate_loss(
+    model::Chain, ps, st,
+    X::AbstractArray{<:Real};
+    lat::Int = latent_layer(model),
+)
+    nlayers = length(model.layers)
+    embedded = _fwd(model, ps, st, X, 1, lat)
+    prediction = _fwd(model, ps, st, embedded, lat + 1, nlayers)
+    ce = _binary_crossentropy(prediction, X)
+    return ce, st
+end
+
 # Walk the NamedTuple of layers over a contiguous index range, calling
 # each layer's functor form. Returned state is discarded (the thesis
 # loop re-runs setup each epoch); we only need the forward value for AD.

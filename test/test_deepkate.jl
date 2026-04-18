@@ -62,6 +62,32 @@ const RNG = Random.MersenneTwister(42)
         @test loss > 0
     end
 
+    @testset "single-batch loss overload — reconstruction BCE only" begin
+        m = deep_kate(16; latent = 2, k1 = 4)
+        ps, st = Lux.setup(RNG, m)
+        X = rand(RNG, Float32, 16, 4)
+        loss4, _ = deep_kate_loss(m, ps, st, X)
+        @test isfinite(loss4)
+        @test loss4 > 0
+        # The 4-arg form equals the `ce` term of the 6-arg form when
+        # `a == b == c` and the targets are taken in test mode (so the
+        # prev / succ mse vs −target reduces to a non-zero self-distance).
+        # We only assert the 4-arg loss is strictly *smaller* than the
+        # 6-arg loss on identical inputs, because 6-arg adds the two
+        # non-negative temporal terms on top.
+        loss6, _ = deep_kate_loss(m, ps, st, X, X, X)
+        @test loss4 < loss6
+    end
+
+    @testset "single-batch loss — differentiable" begin
+        m = deep_kate(16; latent = 2, k1 = 4)
+        ps, st = Lux.setup(RNG, m)
+        X = rand(RNG, Float32, 16, 3)
+        g = Zygote.gradient(p -> first(deep_kate_loss(m, p, st, X)), ps)[1]
+        @test g !== nothing
+        @test any(!iszero, g.layer_10.weight)     # decoder output
+    end
+
     @testset "loss is differentiable through the encoder+decoder" begin
         m = deep_kate(16; latent = 2, k1 = 4)
         ps, st = Lux.setup(RNG, m)

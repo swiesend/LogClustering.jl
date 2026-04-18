@@ -38,7 +38,7 @@ using ..Featurise: Featurise, Vocabulary, build_vocab, bow,
 using ..Persistence
 using ..PersistenceGlue
 using ..AutoTune
-using ..DeepKATE: deep_kate
+using ..DeepKATE: DeepKATE, deep_kate
 using ..VQVAE: vq_vae, assign_codes, VectorQuantizer
 using ..SeqLSTM: seq_lstm, seq_lstm_loss
 using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly,
@@ -411,11 +411,11 @@ function _sgd_recon!(model, ps, st, X::AbstractMatrix, epochs::Int, batch::Int,
                      label::AbstractString = "model")
     n = size(X, 2)
     batch = min(batch, n)
-    eps = Float32(1e-7)
-    loss_fn = (p, Xb) -> begin
-        y, _ = model(Xb, p, Lux.testmode(st))
-        -mean(@. Xb * log(max(y, eps)) + (1 - Xb) * log(max(1 - y, eps)))
-    end
+    # Delegate the loss body to `DeepKATE.deep_kate_loss` (4-arg form,
+    # reconstruction BCE only). Any Lux `Chain` that's `input-in / input-
+    # out` shape-preserving works, including DeepKATE itself. State `st`
+    # is passed in training mode so Dropout + KATE competition both fire
+    # inside the autodiff step — Lux emits a warning otherwise.
     for epoch in 1:epochs
         perm = randperm(rng, n)
         total = 0.0f0
@@ -424,7 +424,9 @@ function _sgd_recon!(model, ps, st, X::AbstractMatrix, epochs::Int, batch::Int,
             stop = min(start + batch - 1, n)
             cols = perm[start:stop]
             Xb = X[:, cols]
-            (loss, back) = Zygote.pullback(p -> loss_fn(p, Xb), ps)
+            (loss, back) = Zygote.pullback(ps) do p
+                first(DeepKATE.deep_kate_loss(model, p, st, Xb))
+            end
             g = back(one(loss))[1]
             ps = _apply_sgd!(ps, g, lr)
             total += loss
