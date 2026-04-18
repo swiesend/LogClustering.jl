@@ -41,7 +41,8 @@ using ..AutoTune
 using ..DeepKATE: deep_kate
 using ..VQVAE: vq_vae, assign_codes, VectorQuantizer
 using ..SeqLSTM: seq_lstm, seq_lstm_loss
-using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly
+using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly,
+                  value_novelty
 using ..Sparsity: sparsity_clusters
 using ..Framing: parse_frame, SOURCE_RAW
 using Lux
@@ -696,7 +697,7 @@ function cmd_score(args::Vector{String})::Int
     _, values = mask_lines_with_values(lines)
     scores = Float64[]
     for vs in values
-        push!(scores, Float64(LogClustering.Instance.value_novelty(det, vs)))
+        push!(scores, Float64(value_novelty(det, vs)))
     end
     io = IOBuffer()
     if opts["format"] == "tsv"
@@ -742,9 +743,12 @@ function cmd_benchmark(args::Vector{String})::Int
     isfile(run_jl) ||
         throw(ArgumentError("benchmark script not found at $run_jl"))
     # `run.jl` reads `ARGS` directly; hand it our tail and call its main.
+    # Fresh anonymous module keeps the script's globals out of CLI's
+    # namespace, but `Module(:X)` doesn't expose `include` — use
+    # `Base.include` explicitly.
     mod = Module(:LcBenchmarkShim)
     Core.eval(mod, :(ARGS = $(copy(args))))
-    Core.eval(mod, :(include($(run_jl))))
+    Base.include(mod, run_jl)
     Core.eval(mod, :(main(ARGS)))
     return 0
 end
@@ -756,7 +760,7 @@ function cmd_download(args::Vector{String})::Int
         throw(ArgumentError("download script not found at $dl_jl"))
     mod = Module(:LcDownloadShim)
     Core.eval(mod, :(ARGS = $(copy(args))))
-    Core.eval(mod, :(include($(dl_jl))))
+    Base.include(mod, dl_jl)
     Core.eval(mod, :(main(ARGS)))
     return 0
 end

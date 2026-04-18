@@ -246,4 +246,149 @@ end
             for p in (data, model, out); isfile(p) && rm(p); end
         end
     end
+
+    # -------------------------------------------------------------
+    # score — load a saved ValueNoveltyDetector and emit per-line
+    # anomaly scores. Round-trips the detector through
+    # PersistenceGlue.save / load_and_rehydrate.
+    # -------------------------------------------------------------
+
+    @testset "score — TSV round-trip through a saved ValueNoveltyDetector" begin
+        using LogClustering.Instance: ValueNoveltyDetector, update!
+        using LogClustering.Masking: mask_lines_with_values
+        using LogClustering.PersistenceGlue: PersistenceGlue
+
+        # Train the detector on a 3-line fixture so it remembers an IP
+        # it has seen; score a 4-line fixture where one line sports a
+        # brand-new IP. The novelty score for that line must be strictly
+        # greater than for the three familiar ones.
+        train_lines = ["user 1 from 10.0.0.1",
+                       "user 2 from 10.0.0.1",
+                       "user 3 from 10.0.0.1"]
+        _, train_vals = mask_lines_with_values(train_lines)
+        det = ValueNoveltyDetector()
+        for vs in train_vals; update!(det, vs); end
+
+        det_path  = tempname() * ".jld2"
+        data_path = tempname() * ".log"
+        out_path  = tempname() * ".tsv"
+        try
+            PersistenceGlue.save(det_path, det)
+
+            open(data_path, "w") do io
+                println(io, "user 4 from 10.0.0.1")   # known IP
+                println(io, "user 5 from 10.0.0.1")   # known IP
+                println(io, "user 6 from 10.0.0.1")   # known IP
+                println(io, "user 7 from 99.99.99.99") # novel IP
+            end
+
+            r = _with_captured_stdio(() -> CLI.main(["score",
+                "--detector", det_path,
+                "--data", data_path,
+                "--out", out_path,
+                "--format", "tsv"]))
+            @test r.code == 0
+
+            lines = readlines(out_path)
+            @test lines[1] == "line_id\tscore\tline"
+            @test length(lines) == 5                          # header + 4 rows
+            scores = [parse(Float64, split(ln, '\t')[2]) for ln in lines[2:end]]
+            @test all(isfinite, scores)
+            @test scores[4] > scores[1]                       # novel > known
+        finally
+            for p in (det_path, data_path, out_path); isfile(p) && rm(p); end
+        end
+    end
+
+    @testset "score --format json emits parseable NDJSON" begin
+        using LogClustering.Instance: ValueNoveltyDetector, update!
+        using LogClustering.Masking: mask_lines_with_values
+        using LogClustering.PersistenceGlue: PersistenceGlue
+
+        lines_train = ["user 1 from 10.0.0.1", "user 2 from 10.0.0.1"]
+        _, vs = mask_lines_with_values(lines_train)
+        det = ValueNoveltyDetector()
+        for v in vs; update!(det, v); end
+
+        det_path  = tempname() * ".jld2"
+        data_path = tempname() * ".log"
+        out_path  = tempname() * ".jsonl"
+        try
+            PersistenceGlue.save(det_path, det)
+            open(data_path, "w") do io
+                println(io, "user 3 from 10.0.0.1")
+                println(io, "user 4 from 8.8.8.8")
+            end
+
+            r = _with_captured_stdio(() -> CLI.main(["score",
+                "--detector", det_path,
+                "--data", data_path,
+                "--out", out_path,
+                "--format", "json"]))
+            @test r.code == 0
+
+            records = [JSON3.read(l) for l in readlines(out_path)]
+            @test length(records) == 2
+            @test haskey(records[1], :line_id)
+            @test haskey(records[1], :score)
+            @test haskey(records[1], :line)
+        finally
+            for p in (det_path, data_path, out_path); isfile(p) && rm(p); end
+        end
+    end
+
+    @testset "score without --detector exits 2 with ArgumentError" begin
+        r = _with_captured_stdio(() -> CLI.main(["score"]))
+        @test r.code == 2
+        @test occursin("--detector", r.err)
+    end
+
+    # -------------------------------------------------------------
+    # benchmark — wraps benchmarks/loghub2/run.jl. We exercise the
+    # --help path (no FS side effects) and a single-dataset end-to-end
+    # run against the tiny checked-in toy_structured.csv fixture. No
+    # network traffic either way.
+    # -------------------------------------------------------------
+
+    @testset "benchmark --help prints usage from run.jl" begin
+        r = _with_captured_stdio(() -> CLI.main(["benchmark", "--help"]))
+        @test r.code == 0
+        @test occursin("usage:", r.out)
+        @test occursin("parsers", r.out) || occursin("parser", r.out)
+    end
+
+    @testset "benchmark — end-to-end on the checked-in toy fixture" begin
+        toy = joinpath(@__DIR__, "..", "benchmarks", "loghub2",
+                       "toy_structured.csv")
+        if !isfile(toy)
+            @test_skip isfile(toy)
+        else
+            r = _with_captured_stdio(() -> CLI.main(["benchmark", toy, "identity"]))
+            @test r.code == 0
+            # format_report emits one row; our test just checks we got
+            # non-empty output and no thrown error.
+            @test !isempty(strip(r.out))
+        end
+    end
+
+    # -------------------------------------------------------------
+    # download-loghub — wraps benchmarks/loghub2/download.jl.
+    # `--help` is the only guaranteed side-effect-free invocation;
+    # `unknown-dataset` asserts the bad-input error path returns
+    # non-zero *without* ever touching the network.
+    # -------------------------------------------------------------
+
+    @testset "download-loghub --help lists datasets + flags" begin
+        r = _with_captured_stdio(() -> CLI.main(["download-loghub", "--help"]))
+        @test r.code == 0
+        @test occursin("--all", r.out)
+        @test occursin("HDFS", r.out)
+        @test occursin("Apache", r.out)
+    end
+
+    @testset "download-loghub rejects unknown dataset name" begin
+        r = _with_captured_stdio(() -> CLI.main(["download-loghub",
+                                                 "NonexistentDatasetXYZ"]))
+        @test r.code != 0
+    end
 end

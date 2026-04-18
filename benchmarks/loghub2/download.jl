@@ -117,4 +117,6 @@ function main(args)
     println("  julia --project benchmarks/loghub2/run.jl $(example) num_mask")
 end
 
-isinteractive() || main(ARGS)
+if abspath(PROGRAM_FILE) == @__FILE__
+    main(ARGS)
+end
