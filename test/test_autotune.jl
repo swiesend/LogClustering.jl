@@ -28,13 +28,19 @@ const RNG_AT = Random.MersenneTwister(13)
         X = randn(RNG_AT, Float32, 32, 100)
         cfg = fit_hyperparams(:deep_kate, X)
         @test cfg.n == 32
-        # Thesis DeepKATE bottleneck is 5 → latent → 5, so `latent` is
-        # capped at 5 and `k1` is capped at 100 (the first hidden).
-        @test 2 <= cfg.latent <= 5
-        @test 4 <= cfg.k1 <= 100
+        # Parametric factory: latent scales with the PCA elbow (no more
+        # ≤ 5 cap), k1 stays clamped to the widest hidden layer.
+        @test 2 <= cfg.latent <= 128
+        @test 4 <= cfg.k1 <= 256
+        @test cfg.k1 <= cfg.hidden[1]
+        @test cfg.hidden isa AbstractVector
+        @test length(cfg.hidden) == 2
+        @test cfg.hidden[end] >= cfg.latent   # bottleneck in-dim ≥ k_bottleneck
+        @test cfg.k_bottleneck == cfg.latent
         @test cfg.p isa AbstractFloat
         # Splats cleanly into the factory.
-        m = deep_kate(cfg.n; latent = cfg.latent, k1 = cfg.k1, p = cfg.p)
+        m = deep_kate(cfg.n; hidden = cfg.hidden, latent = cfg.latent,
+                      k1 = cfg.k1, k_bottleneck = cfg.k_bottleneck, p = cfg.p)
         @test m isa Chain
     end
 
@@ -79,8 +85,13 @@ const RNG_AT = Random.MersenneTwister(13)
         X = randn(RNG_AT, Float32, 20, 60)
         cfg = fit_hyperparams(:deep_kate, X; budget = 5, rng = RNG_AT)
         @test cfg.n == 20
-        @test 2 <= cfg.latent <= 16
-        m = deep_kate(cfg.n; latent = cfg.latent, k1 = cfg.k1, p = cfg.p)
+        @test 2 <= cfg.latent <= 128
+        # Factory invariants the perturbation must preserve.
+        @test cfg.k1 <= cfg.hidden[1]
+        @test cfg.k_bottleneck == cfg.latent
+        @test cfg.hidden[end] >= cfg.k_bottleneck
+        m = deep_kate(cfg.n; hidden = cfg.hidden, latent = cfg.latent,
+                      k1 = cfg.k1, k_bottleneck = cfg.k_bottleneck, p = cfg.p)
         @test m isa Chain
     end
 

@@ -310,19 +310,21 @@ function _train_deep_kate(lines::Vector{String}, opts::Dict, rng)::Int
                   rng = rng)
     n = size(X, 1)
     cfg = merge(cfg_base, (n = n,))
-    model = deep_kate(cfg.n; latent = cfg.latent, k1 = cfg.k1, p = cfg.p)
+    model = deep_kate(cfg.n; hidden = cfg.hidden, latent = cfg.latent,
+                      k1 = cfg.k1, k_bottleneck = cfg.k_bottleneck, p = cfg.p)
     ps, st = Lux.setup(rng, model)
     ps = _sgd_recon!(model, ps, st, X, Int(opts["epochs"]), Int(opts["batch"]),
                      Float32(opts["lr"]), rng; quiet = opts["quiet"],
                      label = "deep_kate")
     PersistenceGlue.save(opts["out"], model, ps, st;
         kind = :deep_kate,
-        n = cfg.n, latent = cfg.latent, k1 = cfg.k1, p = cfg.p,
+        n = cfg.n, hidden = cfg.hidden, latent = cfg.latent,
+        k1 = cfg.k1, k_bottleneck = cfg.k_bottleneck, p = cfg.p,
         vocab = vocab,
         metadata = _train_metadata(opts, lines, "deep_kate"))
     opts["quiet"] || println(stderr,
-        "deep_kate: ", length(vocab), "-tok vocab, latent=", cfg.latent,
-        ", k1=", cfg.k1, " → ", opts["out"])
+        "deep_kate: ", length(vocab), "-tok vocab, hidden=", cfg.hidden,
+        ", latent=", cfg.latent, ", k1=", cfg.k1, " → ", opts["out"])
     return 0
 end
 

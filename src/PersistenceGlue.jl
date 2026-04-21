@@ -81,14 +81,24 @@ function _rehydrate_kate(bundle)
 end
 
 # ---------------------------------------------------------------------------
-# DeepKATE — constructor kwargs are `(n, latent, k1, p)`.
+# DeepKATE — parametric cascade (schema v2).
+#
+# Schema v1 spec was `(n, latent, k1, p, vocab)` — the thesis-fixed
+# topology. Schema v2 adds `hidden::Vector{Int}` and `k_bottleneck::Int`
+# so the factory can scale with the corpus. Old v1 bundles rehydrate
+# with `hidden = [100, 20]` + `k_bottleneck = latent`, matching the
+# thesis defaults.
 # ---------------------------------------------------------------------------
 
 function save_deep_kate(path, model::Chain, ps, st;
                         n::Integer, latent::Integer, k1::Integer, p::Real,
+                        hidden::AbstractVector{<:Integer} = [100, 20],
+                        k_bottleneck::Integer = latent,
                         vocab::Union{Nothing, Vocabulary} = nothing,
                         metadata::AbstractDict = Dict{String, Any}())
-    spec = (n = Int(n), latent = Int(latent), k1 = Int(k1), p = Float32(p),
+    spec = (n = Int(n), hidden = Int[Int(h) for h in hidden],
+            latent = Int(latent), k1 = Int(k1),
+            k_bottleneck = Int(k_bottleneck), p = Float32(p),
             vocab = vocab)
     Persistence.save_lux(path; kind = :deep_kate, spec = spec,
                          ps = ps, st = st, metadata = metadata)
@@ -96,7 +106,12 @@ end
 
 function _rehydrate_deep_kate(bundle)
     sp = bundle.spec
-    model = deep_kate(sp.n; latent = sp.latent, k1 = sp.k1, p = sp.p)
+    # Backward-compat with schema v1 bundles that lack `hidden` /
+    # `k_bottleneck`: fall back to the thesis defaults.
+    hidden = hasproperty(sp, :hidden) ? sp.hidden : [100, 20]
+    k_bottleneck = hasproperty(sp, :k_bottleneck) ? sp.k_bottleneck : sp.latent
+    model = deep_kate(sp.n; hidden = hidden, latent = sp.latent,
+                      k1 = sp.k1, k_bottleneck = k_bottleneck, p = sp.p)
     vocab = hasproperty(sp, :vocab) ? sp.vocab : nothing
     return (; model = model,
               ps = bundle.payload.ps,

@@ -43,7 +43,7 @@ using JLD2
 export PersistedBundle, save, load, rehydrate,
        register_rehydrator!, register_callable!
 
-const SCHEMA_VERSION = UInt8(1)
+const SCHEMA_VERSION = UInt8(2)
 
 """
     LC_VERSION[]

@@ -116,13 +116,27 @@ end
 
 function _heuristic(::Val{:deep_kate}, X::AbstractMatrix)
     n = size(X, 1)
-    # DeepKATE's thesis architecture hard-codes a Dense(5 => latent)
-    # bottleneck and a KCompetetive(20, 5; k = latent), so `latent`
-    # must stay ≤ 5. The factory's internal `hidden=100` likewise
-    # bounds `k1` ≤ 100.
-    latent = pca_elbow(X; var_threshold = 0.95, lower = 2, upper = 5)
-    k1 = _clamp(pca_elbow(X; var_threshold = 0.90, lower = 4, upper = 100), 4, 100)
-    return (n = n, latent = latent, k1 = k1, p = 0.4f0)
+    # Two PCA elbows to scale the topology with the corpus:
+    #   - `latent` is the bottleneck dim; 95 %-variance elbow, bounded to
+    #     a sensible range — no longer hard-capped at 5 because the
+    #     parametric factory lifts the thesis's narrow bottleneck.
+    #   - `hidden` is a two-layer encoder ramp that sits between the
+    #     input and the bottleneck. Widths scale with `n` (input dim)
+    #     and the detected elbow.
+    latent_raw = pca_elbow(X; var_threshold = 0.95, lower = 2, upper = 128)
+    # Keep `latent` strictly below `n` so the bottleneck actually
+    # compresses.
+    latent = min(latent_raw, max(2, n - 1))
+    k1_raw = pca_elbow(X; var_threshold = 0.90, lower = 4, upper = 256)
+    # First hidden layer ≈ 2·elbow but at least 32 and never wider than
+    # the input; second hidden layer sits halfway to the bottleneck.
+    h1 = _clamp(max(32, 2 * k1_raw), 16, max(16, n))
+    h2 = _clamp(max(latent, div(h1, 4)), latent, max(latent, h1))
+    hidden = [h1, h2]
+    k1 = min(Int(k1_raw), h1)
+    k_bottleneck = latent
+    return (n = n, hidden = hidden, latent = latent, k1 = k1,
+            k_bottleneck = k_bottleneck, p = 0.4f0)
 end
 
 # ---- VQ-VAE ----
@@ -248,9 +262,22 @@ _perturb(kind::Symbol, seed::NamedTuple, rng::AbstractRNG) =
     _perturb(Val(kind), seed, rng)
 
 function _perturb(::Val{:deep_kate}, seed::NamedTuple, rng::AbstractRNG)
-    latent = _bump(seed.latent, rng; factors = (0.5, 1.0, 2.0), lo = 2, hi = 5)
-    k1 = _bump(seed.k1, rng; factors = (0.5, 1.0, 2.0), lo = 4, hi = 100)
-    return merge(seed, (latent = latent, k1 = k1))
+    # Widened upper bounds — the parametric factory no longer caps
+    # `latent ≤ 5`, and `hidden` scales with the corpus so `k1` can
+    # legitimately climb.
+    latent = _bump(seed.latent, rng; factors = (0.5, 1.0, 2.0), lo = 2, hi = 128)
+    k1 = _bump(seed.k1, rng; factors = (0.5, 1.0, 2.0), lo = 4, hi = 256)
+    # Preserve the factory invariants on every perturbation:
+    #   k1 ≤ hidden[1]
+    #   latent ≤ hidden[end]  (so KCompetetive(hidden[end] → latent) is legal)
+    #   k_bottleneck = latent
+    hidden = hasproperty(seed, :hidden) ? Int[Int(h) for h in seed.hidden] : [k1]
+    isempty(hidden) && (hidden = [max(k1, latent)])
+    hidden[1]   = max(hidden[1], k1)
+    hidden[end] = max(hidden[end], latent)
+    k1 = min(k1, hidden[1])
+    return merge(seed,
+                 (hidden = hidden, latent = latent, k1 = k1, k_bottleneck = latent))
 end
 
 function _perturb(::Val{:vq_vae}, seed::NamedTuple, rng::AbstractRNG)

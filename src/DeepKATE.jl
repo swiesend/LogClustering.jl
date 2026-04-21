@@ -49,40 +49,118 @@ export deep_kate, latent_layer, deep_kate_loss, repel
 # ---------------------------------------------------------------------------
 
 """
-    deep_kate(n::Integer; latent::Integer = 2,
-              k1::Integer = 25, p::Real = 0.4f0) -> Chain
+    deep_kate(n::Integer;
+              hidden::AbstractVector{<:Integer} = [100, 20],
+              latent::Integer = 2,
+              k1::Integer = 25,
+              k_bottleneck::Integer = latent,
+              p::Real = 0.4f0) -> Chain
 
-Build the DeepKATE autoencoder for input dimension `n` with `latent`
-latent dimensions. `k1` is the `k`-winners-take-all count of the first
-competitive layer (thesis default 25); the bottleneck competitive layer
-has `k = latent` winners. `p` is the dropout rate (thesis default 0.4).
+Build a DeepKATE autoencoder.
 
-Mirrors Quellcode 3.7 exactly, one layer for one line.
+- `hidden` is the encoder's widths from input toward the bottleneck;
+  the decoder mirrors it. `[100, 20]` (the default) recovers the
+  thesis's semantics.
+- `latent` is the bottleneck dimension; it is also the default for
+  `k_bottleneck` (k-winners at the bottleneck KATE layer).
+- `k1` is the k-winners count at the first (widest) KATE layer.
+- `p` is the Dropout rate; one Dropout after each intermediate
+  encoder transition (and mirrored in the decoder).
+
+Topology with `hidden = [h₁, h₂, …, hₘ]`:
+
+```
+Encoder:
+    KCompetetive(n → h₁; k = k1)
+    Dense(h₁ → h₂, sigmoid); Dropout(p)
+    …
+    Dense(hₘ₋₁ → hₘ, sigmoid); Dropout(p)
+    KCompetetive(hₘ → latent; k = k_bottleneck)
+    Dense(latent → latent, sin)            ← bottleneck output
+
+Decoder (mirror):
+    Dense(latent → hₘ, sigmoid)
+    Dense(hₘ → hₘ₋₁, sigmoid); Dropout(p)
+    …
+    Dense(h₂ → h₁, sigmoid); Dropout(p)
+    Dense(h₁ → n, sigmoid)
+```
+
+`hidden = []` collapses to the minimum topology
+`KCompetetive(n → latent) → Dense(latent → latent, sin) →
+Dense(latent → n, sigmoid)`.
+
+Unlike the thesis's fixed 10-layer form, this factory scales the
+bottleneck with `latent`: on a corpus with many event types
+(e.g. Thunderbird's 149) set `hidden = [256, 64]` and
+`latent = 32` to avoid the narrow-bottleneck collapse. Thesis
+defaults (`hidden = [100, 20]`, `latent = 2`) stay backward-
+compatible for API callers who don't opt in.
 """
-function deep_kate(n::Integer; latent::Integer = 2,
-                   k1::Integer = 25, p::Real = 0.4f0)
-    return Chain(
-        KCompetetive(n, 100, tanh; k = k1),        # encoder
-        Dense(100 => 20, sigmoid),
-        Dropout(Float32(p)),
-        KCompetetive(20, 5, tanh; k = latent),
-        Dense(5 => latent, sin),                   # bottleneck
-        Dense(latent => 5, sigmoid),               # decoder
-        Dense(5 => 20, sigmoid),
-        Dropout(Float32(p)),
-        Dense(20 => 100, sigmoid),
-        Dense(100 => n, sigmoid),
-    )
+function deep_kate(n::Integer;
+                   hidden::AbstractVector{<:Integer} = [100, 20],
+                   latent::Integer = 2,
+                   k1::Integer = 25,
+                   k_bottleneck::Integer = latent,
+                   p::Real = 0.4f0)
+    latent > 0 || throw(ArgumentError("latent must be ≥ 1"))
+    k1 > 0     || throw(ArgumentError("k1 must be ≥ 1"))
+    k_bottleneck > 0 || throw(ArgumentError("k_bottleneck must be ≥ 1"))
+    hidden = Int[Int(h) for h in hidden]
+    any(h -> h <= 0, hidden) && throw(ArgumentError("hidden sizes must be ≥ 1"))
+
+    layers = Any[]
+
+    # --- Encoder -----------------------------------------------------------
+    if isempty(hidden)
+        push!(layers, KCompetetive(Int(n), Int(latent), tanh; k = Int(k_bottleneck)))
+    else
+        k1_eff = min(Int(k1), hidden[1])
+        push!(layers, KCompetetive(Int(n), hidden[1], tanh; k = k1_eff))
+        for i in 1:length(hidden) - 1
+            push!(layers, Dense(hidden[i] => hidden[i + 1], sigmoid))
+            push!(layers, Dropout(Float32(p)))
+        end
+        push!(layers, KCompetetive(hidden[end], Int(latent), tanh;
+                                   k = Int(k_bottleneck)))
+    end
+
+    # --- Bottleneck --------------------------------------------------------
+    push!(layers, Dense(Int(latent) => Int(latent), sin))
+
+    # --- Decoder (mirror) --------------------------------------------------
+    if isempty(hidden)
+        push!(layers, Dense(Int(latent) => Int(n), sigmoid))
+    else
+        push!(layers, Dense(Int(latent) => hidden[end], sigmoid))
+        for i in length(hidden):-1:2
+            push!(layers, Dense(hidden[i] => hidden[i - 1], sigmoid))
+            push!(layers, Dropout(Float32(p)))
+        end
+        push!(layers, Dense(hidden[1] => Int(n), sigmoid))
+    end
+
+    return Chain(layers...)
 end
 
 """
-    latent_layer(::Chain) -> Int
+    latent_layer(model::Chain) -> Int
 
-Index of the last encoder layer in a DeepKATE model. The encoder is
-`model[1:latent_layer(model)]`; the decoder is
-`model[latent_layer(model)+1:end]`.
+1-based index of the DeepKATE bottleneck (the sin-activated Dense).
+The encoder is `model[1:latent_layer(model)]`; the decoder is
+`model[latent_layer(model)+1:end]`. Under the parametric factory
+this index moves with `length(hidden)` (`5` for the thesis default
+`hidden = [100, 20]`; `7` for `hidden = [256, 128, 64]`; etc.).
 """
-latent_layer(::Chain) = 5
+function latent_layer(model::Chain)
+    for (i, layer) in enumerate(values(model.layers))
+        if layer isa Dense && getproperty(layer, :activation) === sin
+            return i
+        end
+    end
+    throw(ArgumentError("model has no sin-activated bottleneck Dense; \
+                         not built by `deep_kate`?"))
+end
 
 # ---------------------------------------------------------------------------
 # Repel helper (Quellcode 3.9)

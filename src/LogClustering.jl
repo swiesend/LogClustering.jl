@@ -152,12 +152,18 @@ PrecompileTools.@setup_workload begin
         # DeepKATE — build + forward in testmode (Dropout / KATE
         # competition bypassed so we don't trip the Lux "training=true
         # outside autodiff" warning during precompile). The loss path
-        # itself is exercised in the test suite, not here.
+        # itself is exercised in the test suite, not here. Cover both
+        # the thesis-default topology and a widened-bottleneck variant
+        # so TTFX stays low whichever path the user opts into.
         m = deep_kate(16; latent = 2, k1 = 4)
         ps, st = Lux.setup(rng, m)
         st_eval = Lux.testmode(st)
         x = rand(rng, Float32, 16, 2)
         m(x, ps, st_eval)
+
+        m_wide = deep_kate(16; hidden = [32, 16], latent = 8, k1 = 8)
+        ps_w, st_w = Lux.setup(rng, m_wide)
+        m_wide(x, ps_w, Lux.testmode(st_w))
 
         # DenoisingAE — forward + loss in testmode.
         m_d = denoising_ae(16; hidden = 8, latent = 4)

@@ -9,16 +9,18 @@ using LogClustering.DeepKATE: deep_kate, latent_layer, deep_kate_loss, repel
 const RNG = Random.MersenneTwister(42)
 
 @testset "DeepKATE" begin
-    @testset "architecture matches thesis Quellcode 3.7" begin
+    @testset "architecture — thesis defaults (hidden = [100, 20])" begin
         m = deep_kate(64; latent = 3)
-        @test length(m.layers) == 10
+        # Encoder: KComp + Dense + Dropout + KComp + Dense(sin) = 5
+        # Decoder: Dense + Dense + Dropout + Dense          = 4
+        @test length(m.layers) == 9
         @test latent_layer(m) == 5
 
-        encoder_last = m.layers[latent_layer(m)]
-        @test encoder_last isa Dense
-        @test encoder_last.activation === sin
-        @test encoder_last.in_dims == 5
-        @test encoder_last.out_dims == 3                 # latent
+        bottleneck = m.layers[latent_layer(m)]
+        @test bottleneck isa Dense
+        @test bottleneck.activation === sin
+        @test bottleneck.in_dims == 3                    # latent
+        @test bottleneck.out_dims == 3
 
         decoder_last = m.layers[end]
         @test decoder_last isa Dense
@@ -28,6 +30,57 @@ const RNG = Random.MersenneTwister(42)
         # Two KCompetetive layers with the thesis's k values.
         ks = [l.k for l in m.layers if l isa LogClustering.KATE.KCompetetive]
         @test ks == [25, 3]
+    end
+
+    @testset "architecture — widened (hidden = [256, 128, 64], latent = 32)" begin
+        m = deep_kate(512; hidden = [256, 128, 64], latent = 32, k1 = 64)
+        # Encoder: KComp + (Dense+Dropout)×2 + KComp + Dense(sin) = 7
+        # Decoder: Dense + (Dense+Dropout)×2 + Dense             = 6
+        @test length(m.layers) == 13
+        @test latent_layer(m) == 7
+
+        bottleneck = m.layers[latent_layer(m)]
+        @test bottleneck isa Dense
+        @test bottleneck.activation === sin
+        @test bottleneck.in_dims == 32
+        @test bottleneck.out_dims == 32
+
+        ks = [l.k for l in m.layers if l isa LogClustering.KATE.KCompetetive]
+        @test ks == [64, 32]                             # k1 first, k_bottleneck second
+    end
+
+    @testset "architecture — minimal (hidden = [])" begin
+        m = deep_kate(8; hidden = Int[], latent = 2, k1 = 2)
+        # KComp(n→latent) + Dense(latent→latent, sin) + Dense(latent→n, sigmoid) = 3
+        @test length(m.layers) == 3
+        @test latent_layer(m) == 2
+
+        ks = [l.k for l in m.layers if l isa LogClustering.KATE.KCompetetive]
+        @test ks == [2]                                  # only bottleneck KComp
+
+        decoder_last = m.layers[end]
+        @test decoder_last.out_dims == 8
+    end
+
+    @testset "forward pass — widened bottleneck preserves shape" begin
+        m = deep_kate(32; hidden = [64, 32], latent = 16, k1 = 16)
+        ps, st = Lux.setup(RNG, m)
+        X = randn(RNG, Float32, 32, 4)
+        Y, _ = m(X, ps, st)
+        @test size(Y) == (32, 4)
+        @test all(isfinite, Y)
+    end
+
+    @testset "constructor rejects out-of-range knobs" begin
+        @test_throws ArgumentError deep_kate(16; latent = 0)
+        @test_throws ArgumentError deep_kate(16; k1 = 0)
+        @test_throws ArgumentError deep_kate(16; k_bottleneck = 0)
+        @test_throws ArgumentError deep_kate(16; hidden = [100, -1])
+    end
+
+    @testset "latent_layer rejects non-deep_kate chains" begin
+        bogus = Chain(Dense(4 => 4, tanh))
+        @test_throws ArgumentError latent_layer(bogus)
     end
 
     @testset "forward pass (batch)" begin
@@ -85,7 +138,8 @@ const RNG = Random.MersenneTwister(42)
         X = rand(RNG, Float32, 16, 3)
         g = Zygote.gradient(p -> first(deep_kate_loss(m, p, st, X)), ps)[1]
         @test g !== nothing
-        @test any(!iszero, g.layer_10.weight)     # decoder output
+        last_layer = Symbol(:layer_, length(m.layers))
+        @test any(!iszero, getproperty(g, last_layer).weight)   # decoder output
     end
 
     @testset "loss is differentiable through the encoder+decoder" begin
@@ -99,10 +153,11 @@ const RNG = Random.MersenneTwister(42)
         # Gradient reaches some parameter — at minimum the decoder's last
         # Dense, which is directly upstream of the cross-entropy signal.
         total = sum(sum(abs, getproperty(g, Symbol(:layer_, i)).weight)
-                    for i in 1:10
+                    for i in 1:length(m.layers)
                     if hasproperty(getproperty(g, Symbol(:layer_, i)), :weight))
         @test total > 0
-        @test any(!iszero, g.layer_10.weight)
+        last_layer = Symbol(:layer_, length(m.layers))
+        @test any(!iszero, getproperty(g, last_layer).weight)
     end
 
     @testset "training-mode encoder differs from test-mode (dropout)" begin
