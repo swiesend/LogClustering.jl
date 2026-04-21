@@ -2,6 +2,7 @@ using Test
 using Random
 using Lux
 using LogClustering
+using JLD2: jldopen
 using LogClustering.Persistence
 using LogClustering.PersistenceGlue
 using LogClustering.KATE: KCompetetive
@@ -223,6 +224,86 @@ end
                 NamedTuple(), nothing, Dict{String, Any}())
             Persistence._save_bundle(path, bundle)
             @test_throws ErrorException Persistence.load(path)
+        finally
+            isfile(path) && rm(path)
+        end
+    end
+
+    # -----------------------------------------------------------------
+    # Corpus fingerprint + registry (commit 2: --reuse path)
+    # -----------------------------------------------------------------
+
+    @testset "corpus_fingerprint — stable and distinguishing" begin
+        a = ["foo", "bar", "baz"]
+        # Order-invariant (sort+unique).
+        @test Persistence.corpus_fingerprint(a) ==
+              Persistence.corpus_fingerprint(reverse(a))
+        # Duplicate tokens collapse.
+        @test Persistence.corpus_fingerprint([a; a]) ==
+              Persistence.corpus_fingerprint(a)
+        # Different vocabularies diverge.
+        @test Persistence.corpus_fingerprint(a) !=
+              Persistence.corpus_fingerprint(["foo", "bar", "qux"])
+        # n_lines mixed into the key.
+        @test Persistence.corpus_fingerprint(a; n_lines = 10) !=
+              Persistence.corpus_fingerprint(a; n_lines = 20)
+    end
+
+    @testset "list_bundles + find_compatible_bundle" begin
+        dir = mktempdir()
+        try
+            # Build two throw-away bundles with different fingerprints.
+            for (name, fp) in (("a.jld2", "alpha-fp"), ("b.jld2", "beta-fp"))
+                path = joinpath(dir, name)
+                bundle = Persistence.PersistedBundle(
+                    :deep_kate, v"0.0.0", Persistence.SCHEMA_VERSION,
+                    (n = 4,), nothing,
+                    Dict{String, Any}("corpus_fingerprint" => fp))
+                Persistence._save_bundle(path, bundle)
+            end
+            # Non-bundle JLD2 file in the same directory should be skipped.
+            noise = joinpath(dir, "not-a-bundle.jld2")
+            jldopen(noise, "w") do f; f["hello"] = "world"; end
+
+            infos = Persistence.list_bundles(dir)
+            @test length(infos) == 2
+            @test all(b -> b.kind == :deep_kate, infos)
+
+            hit = Persistence.find_compatible_bundle(dir, :deep_kate, "beta-fp")
+            @test hit !== nothing
+            @test basename(hit.path) == "b.jld2"
+
+            @test Persistence.find_compatible_bundle(dir, :deep_kate, "gamma") === nothing
+            @test Persistence.find_compatible_bundle(dir, :vq_vae,   "beta-fp") === nothing
+        finally
+            rm(dir; recursive = true, force = true)
+        end
+    end
+
+    @testset "save_deep_kate stamps corpus_fingerprint automatically" begin
+        using LogClustering.Featurise: build_vocab
+        lines = ["INFO start 1", "INFO start 2", "ERROR fail 1"]
+        vocab = build_vocab(lines; mask = true)
+        m = deep_kate(length(vocab); hidden = [16, 8], latent = 4, k1 = 4)
+        ps, st = Lux.setup(RNG_PERS, m)
+        path = tempname() * ".jld2"
+        try
+            PersistenceGlue.save(path, m, ps, st;
+                kind = :deep_kate,
+                n = length(vocab), hidden = [16, 8], latent = 4,
+                k1 = 4, k_bottleneck = 4, p = 0.1f0,
+                vocab = vocab, n_lines = length(lines),
+                metadata = Dict{String, Any}("source" => "test"))
+            bundle = Persistence.load(path)
+            @test haskey(bundle.metadata, "corpus_fingerprint")
+            @test bundle.metadata["corpus_fingerprint"] ==
+                  Persistence.corpus_fingerprint(vocab.tokens;
+                                                 n_lines = length(lines))
+            # find_compatible_bundle reaches the freshly-saved bundle.
+            hit = Persistence.find_compatible_bundle(
+                dirname(path), :deep_kate,
+                bundle.metadata["corpus_fingerprint"])
+            @test hit !== nothing
         finally
             isfile(path) && rm(path)
         end

@@ -95,13 +95,20 @@ function save_deep_kate(path, model::Chain, ps, st;
                         hidden::AbstractVector{<:Integer} = [100, 20],
                         k_bottleneck::Integer = latent,
                         vocab::Union{Nothing, Vocabulary} = nothing,
-                        metadata::AbstractDict = Dict{String, Any}())
+                        metadata::AbstractDict = Dict{String, Any}(),
+                        n_lines::Integer = 0)
     spec = (n = Int(n), hidden = Int[Int(h) for h in hidden],
             latent = Int(latent), k1 = Int(k1),
             k_bottleneck = Int(k_bottleneck), p = Float32(p),
             vocab = vocab)
+    # Stamp the corpus fingerprint unless the caller set one explicitly.
+    md = Dict{String, Any}(string(k) => v for (k, v) in metadata)
+    if vocab !== nothing && !haskey(md, "corpus_fingerprint")
+        md["corpus_fingerprint"] =
+            Persistence.corpus_fingerprint(vocab.tokens; n_lines = n_lines)
+    end
     Persistence.save_lux(path; kind = :deep_kate, spec = spec,
-                         ps = ps, st = st, metadata = metadata)
+                         ps = ps, st = st, metadata = md)
 end
 
 function _rehydrate_deep_kate(bundle)

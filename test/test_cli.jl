@@ -391,4 +391,89 @@ end
                                                  "NonexistentDatasetXYZ"]))
         @test r.code != 0
     end
+
+    # -------------------------------------------------------------
+    # select-model / train --reuse — corpus fingerprint registry.
+    # -------------------------------------------------------------
+
+    @testset "select-model --help exits 0" begin
+        r = _with_captured_stdio(() -> CLI.main(["select-model", "--help"]))
+        @test r.code == 0
+        @test occursin("registry", r.out)
+    end
+
+    @testset "select-model finds a fingerprint match in the registry" begin
+        registry = mktempdir()
+        data = _toy_file()
+        out  = tempname() * ".jld2"
+        try
+            # Train once into the registry so a bundle is cached.
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "deep_kate", "--data", data,
+                "--out", joinpath(registry, "seed.jld2"),
+                "--epochs", "2", "--batch", "8", "--lr", "0.01",
+                "--min-count", "1", "--max-vocab", "64",
+                "--quiet"]))
+            @test r1.code == 0
+
+            # select-model returns that exact path for the same corpus.
+            r2 = _with_captured_stdio(() -> CLI.main(["select-model",
+                "--kind", "deep_kate", "--data", data,
+                "--registry", registry, "--min-count", "1"]))
+            @test r2.code == 0
+            @test occursin("seed.jld2", r2.out)
+
+            # A different corpus (change one line) → fingerprint mismatch.
+            data2 = tempname() * ".log"
+            open(data2, "w") do io
+                for l in TOY_LINES; println(io, l); end
+                println(io, "NEW totally different line with unseen tokens")
+            end
+            try
+                r3 = _with_captured_stdio(() -> CLI.main(["select-model",
+                    "--kind", "deep_kate", "--data", data2,
+                    "--registry", registry, "--min-count", "1"]))
+                @test r3.code == 1
+                @test occursin("no deep_kate bundle matches", r3.err)
+            finally
+                isfile(data2) && rm(data2)
+            end
+        finally
+            isfile(data) && rm(data)
+            isfile(out) && rm(out)
+            rm(registry; recursive = true, force = true)
+        end
+    end
+
+    @testset "train --reuse short-circuits when a match exists" begin
+        registry = mktempdir()
+        data = _toy_file()
+        out1 = joinpath(registry, "seed.jld2")
+        out2 = tempname() * ".jld2"
+        try
+            # Seed the registry with a trained bundle.
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "deep_kate", "--data", data, "--out", out1,
+                "--epochs", "2", "--batch", "8", "--lr", "0.01",
+                "--min-count", "1", "--max-vocab", "64",
+                "--quiet"]))
+            @test r1.code == 0
+            @test isfile(out1)
+
+            # --reuse on the same corpus must find the seed and copy it.
+            r2 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "deep_kate", "--data", data, "--out", out2,
+                "--epochs", "2", "--batch", "8", "--lr", "0.01",
+                "--min-count", "1", "--max-vocab", "64",
+                "--reuse", "--registry", registry]))
+            @test r2.code == 0
+            @test isfile(out2)
+            @test occursin("reuse:", r2.err)
+            @test filesize(out1) == filesize(out2)
+        finally
+            isfile(data) && rm(data)
+            isfile(out2) && rm(out2)
+            rm(registry; recursive = true, force = true)
+        end
+    end
 end

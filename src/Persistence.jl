@@ -39,9 +39,11 @@ stored in the bundle's `spec`.
 module Persistence
 
 using JLD2
+using SHA: sha256
 
 export PersistedBundle, save, load, rehydrate,
-       register_rehydrator!, register_callable!
+       register_rehydrator!, register_callable!,
+       corpus_fingerprint, list_bundles, find_compatible_bundle
 
 const SCHEMA_VERSION = UInt8(2)
 
@@ -258,6 +260,111 @@ function save_native(path::AbstractString;
         Dict{String, Any}(string(k) => v for (k, v) in metadata),
     )
     _save_bundle(path, bundle)
+end
+
+# ---------------------------------------------------------------------------
+# Corpus fingerprint + model registry (plan: parametric DeepKATE + reuse)
+# ---------------------------------------------------------------------------
+#
+# A fingerprint binds a saved model to the *tokeniser* it was trained on.
+# Two models with the same fingerprint can classify lines from the same
+# tokenisation regime; different fingerprints mean the vocab is
+# structurally different and reuse would produce garbage.
+
+"""
+    corpus_fingerprint(tokens::AbstractVector{<:AbstractString};
+                       n_lines::Integer = 0) -> String
+
+Return a hex-encoded SHA-256 of the tokeniser's vocabulary. Stable
+across runs and Julia versions; changes whenever a token is added,
+removed or renamed. `n_lines` (optional) is mixed in so a vocab
+trained on a tiny probe and a production-scale vocab get distinct
+fingerprints even when the token set happens to match.
+
+This is the primary key used by `find_compatible_bundle` to decide
+whether a saved model can be reused on a new corpus.
+"""
+function corpus_fingerprint(tokens::AbstractVector{<:AbstractString};
+                            n_lines::Integer = 0)::String
+    sorted = sort(unique(String[String(t) for t in tokens]))
+    buf = IOBuffer()
+    for t in sorted
+        write(buf, t); write(buf, '\0')
+    end
+    write(buf, "|n="); write(buf, string(n_lines))
+    return bytes2hex(sha256(take!(buf)))
+end
+
+"""
+    BundleInfo(path, kind, schema_version, spec, metadata)
+
+Lightweight view of a saved bundle returned by
+[`list_bundles`] — avoids rehydrating the full payload when all
+the caller wants is the header / spec / metadata.
+"""
+struct BundleInfo
+    path::String
+    kind::Symbol
+    schema_version::UInt8
+    spec::NamedTuple
+    metadata::Dict{String, Any}
+end
+
+"""
+    list_bundles(dir::AbstractString) -> Vector{BundleInfo}
+
+Walk `dir` for `.jld2` files and peek at each one's header (`kind`,
+`schema_version`, `spec`, `metadata`) without loading the full
+payload. Silently skips non-bundle `.jld2` files so a mixed
+directory can hold training state, checkpoints, etc.
+"""
+function list_bundles(dir::AbstractString)::Vector{BundleInfo}
+    isdir(dir) || return BundleInfo[]
+    out = BundleInfo[]
+    for entry in sort(readdir(dir; join = true))
+        endswith(entry, ".jld2") || continue
+        isfile(entry) || continue
+        info = try
+            jldopen(entry, "r") do f
+                BundleInfo(
+                    entry,
+                    Symbol(f["kind"]),
+                    UInt8(f["schema_version"]),
+                    f["spec"],
+                    Dict{String, Any}(string(k) => v for (k, v) in f["metadata"]),
+                )
+            end
+        catch
+            nothing
+        end
+        info === nothing && continue
+        push!(out, info)
+    end
+    return out
+end
+
+"""
+    find_compatible_bundle(dir, kind::Symbol, fingerprint::AbstractString)
+        -> Union{BundleInfo, Nothing}
+
+Scan `dir` for a bundle of the requested `kind` whose
+`metadata["corpus_fingerprint"]` matches `fingerprint`. Returns
+the most recently modified match, or `nothing`. This is the
+predicate behind `--reuse`: if it returns a bundle, the CLI
+copies it to `--out` and skips training.
+"""
+function find_compatible_bundle(dir::AbstractString, kind::Symbol,
+                                fingerprint::AbstractString
+                                )::Union{BundleInfo, Nothing}
+    infos = list_bundles(dir)
+    candidates = filter(b ->
+        b.kind == kind &&
+        get(b.metadata, "corpus_fingerprint", "") == fingerprint,
+        infos)
+    isempty(candidates) && return nothing
+    # Most-recent wins. `mtime` returns a Float64 (Unix secs).
+    sort!(candidates; by = b -> mtime(b.path), rev = true)
+    return first(candidates)
 end
 
 end # module Persistence

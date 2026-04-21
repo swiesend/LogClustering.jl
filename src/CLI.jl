@@ -98,6 +98,7 @@ function _print_top_help()
       train            fit a model on a log corpus
       classify         label each line with its template / cluster id
       score            per-line anomaly score
+      select-model     find a registry bundle matching a corpus
       mask             apply the typed-slot regex battery
       benchmark        run one parser vs a LogHub-2.0 CSV
       download-loghub  fetch the 2k subsets
@@ -261,6 +262,8 @@ function cmd_train(args::Vector{String})::Int
         ("seqlen",    16,       :int),
         ("max-vocab", 5000,     :int),
         ("min-count", 1,        :int),
+        ("reuse",     false,    :bool),
+        ("registry",  _default_registry_path(), :path),
         ("quiet",     false,    :bool),
     ]
     opts = parse_flags(args, specs)
@@ -269,6 +272,14 @@ function cmd_train(args::Vector{String})::Int
     lines = read_lines(opts["data"])
     kind = Symbol(opts["kind"])
     rng = MersenneTwister(Int(opts["seed"]))
+
+    # --reuse short-circuit: if the registry holds a bundle whose
+    # corpus fingerprint matches the current vocab, copy it to --out
+    # and skip training. Only supported for kinds that save a vocab.
+    if opts["reuse"] && kind in (:deep_kate, :vq_vae, :seq_lstm)
+        reused = _try_reuse(kind, lines, opts)
+        reused == 0 && return 0
+    end
 
     if kind === :drain
         d = Drain()
@@ -288,6 +299,43 @@ function cmd_train(args::Vector{String})::Int
     else
         throw(ArgumentError("unknown kind `$(opts["kind"])`"))
     end
+end
+
+"""
+    _default_registry_path() -> String
+
+Per-user model cache directory; follows the XDG-cache convention on
+Linux (`~/.cache/logclustering/models`), falls back to a homedir
+subdirectory otherwise. The directory is created on demand.
+"""
+function _default_registry_path()
+    home = try; homedir(); catch; "."; end
+    cache = get(ENV, "XDG_CACHE_HOME", joinpath(home, ".cache"))
+    return joinpath(cache, "logclustering", "models")
+end
+
+"""
+    _try_reuse(kind, lines, opts) -> Int
+
+Build the query fingerprint for the current corpus and scan the
+registry for a compatible saved bundle. Returns 0 on a successful
+reuse (bundle copied to `--out`), non-zero to signal "train
+instead." The fingerprint is computed from the vocab the bundle
+*would* use, so reuse costs one `build_vocab` call.
+"""
+function _try_reuse(kind::Symbol, lines::Vector{String}, opts::Dict)::Int
+    vocab = build_vocab(lines; mask = true,
+                        min_count = Int(opts["min-count"]),
+                        max_vocab = Int(opts["max-vocab"]))
+    fp = Persistence.corpus_fingerprint(vocab.tokens; n_lines = length(lines))
+    registry = String(opts["registry"])
+    candidate = Persistence.find_compatible_bundle(registry, kind, fp)
+    candidate === nothing && return 1                     # no reuse; train.
+    cp(candidate.path, String(opts["out"]); force = true)
+    opts["quiet"] || println(stderr,
+        "reuse: copied ", candidate.path, " → ", opts["out"],
+        " (fingerprint ", fp[1:12], "…)")
+    return 0
 end
 
 function _train_metadata(opts, lines, kind_name::AbstractString)
@@ -321,6 +369,7 @@ function _train_deep_kate(lines::Vector{String}, opts::Dict, rng)::Int
         n = cfg.n, hidden = cfg.hidden, latent = cfg.latent,
         k1 = cfg.k1, k_bottleneck = cfg.k_bottleneck, p = cfg.p,
         vocab = vocab,
+        n_lines = length(lines),
         metadata = _train_metadata(opts, lines, "deep_kate"))
     opts["quiet"] || println(stderr,
         "deep_kate: ", length(vocab), "-tok vocab, hidden=", cfg.hidden,
@@ -515,6 +564,7 @@ function _print_train_help()
                             [--auto] [--budget N] [--epochs N] [--batch N]
                             [--lr F] [--seed N]
                             [--seqlen N] [--max-vocab N] [--min-count N]
+                            [--reuse] [--registry DIR]
                             [--quiet]
 
     Fit and persist a model.
@@ -538,6 +588,13 @@ function _print_train_help()
     --seqlen N    sequence length for seq_lstm (default 16).
     --max-vocab N cap the vocabulary (default 5000).
     --min-count N minimum token frequency to keep (default 1).
+    --reuse       skip training if --registry holds a bundle whose
+                  `corpus_fingerprint` matches this corpus's vocab;
+                  the bundle is then copied to --out. Ignored for
+                  --kind drain (drain bundles don't carry a vocab).
+    --registry D  directory of saved bundles to scan for --reuse and
+                  `select-model`. Default: \$XDG_CACHE_HOME/logclustering/models
+                  (or ~/.cache/logclustering/models).
     --quiet       suppress per-epoch loss lines.
     """)
 end
@@ -740,6 +797,54 @@ end
 # scripts under `benchmarks/loghub2/`.
 # ---------------------------------------------------------------------------
 
+function cmd_select(args::Vector{String})::Int
+    specs = [
+        ("kind",      "deep_kate", :string),
+        ("data",      "-",         :path),
+        ("registry",  _default_registry_path(), :path),
+        ("max-vocab", 5000,        :int),
+        ("min-count", 1,           :int),
+        ("format",    "path",      :string),   # "path" | "info"
+    ]
+    opts = parse_flags(args, specs)
+    get(opts, "help", false) && (_print_select_help(); return 0)
+    kind = Symbol(opts["kind"])
+    lines = read_lines(opts["data"])
+    vocab = build_vocab(lines; mask = true,
+                        min_count = Int(opts["min-count"]),
+                        max_vocab = Int(opts["max-vocab"]))
+    fp = Persistence.corpus_fingerprint(vocab.tokens; n_lines = length(lines))
+    candidate = Persistence.find_compatible_bundle(
+        String(opts["registry"]), kind, fp)
+    if candidate === nothing
+        println(stderr,
+                "no ", kind, " bundle matches fingerprint ", fp[1:12], "…",
+                " in ", opts["registry"])
+        return 1
+    end
+    if opts["format"] == "info"
+        println(candidate.path)
+        println("  kind=", candidate.kind,
+                "  schema=", Int(candidate.schema_version))
+        println("  n_lines=", get(candidate.metadata, "n_lines", "?"),
+                "  source=", get(candidate.metadata, "source", "?"))
+    else
+        println(candidate.path)
+    end
+    return 0
+end
+
+function _print_select_help()
+    println("""
+    usage: logcluster select-model [--kind KIND] [--data FILE]
+                                   [--registry DIR] [--format path|info]
+
+    Print the path of a saved bundle in --registry whose
+    `corpus_fingerprint` matches the vocab of --data. Exits 1 when no
+    match is found. Use `--format info` to include kind + metadata.
+    """)
+end
+
 function cmd_benchmark(args::Vector{String})::Int
     # Lazy-include to avoid hard-wiring the path at CLI module load time.
     here = @__DIR__
@@ -777,6 +882,7 @@ const SUBCOMMANDS = Dict{String, Function}(
     "train"            => cmd_train,
     "classify"         => cmd_classify,
     "score"            => cmd_score,
+    "select-model"     => cmd_select,
     "mask"             => cmd_mask,
     "benchmark"        => cmd_benchmark,
     "download-loghub"  => cmd_download,
