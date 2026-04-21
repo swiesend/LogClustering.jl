@@ -94,6 +94,40 @@ The batched `parse_lines` FFI makes every `mask`-prefixed path run
 in well under `0.03 s` per 2 k lines (400–1000× faster than the
 per-line FFI crossings it replaced).
 
+## Root-cause-analysis in one command
+
+Once a model is trained (or found in the registry by
+`logcluster select-model`), `logcluster rca` composes
+clustering → anomaly scoring → episode mining into a single
+report:
+
+```sh
+logcluster train --kind deep_kate --data corpus.log \
+    --auto --reuse --registry ~/.cache/logclustering/models \
+    --out /tmp/model.jld2
+
+logcluster rca --model /tmp/model.jld2 --data corpus.log \
+    --percentile 0.05 --topk 10 --format md --out /tmp/rca.md
+```
+
+The top-N ranked root-cause episodes — scored by
+`support · mean_anomaly_density` — are the sequences of cluster
+ids that fire often *and* fire in anomalous windows. The
+Markdown output includes representative lines per pattern so the
+runbook entry writes itself. See
+[`docs/src/rca.md`](docs/src/rca.md) for flag reference and
+[`src/RCA.jl`](src/RCA.jl) for the Julia API.
+
+## Model reuse across investigations
+
+Saved DeepKATE / VQ-VAE / SeqLSTM bundles carry a
+`corpus_fingerprint` — a SHA-256 of the sorted vocabulary. The
+`--reuse --registry DIR` flag on `logcluster train` scans that
+directory for a bundle whose fingerprint matches the new corpus
+and, on a hit, copies it to `--out` without running SGD. The
+same mechanism drives `logcluster select-model`, which prints
+the matched path (or exits non-zero) so it's scriptable.
+
 ## Value-level outlier detection
 
 Typed-slot masking replaces every `<IP>` / `<INT>` / `<TIMESTAMP>` before

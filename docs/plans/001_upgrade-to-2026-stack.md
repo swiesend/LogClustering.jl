@@ -33,6 +33,34 @@ require them to be fully complete.
 
 ---
 
+### Stage G — Root-cause workflow + model reuse  *(landed)*
+
+**Decision.** Wrap the existing pieces into a single RCA
+pipeline so the practitioner answers "which recurring event
+sequences correlate with the anomalies?" in one subcommand, and
+introduce a lightweight model registry so retraining happens
+only when the corpus vocabulary actually changes.
+
+- `src/RCA.jl` + `logcluster rca` — cluster → per-line anomaly
+  → episode mining seeded with top-percentile cluster ids →
+  ranked root-cause episodes (sorted by `support · density`).
+  Markdown / JSON / TSV outputs. Pure orchestration over
+  `Masking`, `Featurise`, `DeepKATE`, `Cluster.Pipeline`,
+  `Anomaly.Instance`, `Mining.Episodes`.
+- `Persistence.corpus_fingerprint` (SHA-256 of sorted vocab) +
+  `find_compatible_bundle(dir, kind, fingerprint)` +
+  `logcluster select-model` + `logcluster train --reuse
+  --registry PATH` — a trained DeepKATE / VQ-VAE / SeqLSTM
+  bundle is auto-selected from the registry when its
+  fingerprint matches the current corpus; SGD runs only on a
+  miss. Registry defaults to `$XDG_CACHE_HOME/logclustering/models`.
+
+**Files.** `src/RCA.jl` ✓, `src/Persistence.jl` fingerprint
+helpers ✓, `src/CLI.jl` `rca` + `select-model` + `--reuse` ✓,
+`docs/src/rca.md` tutorial ✓.
+
+---
+
 ### Stage A — Revival foundation  *(Started)*
 
 **Decision.** Migrate to Julia 1.10 LTS and **Lux** (not Flux). Replace
@@ -94,11 +122,18 @@ on HDFS within 1 pt.
 
 **Decision.** Keep KATE-modernised as the reference. DeepKATE (the
 thesis's own contribution, §3.2.3, Quellcode 3.7/3.8/3.9) is *ported*
-from Flux to Lux in `src/DeepKATE.jl`: ten-layer autoencoder, two
-`KCompetetive` layers with `k < out` (this required extending
-`KCompetetive` to separate `out_dims` from `k`), sine-activated
-bottleneck, dropout, and the triplet Pareto loss (prev/ce/succ) with
-stop-gradient targets via `@ignore_derivatives`. Add three siblings:
+from Flux to Lux in `src/DeepKATE.jl`: a parametric encoder /
+decoder cascade (default `hidden = [100, 20]` reproduces the
+thesis semantics), two `KCompetetive` layers, sin-activated
+bottleneck, dropout, and the triplet Pareto loss (prev/ce/succ)
+with stop-gradient targets via `@ignore_derivatives`. The
+parametric factory lifts the old `latent ≤ 5` cap — dense-vocabulary
+corpora (Thunderbird: 149 templates) can now opt into
+`hidden = [256, 64]`, `latent = 32` without code changes. A
+single-batch `deep_kate_loss(model, ps, st, X)` overload drops
+the temporal prev/succ sub-objectives so callers training on a
+shuffled BoW batch don't need to synthesise triplets. Add three
+siblings:
 
 - **VQ-VAE** (van den Oord et al. 2017) — the principled descendant of
   k-winner-take-all; codebook *is* the cluster vocabulary; discrete code
@@ -443,7 +478,7 @@ src/
   Mining/{Episodes.jl,              # MV-Span / MT-Span (thesis §3.2.7, ported)
           Baselines.jl}             # PrefixSpan, SPADE, CM-SPADE (Stage E baselines)
   Anomaly/{Instance.jl (ported, thesis §3.2.5), Sequence.jl}
-  RCA/{Graph.jl, CausalDiscovery.jl}
+  RCA.jl                         # cluster+anomaly+episode orchestration (landed)
   Eval/{Metrics.jl, Harness.jl, CV.jl}
 rust/                          # cdylib: parse_line + infer_regex (thesis §3.2.2, §3.2.6)
   Cargo.toml, Cargo.lock, src/{lib.rs, parse_line.rs, infer.rs}

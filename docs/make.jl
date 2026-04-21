@@ -44,6 +44,7 @@ makedocs(
             "Clustering"     => "cluster.md",
             "Mining"         => "mining.md",
             "Anomaly"        => "anomaly.md",
+            "RCA"            => "rca.md",
         ],
         "Evaluation" => [
             "Metrics"        => "metrics.md",
