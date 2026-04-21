@@ -25,6 +25,7 @@ using LogClustering
     include("test_postproc.jl")
     include("test_persistence.jl")
     include("test_autotune.jl")
+    include("test_rca.jl")
     include("test_cli.jl")
     include("test_ad.jl")
     include("test_rust.jl")

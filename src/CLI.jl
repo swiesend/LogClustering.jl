@@ -45,6 +45,7 @@ using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly
                   value_novelty
 using ..Sparsity: sparsity_clusters
 using ..Framing: parse_frame, SOURCE_RAW
+using ..RCA: RCA, root_cause, render_markdown
 using Lux
 using Zygote
 using JSON3
@@ -99,6 +100,7 @@ function _print_top_help()
       classify         label each line with its template / cluster id
       score            per-line anomaly score
       select-model     find a registry bundle matching a corpus
+      rca              root-cause-analysis report (cluster+anomaly+episodes)
       mask             apply the typed-slot regex battery
       benchmark        run one parser vs a LogHub-2.0 CSV
       download-loghub  fetch the 2k subsets
@@ -878,11 +880,100 @@ end
 # Subcommand table.
 # ---------------------------------------------------------------------------
 
+function cmd_rca(args::Vector{String})::Int
+    specs = [
+        ("model",       "",    :path),
+        ("detector",    "",    :path),
+        ("data",        "-",   :path),
+        ("out",         "-",   :path),
+        ("format",      "md",  :string),          # md | json | tsv
+        ("topk",        10,    :int),
+        ("percentile",  0.10,  :float),
+        ("min-sup",     3,     :int),
+        ("max-gap",     20,    :int),
+        ("max-dur",     50,    :int),
+        ("k-clusters",  0,     :int),              # 0 = auto
+    ]
+    opts = parse_flags(args, specs)
+    get(opts, "help", false) && (_print_rca_help(); return 0)
+    isempty(opts["model"]) && throw(ArgumentError("--model is required"))
+    lines = read_lines(opts["data"])
+
+    art = Persistence.load_and_rehydrate(opts["model"])
+    hasproperty(art, :model) && hasproperty(art, :vocab) ||
+        throw(ArgumentError("--model must be a DeepKATE / VQ-VAE bundle"))
+
+    detector = nothing
+    if !isempty(opts["detector"])
+        d = Persistence.load_and_rehydrate(opts["detector"])
+        d isa ValueNoveltyDetector ||
+            throw(ArgumentError("--detector must be a ValueNoveltyDetector bundle"))
+        detector = d
+    end
+
+    kk = Int(opts["k-clusters"])
+    report = root_cause(art.model, art.ps, art.st, art.vocab, lines;
+        detector = detector,
+        k_clusters = kk > 0 ? kk : nothing,
+        top_percentile = Float64(opts["percentile"]),
+        min_sup = Int(opts["min-sup"]),
+        max_gap = Int(opts["max-gap"]),
+        max_time_duration = Int(opts["max-dur"]))
+
+    body = if opts["format"] == "md"
+        render_markdown(report; topk = Int(opts["topk"]), lines = lines)
+    elseif opts["format"] == "json"
+        JSON3.write(Dict(
+            "metadata" => report.metadata,
+            "cluster_ids" => report.cluster_ids,
+            "per_line_score" => report.per_line_score,
+            "ranked" => [Dict("pattern" => r.pattern, "support" => r.support,
+                              "density" => r.density, "score" => r.score)
+                         for r in report.ranked[1:min(end, Int(opts["topk"]))]],
+        ))
+    elseif opts["format"] == "tsv"
+        io = IOBuffer()
+        println(io, "rank\tpattern\tsupport\tdensity\tscore")
+        for (i, r) in enumerate(report.ranked)
+            i > Int(opts["topk"]) && break
+            println(io, i, '\t', join(r.pattern, ','), '\t',
+                    r.support, '\t', r.density, '\t', r.score)
+        end
+        String(take!(io))
+    else
+        throw(ArgumentError("unknown --format `$(opts["format"])`"))
+    end
+    write_out(opts["out"], body)
+    return 0
+end
+
+function _print_rca_help()
+    println("""
+    usage: logcluster rca --model PATH [--detector PATH]
+                          [--data FILE] [--out FILE]
+                          [--format md|json|tsv]
+                          [--topk N] [--percentile F]
+                          [--min-sup N] [--max-gap N] [--max-dur N]
+                          [--k-clusters K]
+
+    Root-cause-analysis report: cluster → anomaly-score → episode
+    mining, seeded with the cluster ids of the top-percentile most
+    anomalous lines. `--model` is a DeepKATE / VQ-VAE bundle;
+    `--detector` (optional) is a saved ValueNoveltyDetector that
+    fuses its value-novelty signal with the reconstruction score.
+
+    The Markdown format includes a table of the top-N root-cause
+    episodes (pattern, support, density, score) and representative
+    lines from each.
+    """)
+end
+
 const SUBCOMMANDS = Dict{String, Function}(
     "train"            => cmd_train,
     "classify"         => cmd_classify,
     "score"            => cmd_score,
     "select-model"     => cmd_select,
+    "rca"              => cmd_rca,
     "mask"             => cmd_mask,
     "benchmark"        => cmd_benchmark,
     "download-loghub"  => cmd_download,

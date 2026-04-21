@@ -81,8 +81,14 @@ using .PersistenceGlue
 include("Cluster/Sparsity.jl")
 using .Sparsity
 
+include("Cluster/Pipeline.jl")
+using .Pipeline
+
 include("AutoTune.jl")
 using .AutoTune
+
+include("RCA.jl")
+using .RCA
 
 include("CLI.jl")
 using .CLI
@@ -91,14 +97,11 @@ function __init__()
     PersistenceGlue.register_all!()
 end
 
-include("Cluster/Pipeline.jl")
-using .Pipeline
-
 export KATE, DeepKATE, DenoisingAE, Framing, Masking, Dedup,
        Featurise, Episodes, Baselines, Instance, Sequence, SeqLSTM,
        VQVAE, SimCSE, Metrics, Compression, Harness, CV, Sparsity,
        Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
-       AutoTune, CLI, Purity, Typing, Merge, Rust
+       AutoTune, RCA, CLI, Purity, Typing, Merge, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
