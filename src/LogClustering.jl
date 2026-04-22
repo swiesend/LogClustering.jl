@@ -45,9 +45,6 @@ using .SimCSE
 include("Models/DenoisingAE.jl")
 using .DenoisingAE
 
-include("Models/SoftKATE.jl")
-using .SoftKATE
-
 include("Eval/Metrics.jl")
 using .Metrics
 
@@ -86,6 +83,12 @@ using .Sparsity
 
 include("Cluster/Pipeline.jl")
 using .Pipeline
+
+# SoftKATE's training helper pulls metrics + pipeline for the
+# optional best-checkpoint tracking, so it has to sit after the
+# Eval/ and Cluster/ includes.
+include("Models/SoftKATE.jl")
+using .SoftKATE
 
 include("AutoTune.jl")
 using .AutoTune

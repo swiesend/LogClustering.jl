@@ -22,20 +22,49 @@ The factory stays parametric like the modern DeepKATE — `hidden`
 vector + `latent` — so callers can scale to the corpus. The bottleneck
 is the `GumbelSoftCompetetive` layer; `latent_layer(model)` reports
 its index so downstream clustering / anomaly code reuses unchanged.
+
+## Annealing caveat
+
+The default annealing target is `τ_stop ≈ 1.0` rather than the
+"hard" value `τ ≈ 0.1`. Empirically on Thunderbird_2k (149
+templates into 40 latent dims), driving τ all the way to `0.1-0.3`
+collapses sparsity-based clustering: the gate becomes a near
+one-hot k-WTA, and distinct templates get forced onto the same
+winner index. Rule of thumb:
+
+    latent_dim < num_templates  →  keep τ_stop ≥ 1.0
+    latent_dim ≥ num_templates  →  safe to anneal to τ_stop ≈ 0.1
+
+The 240-epoch Thunderbird sweep measured sparsity-top-5 purity
+peaking at **τ = 1.75 / epoch 120** (Pur 0.849, NMI 0.893), and
+dropping back to 0.833 at epoch 240 as τ continued annealing.
+Hold τ in the soft regime unless you know the bottleneck has
+headroom.
+
+## Training helper
+
+Use [`soft_kate_train!`] when you want the loop + annealing +
+optional best-checkpoint tracking against a held-out sample. The
+manual-loop form stays available for full control.
 """
 module SoftKATE
 
 using Lux
 using LuxCore: LuxCore, AbstractLuxLayer
-using Random: AbstractRNG, default_rng
+using Random: AbstractRNG, default_rng, MersenneTwister, shuffle
 using Statistics: mean
 using NNlib: softmax, logsoftmax, gelu, sigmoid
 using WeightInitializers: glorot_uniform, zeros32
 using ChainRulesCore: @ignore_derivatives
+using Zygote
+using Clustering: kmeans
 using ..SimCSE: simcse_loss
+using ..Sparsity: sparsity_clusters
+using ..Pipeline: l2_normalise
+using ..Metrics: nmi, ari, purity
 
 export GumbelSoftCompetetive, soft_kate, soft_kate_loss, latent_layer,
-       set_temperature, anneal_temperature
+       set_temperature, anneal_temperature, soft_kate_train!
 
 # ---------------------------------------------------------------------------
 # Gumbel-softmax competitive layer
@@ -347,6 +376,225 @@ function soft_kate_loss(model::Chain, ps, st,
     recon = _bce(ŷ, x)
     contra = simcse_loss(z1, z2; τ = τ_contrast)
     return recon + eltype(ŷ)(λ) * contra, st3
+end
+
+# ---------------------------------------------------------------------------
+# Training helper with optional best-checkpoint tracking
+# ---------------------------------------------------------------------------
+
+@inline function _sgd_step(ps, grads, lr)
+    grads === nothing && return ps
+    ps isa AbstractArray && return ps .- lr .* grads
+    if ps isa NamedTuple
+        k = keys(ps)
+        return NamedTuple{k}(map(ki -> _sgd_step(getfield(ps, ki),
+                                                 hasproperty(grads, ki) ? getfield(grads, ki) : nothing,
+                                                 lr), k))
+    end
+    return ps
+end
+
+function _encode(model::Chain, ps, st, X::AbstractMatrix, lat::Int)
+    st_eval = Lux.testmode(st)
+    Z = X
+    for i in 1:lat
+        sym = Symbol(:layer_, i)
+        Z, _ = getfield(model.layers, sym)(Z, getfield(ps, sym),
+                                           getfield(st_eval, sym))
+    end
+    return Z
+end
+
+"""
+    _validate(model, ps, st, Xval, y_gt; cluster, sparsity_k, kmeans_k, metric) -> Float64
+
+Run the encoder on `Xval`, cluster the L2-normalised latent, score
+the clustering against `y_gt` (string labels or integer ids) with
+the chosen metric. `cluster = :sparsity` uses `sparsity_clusters`
+with `sparsity_k`; `:kmeans` uses `kmeans_cluster` with `kmeans_k`.
+"""
+function _validate(model::Chain, ps, st,
+                   Xval::AbstractMatrix, y_gt::AbstractVector;
+                   cluster::Symbol, sparsity_k::Integer,
+                   kmeans_k::Integer, metric::Symbol)
+    lat = latent_layer(model)
+    Z = _encode(model, ps, st, Xval, lat)
+    Zn = l2_normalise(Z)
+    preds = if cluster === :sparsity
+        first(sparsity_clusters(Zn, Int(sparsity_k)))
+    elseif cluster === :kmeans
+        km = kmeans(Zn, Int(kmeans_k); maxiter = 200)
+        km.assignments
+    else
+        throw(ArgumentError("unknown cluster strategy `$cluster`; use :sparsity or :kmeans"))
+    end
+    pred_str = string.(preds)
+    gold_str = [String(y) for y in y_gt]
+    score = if metric === :nmi
+        nmi(pred_str, gold_str)
+    elseif metric === :ari
+        ari(pred_str, gold_str)
+    elseif metric === :purity
+        purity(pred_str, gold_str)
+    else
+        throw(ArgumentError("unknown metric `$metric`; use :nmi, :ari, :purity"))
+    end
+    return Float64(score)
+end
+
+"""
+    soft_kate_train!(model::Chain, ps, st, X::AbstractMatrix;
+                     epochs = 120, batch = 64, lr = 0.02f0,
+                     λ = 0.3, τ_start = 2.0, τ_stop = 1.0,
+                     schedule = :cosine,
+                     validation = nothing,
+                     metric = :ari,
+                     cluster = :sparsity,
+                     sparsity_k = 5,
+                     kmeans_k = 0,
+                     patience = 0,
+                     rng = MersenneTwister(0),
+                     verbose = false)
+        -> (ps_best, st_best, history)
+
+Train a SoftKATE `model` on columnar-sample matrix `X` with the
+joint BCE + SimCSE objective, annealed Gumbel temperature, and —
+if `validation = (Xval, y_gt)` is supplied — best-checkpoint
+tracking against a held-out sample.
+
+Knobs:
+
+- `epochs`, `batch`, `lr`: standard SGD.
+- `λ`: weight of the SimCSE contrastive term in [`soft_kate_loss`].
+- `τ_start`, `τ_stop`, `schedule`: drive
+  [`anneal_temperature`] once per gradient step. `τ_stop = 1.0`
+  is the default *after* the 240-epoch Thunderbird finding —
+  annealing into the hard-kWTA regime collapses sparsity
+  clustering when `latent_dim < num_templates`.
+- `validation`: optional `(Xval, y_gt)` tuple. `Xval` is a
+  feature matrix matching `X`'s layout; `y_gt` is a vector of
+  string or integer ground-truth labels.
+- `metric`: `:nmi | :ari | :purity` — the scalar tracked against
+  `validation`.
+- `cluster`: `:sparsity` (default) uses `sparsity_clusters(Z,
+  sparsity_k)`; `:kmeans` uses `kmeans(Z, kmeans_k)`.
+- `patience = 0`: no early stop (run all epochs, restore best);
+  `patience > 0`: early-stop when the validation metric hasn't
+  improved for that many epochs.
+- `verbose`: print a short per-epoch log to `stderr`.
+
+Returns `(ps_best, st_best, history)`. `history` is a
+`Vector{NamedTuple}` with `(epoch, loss, τ, val)` per epoch (`val`
+is the validation metric or `NaN` when no validation supplied).
+
+When no `validation` is supplied, `ps_best` / `st_best` are the
+final-epoch parameters and no early stopping applies.
+"""
+function soft_kate_train!(model::Chain, ps, st, X::AbstractMatrix{<:Real};
+                          epochs::Integer = 120,
+                          batch::Integer = 64,
+                          lr::Real = 0.02f0,
+                          λ::Real = 0.3,
+                          τ_start::Real = 2.0,
+                          τ_stop::Real = 1.0,
+                          schedule::Symbol = :cosine,
+                          validation::Union{Nothing, Tuple} = nothing,
+                          metric::Symbol = :ari,
+                          cluster::Symbol = :sparsity,
+                          sparsity_k::Integer = 5,
+                          kmeans_k::Integer = 0,
+                          patience::Integer = 0,
+                          rng::AbstractRNG = MersenneTwister(0),
+                          verbose::Bool = false)
+    epochs >= 1 || throw(ArgumentError("epochs must be ≥ 1"))
+    N = size(X, 2)
+    b = min(Int(batch), N)
+    total_steps = Int(epochs) * cld(N, b)
+    step = 0
+
+    history = @NamedTuple{epoch::Int, loss::Float64,
+                          τ::Float64, val::Float64}[]
+    best_val = -Inf
+    best_ps, best_st = ps, st
+    epochs_since_improve = 0
+
+    if validation !== nothing && cluster === :kmeans && kmeans_k == 0
+        throw(ArgumentError("cluster = :kmeans requires kmeans_k > 0"))
+    end
+
+    lr_f = Float32(lr)
+    for e in 1:Int(epochs)
+        perm = shuffle(rng, collect(1:N))
+        ep_loss = 0.0f0
+        ep_seen = 0
+        for start in 1:b:N
+            stop = min(start + b - 1, N)
+            xb = X[:, perm[start:stop]]
+            step += 1
+            st, _ = anneal_temperature(st, step, total_steps;
+                                       start = τ_start, stop = τ_stop,
+                                       schedule = schedule)
+            (loss, st), back = Zygote.pullback(
+                p -> soft_kate_loss(model, p, st, xb; λ = λ), ps)
+            g = back((one(loss), nothing))[1]
+            ps = _sgd_step(ps, g, lr_f)
+            ep_loss += Float32(loss) * size(xb, 2)
+            ep_seen += size(xb, 2)
+        end
+        epoch_loss = Float64(ep_loss / max(1, ep_seen))
+        τ_now = Float64(_find_temperature(st))
+        val_score = if validation === nothing
+            NaN
+        else
+            Xval, y_gt = validation
+            _validate(model, ps, st, Xval, y_gt;
+                      cluster = cluster, sparsity_k = Int(sparsity_k),
+                      kmeans_k = Int(kmeans_k), metric = metric)
+        end
+        push!(history, (epoch = e, loss = epoch_loss, τ = τ_now,
+                        val = val_score))
+        if validation !== nothing && val_score > best_val
+            best_val = val_score
+            best_ps, best_st = ps, st
+            epochs_since_improve = 0
+        else
+            epochs_since_improve += 1
+        end
+        if verbose
+            println(stderr, "soft_kate  epoch ", lpad(e, 4), "/",
+                    epochs, "   loss=", round(epoch_loss; digits = 4),
+                    "   τ=", round(τ_now; digits = 3),
+                    validation === nothing ? "" :
+                        "   val($metric)=" * string(round(val_score; digits = 4)),
+                    "   best=", round(best_val; digits = 4))
+        end
+        if patience > 0 && validation !== nothing &&
+                epochs_since_improve >= Int(patience)
+            verbose && println(stderr, "early stop at epoch $e (no improvement for $patience epochs)")
+            break
+        end
+    end
+    if validation === nothing
+        best_ps, best_st = ps, st
+    end
+    return best_ps, best_st, history
+end
+
+# Walk the Lux state tree to find the first `temperature` field — used
+# for logging. O(#sub-states); fine for our small chains.
+function _find_temperature(st)
+    st isa NamedTuple || return NaN
+    if haskey(st, :temperature)
+        return Float64(st.temperature)
+    end
+    for k in keys(st)
+        v = getfield(st, k)
+        if v isa NamedTuple
+            τ = _find_temperature(v)
+            isnan(τ) || return τ
+        end
+    end
+    return NaN
 end
 
 end # module SoftKATE

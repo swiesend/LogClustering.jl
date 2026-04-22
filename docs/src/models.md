@@ -60,3 +60,22 @@ LogClustering.DenoisingAE.denoising_ae
 LogClustering.DenoisingAE.denoising_ae_loss
 LogClustering.DenoisingAE.latent_layer
 ```
+
+## SoftKATE (Gumbel-soft competition + joint BCE + SimCSE)
+
+Modernised DeepKATE: soft Gumbel-softmax competition replaces the
+hard k-WTA, joint BCE+SimCSE replaces BCE-only, `gelu`+LayerNorm
+replaces the thesis activations. Annealing caveat: keep
+`τ_stop ≥ 1.0` when `latent_dim < num_templates` — hard-kWTA
+regime collapses sparsity clustering (measured on Thunderbird).
+
+```@docs
+LogClustering.SoftKATE
+LogClustering.SoftKATE.soft_kate
+LogClustering.SoftKATE.soft_kate_loss
+LogClustering.SoftKATE.soft_kate_train!
+LogClustering.SoftKATE.GumbelSoftCompetetive
+LogClustering.SoftKATE.anneal_temperature
+LogClustering.SoftKATE.set_temperature
+LogClustering.SoftKATE.latent_layer
+```

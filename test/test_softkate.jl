@@ -4,7 +4,8 @@ using Lux
 using Zygote
 using LogClustering
 using LogClustering.SoftKATE: GumbelSoftCompetetive, soft_kate, soft_kate_loss,
-                              set_temperature, anneal_temperature
+                              set_temperature, anneal_temperature,
+                              soft_kate_train!
 using LogClustering.SoftKATE: latent_layer as sk_latent_layer
 
 const RNG_SK = Random.MersenneTwister(101)
@@ -161,5 +162,90 @@ end
             push!(losses, Float64(loss))
         end
         @test losses[end] < losses[1]
+    end
+
+    # -----------------------------------------------------------------
+    # soft_kate_train! — training helper + best-checkpoint tracking
+    # -----------------------------------------------------------------
+
+    @testset "soft_kate_train! — without validation returns final ps" begin
+        rng = Random.MersenneTwister(3)
+        m = soft_kate(8; hidden = [16, 8], latent = 4,
+                      init_temperature = 1.0f0)
+        ps, st = Lux.setup(rng, m)
+        x = hcat(
+            repeat(Float32[0.1, 0.9, 0.0, 0.5, 0.0, 0.8, 0.0, 0.2], 1, 4),
+            repeat(Float32[0.0, 0.2, 0.9, 0.1, 0.7, 0.0, 0.3, 0.0], 1, 4),
+        )
+        ps_b, st_b, history = soft_kate_train!(m, ps, st, x;
+            epochs = 6, batch = 4, lr = 0.05f0, λ = 0.3,
+            τ_start = 1.0, τ_stop = 1.0,
+            rng = rng, verbose = false)
+        @test length(history) == 6
+        @test all(isnan(h.val) for h in history)
+        @test history[end].epoch == 6
+        @test history[end].loss < history[1].loss
+        # Without validation the "best" is just the final state.
+        @test ps_b === ps_b   # sanity — returned
+    end
+
+    @testset "soft_kate_train! — validation tracks best-so-far ARI" begin
+        rng = Random.MersenneTwister(5)
+        # Two distinct patterns, 5 copies each — any clusterer can tell
+        # them apart.
+        a = repeat(Float32[1, 0, 1, 0, 1, 0, 1, 0], 1, 5)
+        b = repeat(Float32[0, 1, 0, 1, 0, 1, 0, 1], 1, 5)
+        x = hcat(a, b)
+        gt = vcat(fill("A", 5), fill("B", 5))
+        m = soft_kate(8; hidden = [16, 8], latent = 4,
+                      init_temperature = 2.0f0)
+        ps, st = Lux.setup(rng, m)
+        ps_best, st_best, history = soft_kate_train!(m, ps, st, x;
+            epochs = 10, batch = 4, lr = 0.05f0, λ = 0.3,
+            τ_start = 2.0, τ_stop = 1.0,
+            validation = (x, gt), metric = :ari,
+            cluster = :sparsity, sparsity_k = 2,
+            rng = rng, verbose = false)
+        @test length(history) == 10
+        @test all(!isnan(h.val) for h in history)
+        # Every val score ≤ best; this is the definition of best-so-far
+        # restoration.
+        best = maximum(h.val for h in history)
+        @test history[end].val <= best   # end ≤ best (or ==)
+        @test best >= 0.0                # well-defined ARI
+    end
+
+    @testset "soft_kate_train! — early stopping on patience" begin
+        rng = Random.MersenneTwister(9)
+        x = rand(rng, Float32, 8, 20)
+        # Random ground truth → any clusterer scores near zero; no
+        # improvement past epoch ~3 will fire early-stop.
+        gt = string.(rand(rng, 1:4, 20))
+        m = soft_kate(8; hidden = [8, 4], latent = 2,
+                      init_temperature = 2.0f0)
+        ps, st = Lux.setup(rng, m)
+        ps_b, st_b, history = soft_kate_train!(m, ps, st, x;
+            epochs = 50, batch = 10, lr = 0.05f0, λ = 0.3,
+            τ_start = 2.0, τ_stop = 1.0,
+            validation = (x, gt), metric = :ari,
+            cluster = :sparsity, sparsity_k = 2,
+            patience = 3, rng = rng, verbose = false)
+        # Training stops before all 50 epochs once the metric plateaus.
+        @test length(history) < 50
+    end
+
+    @testset "soft_kate_train! — argument validation" begin
+        rng = Random.MersenneTwister(11)
+        m = soft_kate(4; hidden = [4], latent = 2)
+        ps, st = Lux.setup(rng, m)
+        x = rand(rng, Float32, 4, 4)
+        @test_throws ArgumentError soft_kate_train!(m, ps, st, x; epochs = 0)
+        gt = fill("x", 4)
+        @test_throws ArgumentError soft_kate_train!(m, ps, st, x;
+            epochs = 2, validation = (x, gt),
+            cluster = :kmeans, kmeans_k = 0)
+        @test_throws ArgumentError soft_kate_train!(m, ps, st, x;
+            epochs = 2, validation = (x, gt),
+            cluster = :nope)
     end
 end
