@@ -11,6 +11,7 @@ using LogClustering
     include("test_vqvae.jl")
     include("test_simcse.jl")
     include("test_denoising_ae.jl")
+    include("test_softkate.jl")
     include("test_framing.jl")
     include("test_preproc.jl")
     include("test_featurise.jl")

@@ -45,6 +45,9 @@ using .SimCSE
 include("Models/DenoisingAE.jl")
 using .DenoisingAE
 
+include("Models/SoftKATE.jl")
+using .SoftKATE
+
 include("Eval/Metrics.jl")
 using .Metrics
 
@@ -97,7 +100,7 @@ function __init__()
     PersistenceGlue.register_all!()
 end
 
-export KATE, DeepKATE, DenoisingAE, Framing, Masking, Dedup,
+export KATE, DeepKATE, DenoisingAE, SoftKATE, Framing, Masking, Dedup,
        Featurise, Episodes, Baselines, Instance, Sequence, SeqLSTM,
        VQVAE, SimCSE, Metrics, Compression, Harness, CV, Sparsity,
        Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
