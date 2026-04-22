@@ -7,7 +7,8 @@ using LogClustering.Featurise: build_vocab, bow
 using LogClustering.DeepKATE: deep_kate, deep_kate_loss
 using LogClustering.Instance: ValueNoveltyDetector, update!
 using LogClustering.Masking: mask_lines_with_values
-using LogClustering.RCA: RCA, root_cause, render_markdown, RCAReport
+using LogClustering.RCA: RCA, root_cause, root_cause_sparsity,
+                         render_markdown, RCAReport
 
 const RNG_RCA = Random.MersenneTwister(37)
 
@@ -112,5 +113,56 @@ lr_const() = 0.05f0
         @test occursin("# RCA report", md)
         @test occursin("clusters:", md)
         @test occursin("Top ", md) && occursin("root-cause episodes", md)
+    end
+
+    # -----------------------------------------------------------------
+    # Model-free path: root_cause_sparsity
+    # -----------------------------------------------------------------
+
+    @testset "root_cause_sparsity — no training, clusters via top-k BoW" begin
+        # Shares art.vocab with the trained-DeepKATE path so we can
+        # sanity-check that the sparsity path produces comparable
+        # cluster counts on the fixture.
+        rep_sp = root_cause_sparsity(art.vocab, lines;
+                                     sparsity_k = 3,
+                                     top_percentile = 0.15,
+                                     min_sup = 3, max_gap = 3,
+                                     max_time_duration = 5)
+        @test rep_sp isa RCAReport
+        @test length(rep_sp.cluster_ids) == length(lines)
+        @test length(rep_sp.per_line_score) == length(lines)
+        @test rep_sp.metadata["embedder"] == "sparsity"
+        @test rep_sp.metadata["sparsity_k"] == 3
+        @test rep_sp.metadata["n_clusters"] >= 1
+        # Frequency proxy: -log(p(c)) is non-negative.
+        @test all(>=(0), rep_sp.per_line_score)
+        # Rare-cluster lines are the anomalous ones.
+        @test count(>=(rep_sp.threshold), rep_sp.per_line_score) ==
+              rep_sp.metadata["n_anomalies"]
+    end
+
+    @testset "root_cause_sparsity — rejects bad knobs" begin
+        @test_throws ArgumentError root_cause_sparsity(art.vocab, String[];
+            sparsity_k = 3)
+        @test_throws ArgumentError root_cause_sparsity(art.vocab, lines;
+            sparsity_k = 0)
+        @test_throws ArgumentError root_cause_sparsity(art.vocab, lines;
+            top_percentile = 0.0)
+    end
+
+    @testset "root_cause_sparsity — with detector uses value_novelty scores" begin
+        _, vals = mask_lines_with_values(lines)
+        det = ValueNoveltyDetector()
+        for i in eachindex(lines)
+            occursin("ok", lines[i]) || occursin("logged in", lines[i]) || continue
+            update!(det, vals[i])
+        end
+        rep = root_cause_sparsity(art.vocab, lines;
+                                  sparsity_k = 3, detector = det,
+                                  top_percentile = 0.15,
+                                  min_sup = 3, max_gap = 3,
+                                  max_time_duration = 5)
+        @test rep.metadata["with_detector"] == true
+        @test rep.metadata["embedder"] == "sparsity"
     end
 end

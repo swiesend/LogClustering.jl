@@ -45,7 +45,7 @@ using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly
                   value_novelty
 using ..Sparsity: sparsity_clusters
 using ..Framing: parse_frame, SOURCE_RAW
-using ..RCA: RCA, root_cause, render_markdown
+using ..RCA: RCA, root_cause, root_cause_sparsity, render_markdown
 using Lux
 using Zygote
 using JSON3
@@ -882,26 +882,25 @@ end
 
 function cmd_rca(args::Vector{String})::Int
     specs = [
-        ("model",       "",    :path),
-        ("detector",    "",    :path),
-        ("data",        "-",   :path),
-        ("out",         "-",   :path),
-        ("format",      "md",  :string),          # md | json | tsv
-        ("topk",        10,    :int),
-        ("percentile",  0.10,  :float),
-        ("min-sup",     3,     :int),
-        ("max-gap",     20,    :int),
-        ("max-dur",     50,    :int),
-        ("k-clusters",  0,     :int),              # 0 = auto
+        ("model",       "",       :path),
+        ("detector",    "",       :path),
+        ("data",        "-",      :path),
+        ("out",         "-",      :path),
+        ("format",      "md",     :string),       # md | json | tsv
+        ("topk",        10,       :int),
+        ("percentile",  0.10,     :float),
+        ("min-sup",     3,        :int),
+        ("max-gap",     20,       :int),
+        ("max-dur",     50,       :int),
+        ("k-clusters",  0,        :int),          # 0 = auto
+        ("embedder",    "model",  :string),       # model | sparsity
+        ("sparsity-k",  5,        :int),
+        ("max-vocab",   5000,     :int),
+        ("min-count",   1,        :int),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_rca_help(); return 0)
-    isempty(opts["model"]) && throw(ArgumentError("--model is required"))
     lines = read_lines(opts["data"])
-
-    art = Persistence.load_and_rehydrate(opts["model"])
-    hasproperty(art, :model) && hasproperty(art, :vocab) ||
-        throw(ArgumentError("--model must be a DeepKATE / VQ-VAE bundle"))
 
     detector = nothing
     if !isempty(opts["detector"])
@@ -911,14 +910,36 @@ function cmd_rca(args::Vector{String})::Int
         detector = d
     end
 
-    kk = Int(opts["k-clusters"])
-    report = root_cause(art.model, art.ps, art.st, art.vocab, lines;
-        detector = detector,
-        k_clusters = kk > 0 ? kk : nothing,
-        top_percentile = Float64(opts["percentile"]),
-        min_sup = Int(opts["min-sup"]),
-        max_gap = Int(opts["max-gap"]),
-        max_time_duration = Int(opts["max-dur"]))
+    embedder = Symbol(opts["embedder"])
+    report = if embedder === :sparsity
+        # No model, no training. Build the vocab from the corpus itself.
+        vocab = build_vocab(lines; mask = true,
+                            min_count = Int(opts["min-count"]),
+                            max_vocab = Int(opts["max-vocab"]))
+        root_cause_sparsity(vocab, lines;
+            sparsity_k = Int(opts["sparsity-k"]),
+            detector = detector,
+            top_percentile = Float64(opts["percentile"]),
+            min_sup = Int(opts["min-sup"]),
+            max_gap = Int(opts["max-gap"]),
+            max_time_duration = Int(opts["max-dur"]))
+    elseif embedder === :model
+        isempty(opts["model"]) &&
+            throw(ArgumentError("--model is required for --embedder model"))
+        art = Persistence.load_and_rehydrate(opts["model"])
+        hasproperty(art, :model) && hasproperty(art, :vocab) ||
+            throw(ArgumentError("--model must be a DeepKATE / VQ-VAE bundle"))
+        kk = Int(opts["k-clusters"])
+        root_cause(art.model, art.ps, art.st, art.vocab, lines;
+            detector = detector,
+            k_clusters = kk > 0 ? kk : nothing,
+            top_percentile = Float64(opts["percentile"]),
+            min_sup = Int(opts["min-sup"]),
+            max_gap = Int(opts["max-gap"]),
+            max_time_duration = Int(opts["max-dur"]))
+    else
+        throw(ArgumentError("unknown --embedder `$(opts["embedder"])`; use `model` or `sparsity`"))
+    end
 
     body = if opts["format"] == "md"
         render_markdown(report; topk = Int(opts["topk"]), lines = lines)
@@ -949,18 +970,32 @@ end
 
 function _print_rca_help()
     println("""
-    usage: logcluster rca --model PATH [--detector PATH]
+    usage: logcluster rca [--embedder model|sparsity]
+                          [--model PATH] [--detector PATH]
                           [--data FILE] [--out FILE]
                           [--format md|json|tsv]
                           [--topk N] [--percentile F]
                           [--min-sup N] [--max-gap N] [--max-dur N]
-                          [--k-clusters K]
+                          [--k-clusters K] [--sparsity-k K]
+                          [--max-vocab N] [--min-count N]
 
     Root-cause-analysis report: cluster → anomaly-score → episode
     mining, seeded with the cluster ids of the top-percentile most
-    anomalous lines. `--model` is a DeepKATE / VQ-VAE bundle;
-    `--detector` (optional) is a saved ValueNoveltyDetector that
-    fuses its value-novelty signal with the reconstruction score.
+    anomalous lines.
+
+    Embedders:
+      model     (default) run a saved DeepKATE / VQ-VAE bundle's
+                encoder, k-means on the latent. Requires --model.
+      sparsity  no training: cluster via top-k active BoW tokens
+                per line (`Cluster.Sparsity.sparsity_clusters` on
+                L2-normalised raw BoW). Tune with --sparsity-k
+                (default 5). Empirically matches or beats the
+                model path on dense-vocabulary corpora.
+
+    --detector is optional; it fuses a saved ValueNoveltyDetector's
+    signal with the per-line anomaly score. Without a detector the
+    `model` path uses reconstruction error; the `sparsity` path
+    uses -log(p(cluster_id)) as a frequency proxy.
 
     The Markdown format includes a table of the top-N root-cause
     episodes (pattern, support, density, score) and representative

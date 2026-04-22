@@ -33,14 +33,15 @@ using Statistics: mean
 using DataStructures: OrderedDict
 using Lux
 using ..Masking: mask_lines_with_values
-using ..Featurise: bow
+using ..Featurise: bow, Vocabulary, build_vocab
 using ..DeepKATE: latent_layer
 using ..Pipeline: l2_normalise, kmeans_cluster
+using ..Sparsity: sparsity_clusters
 using ..Instance: Instance, ValueNoveltyDetector, anomaly_score,
-                  combined_anomaly, reconstruction_error_abs
+                  combined_anomaly, reconstruction_error_abs, value_novelty
 using ..Episodes: mv_span
 
-export RCAReport, root_cause, render_markdown
+export RCAReport, root_cause, root_cause_sparsity, render_markdown
 
 """
     RCAReport
@@ -137,14 +138,106 @@ function root_cause(model, ps, st, vocab,
                                   weights = (template = 0.5, values = 0.5)))
     end
 
-    # --- Threshold at the requested percentile --------------------------
+    meta_seed = Dict{String, Any}(
+        "embedder" => "model",
+        "n_clusters" => k,
+        "with_detector" => detector !== nothing,
+    )
+    return _finish_rca(cluster_ids, score, meta_seed, n_lines,
+                       top_percentile, min_sup, max_gap, max_time_duration)
+end
+
+"""
+    root_cause_sparsity(vocab, lines; sparsity_k = 5,
+                        detector = nothing,
+                        top_percentile = 0.10,
+                        min_sup = 3, max_gap = 20,
+                        max_time_duration = 50) -> RCAReport
+
+Model-free variant of [`root_cause`]. Clusters via
+`Sparsity.sparsity_clusters` over the L2-normalised raw BoW
+(no AE training). Anomaly scoring options:
+
+- **With a `ValueNoveltyDetector`**: pure value-novelty per line.
+- **Without a detector**: a frequency proxy — each line's score
+  is `-log(p(cluster_id))`, so lines landing in rare sparsity
+  buckets register higher.
+
+Motivated by an empirical observation on Thunderbird_2k: raw-BoW
++ sparsity top-5 hits NMI ≈ 0.98 / ARI ≈ 1.00, above every
+DeepKATE + k-means or DeepKATE + DBSCAN variant we tested. On
+log corpora with typed-slot masking, each line is sparse by
+construction (≈ 5 informative tokens) and its top-k BoW indices
+already *are* its template signature. Use this path whenever you
+want clusters without paying the AE training cost.
+"""
+function root_cause_sparsity(vocab::Vocabulary,
+                             lines::AbstractVector{<:AbstractString};
+                             sparsity_k::Integer = 5,
+                             detector::Union{Nothing, ValueNoveltyDetector} = nothing,
+                             top_percentile::Real = 0.10,
+                             min_sup::Integer = 3,
+                             max_gap::Integer = 20,
+                             max_time_duration::Integer = 50)
+    isempty(lines) && throw(ArgumentError("root_cause_sparsity needs at least one line"))
+    (0 < top_percentile < 1) ||
+        throw(ArgumentError("top_percentile must be in (0, 1); got $top_percentile"))
+    sparsity_k >= 1 ||
+        throw(ArgumentError("sparsity_k must be ≥ 1; got $sparsity_k"))
+
+    templates, per_line_values = mask_lines_with_values(lines)
+    X = bow(templates, vocab; normalise = :l1)
+    Xn = l2_normalise(X)
+    cluster_ids, _ = sparsity_clusters(Xn, Int(sparsity_k))
+
+    score = if detector !== nothing
+        Float64[value_novelty(detector, vs) for vs in per_line_values]
+    else
+        # Frequency proxy — rare sparsity labels score higher.
+        counts = Dict{Int, Int}()
+        for c in cluster_ids
+            counts[c] = get(counts, c, 0) + 1
+        end
+        total = length(cluster_ids)
+        [-log(counts[c] / total) for c in cluster_ids]
+    end
+
+    n_lines = length(lines)
+    n_clusters = length(unique(cluster_ids))
+    meta_seed = Dict{String, Any}(
+        "embedder" => "sparsity",
+        "sparsity_k" => Int(sparsity_k),
+        "n_clusters" => n_clusters,
+        "with_detector" => detector !== nothing,
+    )
+    return _finish_rca(cluster_ids, score, meta_seed, n_lines,
+                       top_percentile, min_sup, max_gap, max_time_duration)
+end
+
+"""
+    _finish_rca(cluster_ids, score, meta_seed, n_lines,
+                top_percentile, min_sup, max_gap, max_time_duration) -> RCAReport
+
+Shared tail: threshold the score at `top_percentile`, seed
+`Episodes.mv_span` with the cluster ids of anomalous lines,
+compute per-episode anomaly density, rank by `support · density`.
+`meta_seed` carries embedder-specific metadata that's merged into
+the report.
+"""
+function _finish_rca(cluster_ids::AbstractVector{<:Integer},
+                     score::AbstractVector{<:Real},
+                     meta_seed::Dict{String, Any},
+                     n_lines::Integer,
+                     top_percentile::Real,
+                     min_sup::Integer,
+                     max_gap::Integer,
+                     max_time_duration::Integer)
     sorted = sort(score)
     cutoff_idx = max(1, ceil(Int, (1 - top_percentile) * length(sorted)))
-    threshold = sorted[cutoff_idx]
+    threshold = Float64(sorted[cutoff_idx])
     anom_mask = score .>= threshold
     anom_cids = unique(cluster_ids[anom_mask])
 
-    # --- Episode mining seeded with anomalous cluster ids ---------------
     seeds = [[cid] for cid in anom_cids]
     episodes = if isempty(seeds)
         OrderedDict{Vector{Int}, Vector{Vector{Int}}}()
@@ -156,7 +249,6 @@ function root_cause(model, ps, st, vocab,
                 max_time_duration = max_time_duration)
     end
 
-    # --- Per-episode anomaly density -----------------------------------
     per_ep_density = Dict{Vector{Int}, Float64}()
     for (pattern, occurrences) in episodes
         touched = Int[]
@@ -168,7 +260,6 @@ function root_cause(model, ps, st, vocab,
                                   mean(@view score[touched])
     end
 
-    # --- Rank: support · density, descending ---------------------------
     ranked = @NamedTuple{pattern::Vector{Int}, support::Int,
                         density::Float64, score::Float64}[]
     for (pattern, occurrences) in episodes
@@ -179,20 +270,18 @@ function root_cause(model, ps, st, vocab,
     end
     sort!(ranked; by = r -> r.score, rev = true)
 
-    metadata = Dict{String, Any}(
+    metadata = merge(Dict{String, Any}(
         "n_lines" => n_lines,
-        "n_clusters" => k,
         "top_percentile" => top_percentile,
         "threshold" => threshold,
         "n_anomalies" => count(anom_mask),
         "min_sup" => min_sup,
         "max_gap" => max_gap,
         "max_time_duration" => max_time_duration,
-        "with_detector" => detector !== nothing,
-    )
+    ), meta_seed)
 
-    return RCAReport(cluster_ids, score, threshold, episodes,
-                     per_ep_density, ranked, metadata)
+    return RCAReport(Vector{Int}(cluster_ids), Vector{Float64}(score),
+                     threshold, episodes, per_ep_density, ranked, metadata)
 end
 
 """

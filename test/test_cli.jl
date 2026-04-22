@@ -476,4 +476,58 @@ end
             rm(registry; recursive = true, force = true)
         end
     end
+
+    # -------------------------------------------------------------
+    # rca — both embedder paths.
+    # -------------------------------------------------------------
+
+    @testset "rca --help exits 0 and mentions both embedders" begin
+        r = _with_captured_stdio(() -> CLI.main(["rca", "--help"]))
+        @test r.code == 0
+        @test occursin("--embedder", r.out)
+        @test occursin("sparsity", r.out)
+        @test occursin("model", r.out)
+    end
+
+    @testset "rca --embedder sparsity — no model required" begin
+        data = tempname() * ".log"
+        out  = tempname() * ".md"
+        try
+            open(data, "w") do io
+                for _ in 1:5; println(io, "INFO start pid 1"); end
+                for _ in 1:5; println(io, "INFO start pid 2"); end
+                for _ in 1:3; println(io, "ERROR disk failed"); end
+            end
+            r = _with_captured_stdio(() -> CLI.main(["rca",
+                "--embedder", "sparsity",
+                "--sparsity-k", "3",
+                "--data", data, "--out", out,
+                "--format", "md", "--topk", "5",
+                "--percentile", "0.20",
+                "--min-sup", "2", "--max-gap", "3", "--max-dur", "5",
+                "--min-count", "1"]))
+            @test r.code == 0
+            @test isfile(out)
+            body = read(out, String)
+            @test occursin("# RCA report", body)
+            @test occursin("clusters:", body)
+        finally
+            isfile(data) && rm(data)
+            isfile(out) && rm(out)
+        end
+    end
+
+    @testset "rca --embedder model still requires --model" begin
+        r = _with_captured_stdio(() -> CLI.main(["rca",
+            "--embedder", "model", "--data", "/dev/null"]))
+        @test r.code == 2
+        @test occursin("--model is required", r.err)
+    end
+
+    @testset "rca rejects unknown --embedder" begin
+        r = _with_captured_stdio(() -> CLI.main(["rca",
+            "--embedder", "bogus", "--data", "/dev/null"]))
+        @test r.code == 2
+        @test occursin("unknown --embedder", r.err)
+    end
 end
