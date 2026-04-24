@@ -16,6 +16,7 @@ Pure-Julia parsing and clustering metrics for plan 001 Stage F.
 **Clustering metrics** (standard):
 - [`normalised_mutual_information`] ([`nmi`])
 - [`adjusted_rand_index`] ([`ari`])
+- [`fowlkes_mallows`] ([`fmi`])
 - [`purity`]
 - [`v_measure`]
 
@@ -31,6 +32,7 @@ export to_labels,
        template_group_f1, grouping_f1,
        normalised_mutual_information, nmi,
        adjusted_rand_index, ari,
+       fowlkes_mallows, fmi,
        purity, v_measure
 
 # ---------------------------------------------------------------------------
@@ -276,6 +278,49 @@ const ari = adjusted_rand_index
 
 ari(pred::AbstractVector{<:AbstractString}, gold::AbstractVector{<:AbstractString}) =
     ari(to_labels(pred), to_labels(gold))
+
+"""
+    fowlkes_mallows(pred, gold) -> Float64
+
+Fowlkes & Mallows 1983 FMI — the geometric mean of pair-based
+precision and recall:
+
+```
+FMI = TP / sqrt((TP + FP) · (TP + FN))
+```
+
+where `TP` is the number of item pairs that share a cluster in
+*both* `pred` and `gold`; `TP + FP` is pairs sharing a `pred`
+cluster; `TP + FN` is pairs sharing a `gold` cluster. Range
+`[0, 1]`; `1.0` iff the two partitions are identical up to
+relabelling.
+
+Complements `ari`: ARI is chance-corrected (expected value is 0
+on random partitions), FMI is not — it's a raw precision-recall
+score. FMI and ARI can disagree on unbalanced partitions; FMI
+rewards pair-wise agreement more tolerantly.
+"""
+function fowlkes_mallows(pred::AbstractVector{<:Integer},
+                         gold::AbstractVector{<:Integer})
+    length(pred) == length(gold) || throw(DimensionMismatch("pred vs gold length"))
+    N = length(pred)
+    N < 2 && return 0.0
+    cm = _contingency(pred, gold)
+    row_sums = vec(sum(cm; dims = 2))
+    col_sums = vec(sum(cm; dims = 1))
+    c2(n) = n * (n - 1) ÷ 2
+    tp = sum(c2(cm[i, j]) for i in axes(cm, 1), j in axes(cm, 2))
+    # "pairs same in pred" = TP + FP; "pairs same in gold" = TP + FN.
+    pair_pred = sum(c2.(row_sums))
+    pair_gold = sum(c2.(col_sums))
+    (pair_pred == 0 || pair_gold == 0) && return 0.0
+    return Float64(tp) / sqrt(Float64(pair_pred) * Float64(pair_gold))
+end
+
+const fmi = fowlkes_mallows
+
+fmi(pred::AbstractVector{<:AbstractString}, gold::AbstractVector{<:AbstractString}) =
+    fmi(to_labels(pred), to_labels(gold))
 
 # ---------------------------------------------------------------------------
 # Internals

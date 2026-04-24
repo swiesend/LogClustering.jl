@@ -68,6 +68,38 @@ using LogClustering.Harness
         @test purity(pred, gold) == 0.5
     end
 
+    @testset "fmi (Fowlkes-Mallows)" begin
+        # Perfect partition.
+        @test fmi(["a", "a", "b", "b"], ["x", "x", "y", "y"]) == 1.0
+
+        # Worked example: pred={{1,2},{3,4,5}} vs gold={{1,2,3},{4,5}}.
+        # Same-pred pairs   = C(2,2) + C(3,2) = 1 + 3 = 4
+        # Same-gold pairs   = C(3,2) + C(2,2) = 3 + 1 = 4
+        # TP (same both)    = C(2,2) [{1,2}] + C(2,2) [{4,5}] = 1 + 1 = 2
+        # FMI = 2 / sqrt(4 * 4) = 0.5
+        @test fmi([1, 1, 2, 2, 2], [1, 1, 1, 2, 2]) ≈ 0.5 atol = 1e-12
+
+        # Degenerate "one big cluster" — no pairs discriminated.
+        # Same-pred pairs = C(4,2) = 6. Same-gold pairs = 2·C(2,2) = 2.
+        # TP = 2 (pairs {1,2} and {3,4} share both clusters trivially).
+        # FMI = 2 / sqrt(6·2) = 2/sqrt(12) ≈ 0.577.
+        @test fmi(fill("x", 4), ["a", "a", "b", "b"]) ≈
+              2 / sqrt(12) atol = 1e-10
+
+        # FMI ranges in [0, 1]; a clearly-worse partition scores lower.
+        good = fmi([1, 1, 2, 2], [1, 1, 2, 2])           # perfect = 1
+        bad  = fmi([1, 2, 1, 2], [1, 1, 2, 2])           # anti-aligned
+        @test good > bad
+        @test 0.0 <= bad <= 1.0
+
+        # Symmetry.
+        @test fmi([1, 1, 2, 2], [1, 1, 2, 2]) ==
+              fmi([1, 1, 2, 2], [1, 1, 2, 2])
+
+        # Dimension mismatch.
+        @test_throws DimensionMismatch fmi([1, 2], [1, 2, 3])
+    end
+
     @testset "to_labels — stable first-seen encoding" begin
         @test to_labels(["b", "a", "a", "c", "b"]) == [1, 2, 2, 3, 1]
     end
