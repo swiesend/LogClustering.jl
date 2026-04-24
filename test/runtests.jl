@@ -8,6 +8,7 @@ using LogClustering
     include("test_anomaly_sequence.jl")
     include("test_value_novelty.jl")
     include("test_seqlstm.jl")
+    include("test_transformer.jl")
     include("test_vqvae.jl")
     include("test_simcse.jl")
     include("test_denoising_ae.jl")

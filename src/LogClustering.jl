@@ -33,6 +33,9 @@ using .Instance
 include("Models/SeqLSTM.jl")
 using .SeqLSTM
 
+include("Models/Transformer.jl")
+using .Transformer
+
 include("Anomaly/Sequence.jl")
 using .Sequence
 
@@ -105,8 +108,8 @@ end
 
 export KATE, DeepKATE, DenoisingAE, SoftKATE, Framing, Masking, Dedup,
        Featurise, Episodes, Baselines, Instance, Sequence, SeqLSTM,
-       VQVAE, SimCSE, Metrics, Compression, Harness, CV, Sparsity,
-       Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
+       Transformer, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
+       Sparsity, Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
        AutoTune, RCA, CLI, Purity, Typing, Merge, Rust
 
 # ---------------------------------------------------------------------------
