@@ -41,9 +41,13 @@ using ..AutoTune
 using ..DeepKATE: DeepKATE, deep_kate
 using ..VQVAE: vq_vae, assign_codes, VectorQuantizer
 using ..SeqLSTM: seq_lstm, seq_lstm_loss
+using ..Transformer: Transformer, transformer_encoder, transformer_decoder,
+                     transformer_decoder_loss, transformer_encoder_loss,
+                     embed_sequences
 using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly,
                   value_novelty
 using ..Sparsity: sparsity_clusters
+using ..Pipeline: Pipeline, l2_normalise, kmeans_cluster
 using ..Framing: parse_frame, SOURCE_RAW
 using ..RCA: RCA, root_cause, root_cause_sparsity, render_markdown
 using Lux
@@ -267,6 +271,15 @@ function cmd_train(args::Vector{String})::Int
         ("reuse",     false,    :bool),
         ("registry",  _default_registry_path(), :path),
         ("quiet",     false,    :bool),
+        # Transformer-only flags. Defaults match the planning doc; CLI
+        # ignores them for non-transformer kinds.
+        ("d-model",    128,     :int),
+        ("n-layers",   4,       :int),
+        ("n-heads",    8,       :int),
+        ("n-kv-heads", 0,       :int),    # 0 → default to n-heads ÷ 4 (min 1)
+        ("ffn-mult",   4.0,     :float),
+        ("dropout",    0.0,     :float),
+        ("mask-rate",  0.15,    :float),  # encoder MLM only
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_train_help(); return 0)
@@ -278,7 +291,8 @@ function cmd_train(args::Vector{String})::Int
     # --reuse short-circuit: if the registry holds a bundle whose
     # corpus fingerprint matches the current vocab, copy it to --out
     # and skip training. Only supported for kinds that save a vocab.
-    if opts["reuse"] && kind in (:deep_kate, :vq_vae, :seq_lstm)
+    if opts["reuse"] && kind in (:deep_kate, :vq_vae, :seq_lstm,
+                                 :transformer_encoder, :transformer_decoder)
         reused = _try_reuse(kind, lines, opts)
         reused == 0 && return 0
     end
@@ -298,6 +312,10 @@ function cmd_train(args::Vector{String})::Int
         return _train_vq_vae(lines, opts, rng)
     elseif kind === :seq_lstm
         return _train_seq_lstm(lines, opts, rng)
+    elseif kind === :transformer_encoder
+        return _train_transformer(lines, opts, rng, :encoder)
+    elseif kind === :transformer_decoder
+        return _train_transformer(lines, opts, rng, :decoder)
     else
         throw(ArgumentError("unknown kind `$(opts["kind"])`"))
     end
@@ -441,6 +459,135 @@ function _train_seq_lstm(lines::Vector{String}, opts::Dict, rng)::Int
     return 0
 end
 
+# --- Transformer (encoder + decoder) ----------------------------------------
+#
+# Both flavours share `_train_transformer`. The `flavour ∈ (:encoder,
+# :decoder)` switch picks the right factory, loss function, save kind,
+# and label string. Hyperparameters come straight from the CLI flags
+# (no AutoTune entry yet — the planning doc keeps that out of scope).
+
+"""
+    _resolve_transformer_dims(opts) -> NamedTuple
+
+Snap CLI-supplied `--n-heads` / `--n-kv-heads` / `--d-model` to a
+self-consistent set. Enforces the GQA invariants:
+
+  - `d_model % n_heads == 0`
+  - `n_heads % n_kv_heads == 0`
+  - `head_dim = d_model ÷ n_heads` is even (RoPE constraint)
+"""
+function _resolve_transformer_dims(opts)
+    d_model  = Int(opts["d-model"])
+    n_heads  = Int(opts["n-heads"])
+    n_kv_in  = Int(opts["n-kv-heads"])
+    n_kv     = n_kv_in <= 0 ? max(1, n_heads ÷ 4) : n_kv_in
+    d_model % n_heads == 0 ||
+        throw(ArgumentError("--d-model ($d_model) must be divisible by --n-heads ($n_heads)"))
+    n_heads % n_kv == 0 ||
+        throw(ArgumentError("--n-heads ($n_heads) must be divisible by --n-kv-heads ($n_kv)"))
+    head_dim = d_model ÷ n_heads
+    iseven(head_dim) ||
+        throw(ArgumentError("derived head_dim ($head_dim) must be even (RoPE); " *
+                            "adjust --d-model / --n-heads"))
+    return (d_model = d_model, n_heads = n_heads, n_kv_heads = n_kv,
+            head_dim = head_dim)
+end
+
+function _train_transformer(lines::Vector{String}, opts::Dict, rng,
+                            flavour::Symbol)::Int
+    vocab = build_vocab(lines; mask = true,
+                        min_count = Int(opts["min-count"]),
+                        max_vocab = Int(opts["max-vocab"]))
+    seqlen = Int(opts["seqlen"])
+    seqlen >= 2 ||
+        throw(ArgumentError("--seqlen must be ≥ 2 for transformers"))
+    S = sequence_matrix(lines, vocab; seqlen = seqlen)
+    dims = _resolve_transformer_dims(opts)
+    vocab_size = max(Int(maximum(S)), length(vocab))
+
+    # `max_seq_len` rounds up to the next power of 2 (cheap RoPE cache,
+    # leaves headroom for slightly longer inference inputs).
+    max_seq_len = 1 << ceil(Int, log2(max(2, seqlen)))
+
+    label, kind, factory, loss_fn = if flavour === :encoder
+        ("tx_enc", :transformer_encoder, transformer_encoder,
+         (m, p, s, x) -> first(transformer_encoder_loss(
+             m, p, s, x; mask_rate = Float64(opts["mask-rate"]), rng = rng)))
+    elseif flavour === :decoder
+        ("tx_dec", :transformer_decoder, transformer_decoder,
+         (m, p, s, x) -> first(transformer_decoder_loss(m, p, s, x)))
+    else
+        throw(ArgumentError("unknown transformer flavour `$flavour`"))
+    end
+
+    model = factory(vocab_size;
+                    d_model     = dims.d_model,
+                    n_layers    = Int(opts["n-layers"]),
+                    n_heads     = dims.n_heads,
+                    n_kv_heads  = dims.n_kv_heads,
+                    ffn_mult    = Float64(opts["ffn-mult"]),
+                    max_seq_len = max_seq_len,
+                    dropout     = Float64(opts["dropout"]))
+    ps, st = Lux.setup(rng, model)
+    ps = _sgd_tx!(model, ps, st, S, loss_fn, Int(opts["epochs"]),
+                  Int(opts["batch"]), Float32(opts["lr"]), rng;
+                  quiet = opts["quiet"], label = label)
+
+    save_kwargs = (
+        kind = kind, vocab_size = vocab_size, d_model = dims.d_model,
+        n_layers = Int(opts["n-layers"]), n_heads = dims.n_heads,
+        n_kv_heads = dims.n_kv_heads,
+        ffn_mult = Float32(opts["ffn-mult"]),
+        max_seq_len = max_seq_len, dropout = Float32(opts["dropout"]),
+        vocab = vocab, seqlen = seqlen,
+        n_lines = length(lines),
+        metadata = _train_metadata(opts, lines, String(label)),
+    )
+    PersistenceGlue.save(opts["out"], model, ps, st; save_kwargs...)
+    opts["quiet"] || println(stderr,
+        rpad(label, 9), length(vocab), "-tok vocab, d_model=", dims.d_model,
+        ", layers=", Int(opts["n-layers"]),
+        ", heads=", dims.n_heads, "/", dims.n_kv_heads,
+        ", seqlen=", seqlen, " → ", opts["out"])
+    return 0
+end
+
+"""
+    _sgd_tx!(model, ps, st, S, loss_fn, epochs, batch, lr, rng; …)
+
+Generic Zygote pullback loop over `(seqlen, batch)` integer-id mini-
+batches. `loss_fn(model, ps, st, batch) -> scalar` so the same loop
+serves both encoder MLM and decoder shift-one objectives.
+"""
+function _sgd_tx!(model, ps, st, S::AbstractMatrix{<:Integer}, loss_fn,
+                  epochs::Int, batch::Int, lr::Float32, rng;
+                  quiet::Bool = false,
+                  label::AbstractString = "transformer")
+    n = size(S, 2)
+    batch = min(batch, n)
+    for epoch in 1:epochs
+        perm = randperm(rng, n)
+        total = 0.0f0
+        n_batches = 0
+        for start in 1:batch:n
+            stop = min(start + batch - 1, n)
+            cols = perm[start:stop]
+            Sb = S[:, cols]
+            (loss, back) = Zygote.pullback(p -> loss_fn(model, p, st, Sb), ps)
+            g = back(one(loss))[1]
+            ps = _apply_sgd!(ps, g, lr)
+            total += loss
+            n_batches += 1
+        end
+        if !quiet && (epoch % max(1, epochs ÷ 5) == 0 || epoch == epochs)
+            println(stderr, rpad(label, 9), "  epoch ", lpad(epoch, 3),
+                    "/", epochs, "   loss=",
+                    round(total / max(1, n_batches); digits = 4))
+        end
+    end
+    return ps
+end
+
 # --- Shared SGD helpers -----------------------------------------------------
 
 "Apply an SGD step over a NamedTuple / Array parameter tree."
@@ -572,14 +719,17 @@ function _print_train_help()
     Fit and persist a model.
 
     KIND:
-      drain       streaming log-template parser (no featurisation needed)
-      deep_kate   Lux autoencoder on a log-normalised BoW matrix
-      vq_vae      Lux codebook AE on a binary BoW matrix
-      seq_lstm    Lux next-event LSTM on padded token-id sequences
+      drain                streaming log-template parser (no featurisation needed)
+      deep_kate            Lux autoencoder on a log-normalised BoW matrix
+      vq_vae               Lux codebook AE on a binary BoW matrix
+      seq_lstm             Lux next-event LSTM on padded token-id sequences
+      transformer_encoder  Pre-Norm transformer (bidirectional) trained MLM-style
+      transformer_decoder  Pre-Norm causal transformer trained shift-one LM
+                           Both transformer kinds use RoPE + RMSNorm + GQA + SwiGLU.
 
-    All AE/LSTM kinds build a typed-slot-masked vocabulary on the
-    training corpus and persist it in the JLD2 bundle, so a later
-    `classify` pass can re-featurise new lines identically.
+    All AE/LSTM/transformer kinds build a typed-slot-masked vocabulary
+    on the training corpus and persist it in the JLD2 bundle, so a
+    later `classify` pass can re-featurise new lines identically.
 
     --auto        run AutoTune.fit_hyperparams on the featurised corpus.
     --budget N    >0 triggers random search around the heuristic seed.
@@ -598,6 +748,16 @@ function _print_train_help()
                   `select-model`. Default: \$XDG_CACHE_HOME/logclustering/models
                   (or ~/.cache/logclustering/models).
     --quiet       suppress per-epoch loss lines.
+
+    Transformer-only flags (ignored for other kinds):
+      --d-model N     hidden width (default 128).
+      --n-layers N    number of transformer blocks (default 4).
+      --n-heads N     query heads (default 8).
+      --n-kv-heads N  KV heads for GQA (default n-heads ÷ 4, min 1;
+                      0 = use the default).
+      --ffn-mult F    SwiGLU width multiplier (default 4).
+      --dropout F     post-attention / post-FFN dropout (default 0).
+      --mask-rate F   MLM mask rate, encoder only (default 0.15).
     """)
 end
 
@@ -641,6 +801,10 @@ function cmd_classify(args::Vector{String})::Int
         return _classify_vq_vae(artifact, bundle, bodies, opts)
     elseif bundle.kind === :seq_lstm
         return _classify_seq_lstm(artifact, bundle, bodies, opts)
+    elseif bundle.kind === :transformer_encoder
+        return _classify_transformer_encoder(artifact, bundle, bodies, opts)
+    elseif bundle.kind === :transformer_decoder
+        return _classify_transformer_decoder(artifact, bundle, bodies, opts)
     else
         throw(ArgumentError(
             "model kind $(bundle.kind) not yet handled by classify"))
@@ -721,6 +885,48 @@ function _classify_seq_lstm(art, bundle, bodies, opts)
     return 0
 end
 
+# Encoder: mean-pool the post-norm hidden states, kmeans on the
+# `(d_model, batch)` embedding. Cluster count defaults to a √N rule
+# bounded to the same band the rest of the pipeline uses.
+function _classify_transformer_encoder(art, bundle, bodies, opts)
+    vocab = _require_vocab(art, :transformer_encoder)
+    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
+    oov_policy = Symbol(opts["oov"])
+    oov_policy === :distribute &&
+        throw(ArgumentError(":distribute is BoW-only; transformer_encoder needs :unk or :nearest"))
+    S = sequence_matrix(bodies, vocab;
+                        seqlen = seqlen,
+                        oov_policy = oov_policy,
+                        oov_min_sim = Float64(opts["oov-min-sim"]))
+    Z = embed_sequences(art.model, art.ps, art.st, S)            # (d_model, batch)
+    n_lines = size(Z, 2)
+    k = min(n_lines, max(2, ceil(Int, sqrt(n_lines))))
+    Zn = Pipeline.l2_normalise(Z)
+    res = Pipeline.kmeans_cluster(Zn, k)
+    assignments = collect(res.assignments)
+    labels = ["cluster-$(i)" for i in assignments]
+    _emit_classify(opts["out"], opts["format"], bodies, assignments, labels)
+    return 0
+end
+
+# Decoder: greedy next-token prediction (mirrors seq_lstm's path so
+# the output schema matches downstream consumers).
+function _classify_transformer_decoder(art, bundle, bodies, opts)
+    vocab = _require_vocab(art, :transformer_decoder)
+    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
+    oov_policy = Symbol(opts["oov"])
+    oov_policy === :distribute &&
+        throw(ArgumentError(":distribute is BoW-only; transformer_decoder needs :unk or :nearest"))
+    S = sequence_matrix(bodies, vocab;
+                        seqlen = seqlen,
+                        oov_policy = oov_policy,
+                        oov_min_sim = Float64(opts["oov-min-sim"]))
+    ids = Transformer.predict_next(art.model, art.ps, art.st, S)
+    labels = [get(vocab.tokens, id, "<UNK>") for id in ids]
+    _emit_classify(opts["out"], opts["format"], bodies, ids, labels)
+    return 0
+end
+
 "Run `model`'s first `lat` layers in sequence, returning the activation."
 function _forward_through(model, ps, st, X, lat::Int)
     out = X
@@ -762,9 +968,15 @@ function _print_classify_help()
     println("""
     usage: logcluster classify --model PATH [--data FILE] [--out FILE]
                                [--format tsv|json] [--framed]
+                               [--oov unk|nearest|distribute]
+                               [--oov-min-sim F] [--oov-top-k N]
 
-    Load a saved model (currently: Drain) and emit one record per
-    input line with its cluster id and inferred template.
+    Load a saved model and emit one record per input line:
+
+      drain / deep_kate / vq_vae / seq_lstm        — existing paths
+      transformer_encoder                          — kmeans on mean-pooled
+                                                    post-norm hidden states
+      transformer_decoder                          — greedy next-token argmax
     """)
 end
 
@@ -774,22 +986,46 @@ end
 
 function cmd_score(args::Vector{String})::Int
     specs = [
-        ("detector", "", :path),
-        ("data",     "-", :path),
-        ("out",      "-", :path),
+        ("detector", "",   :path),
+        ("model",    "",   :path),         # transformer_decoder bundle for NLL scoring
+        ("data",     "-",  :path),
+        ("out",      "-",  :path),
         ("format",   "tsv", :string),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_score_help(); return 0)
-    isempty(opts["detector"]) && throw(ArgumentError("--detector is required"))
-    det = Persistence.load_and_rehydrate(opts["detector"])
-    det isa ValueNoveltyDetector ||
-        throw(ArgumentError("--detector must be a ValueNoveltyDetector bundle"))
+
+    have_det   = !isempty(opts["detector"])
+    have_model = !isempty(opts["model"])
+    (have_det || have_model) ||
+        throw(ArgumentError("--detector or --model is required"))
+
     lines = read_lines(opts["data"])
-    _, values = mask_lines_with_values(lines)
-    scores = Float64[]
-    for vs in values
-        push!(scores, Float64(value_novelty(det, vs)))
+
+    # Per-line scores from each requested source. When both are
+    # present, sum them — `score(d, m, x) = value_novelty(d) + nll(m)`.
+    scores = zeros(Float64, length(lines))
+
+    if have_det
+        det = Persistence.load_and_rehydrate(opts["detector"])
+        det isa ValueNoveltyDetector ||
+            throw(ArgumentError("--detector must be a ValueNoveltyDetector bundle"))
+        _, values = mask_lines_with_values(lines)
+        for (i, vs) in enumerate(values)
+            scores[i] += Float64(value_novelty(det, vs))
+        end
+    end
+
+    if have_model
+        bundle = Persistence.load(opts["model"])
+        bundle.kind === :transformer_decoder ||
+            throw(ArgumentError(
+                "--model must be a :transformer_decoder bundle for score; got $(bundle.kind)"))
+        art = Persistence.rehydrate(bundle)
+        nlls = _per_line_decoder_nll(art, lines)
+        for i in eachindex(lines)
+            scores[i] += Float64(nlls[i])
+        end
     end
     io = IOBuffer()
     if opts["format"] == "tsv"
@@ -812,14 +1048,40 @@ function cmd_score(args::Vector{String})::Int
     return 0
 end
 
+"""
+    _per_line_decoder_nll(art, lines) -> Vector{Float32}
+
+Compute per-line negative log-likelihood from a `:transformer_decoder`
+bundle. Higher = the model finds the line less typical (the standard
+perplexity-style anomaly signal). Each line is scored independently so
+batch ordering doesn't bleed across lines.
+"""
+function _per_line_decoder_nll(art, lines::Vector{String})::Vector{Float32}
+    vocab = _require_vocab(art, :transformer_decoder)
+    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
+    nlls = Vector{Float32}(undef, length(lines))
+    for (i, l) in enumerate(lines)
+        S = sequence_matrix([l], vocab; seqlen = seqlen)
+        loss, _ = transformer_decoder_loss(art.model, art.ps,
+                                            Lux.testmode(art.st), S)
+        nlls[i] = Float32(loss)
+    end
+    return nlls
+end
+
 function _print_score_help()
     println("""
-    usage: logcluster score --detector PATH [--data FILE] [--out FILE]
+    usage: logcluster score [--detector PATH] [--model PATH]
+                            [--data FILE] [--out FILE]
                             [--format tsv|json]
 
-    Load a saved ValueNoveltyDetector, mask each line, and emit one
-    anomaly score per line. A template-reconstruction head can be
-    added once DeepKATE/VQVAE featurisation lands.
+    Per-line anomaly score. At least one signal source is required:
+
+      --detector PATH  ValueNoveltyDetector bundle — slot-novelty term.
+      --model PATH     :transformer_decoder bundle — per-line NLL
+                       (perplexity proxy). Higher = less typical.
+
+    When both are supplied the per-line scores are summed.
     """)
 end
 

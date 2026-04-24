@@ -248,6 +248,94 @@ end
     end
 
     # -------------------------------------------------------------
+    # transformer_decoder + transformer_encoder
+    # -------------------------------------------------------------
+
+    @testset "transformer_decoder train + classify + score round-trip" begin
+        data  = _toy_file()
+        model = tempname() * ".jld2"
+        out   = tempname() * ".tsv"
+        score_out = tempname() * ".tsv"
+        try
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "transformer_decoder", "--data", data, "--out", model,
+                "--epochs", "2", "--batch", "4", "--seqlen", "8",
+                "--d-model", "16", "--n-layers", "2",
+                "--n-heads", "4", "--n-kv-heads", "2", "--quiet"]))
+            @test r1.code == 0
+            @test isfile(model)
+
+            r2 = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model, "--data", data, "--out", out]))
+            @test r2.code == 0
+            rows = readlines(out)
+            @test length(rows) == length(TOY_LINES) + 1
+
+            # `score --model <decoder>` emits one perplexity per line.
+            r3 = _with_captured_stdio(() -> CLI.main(["score",
+                "--model", model, "--data", data, "--out", score_out]))
+            @test r3.code == 0
+            score_rows = readlines(score_out)
+            @test length(score_rows) == length(TOY_LINES) + 1     # header + scores
+            # Numeric column must parse as Float64.
+            for row in score_rows[2:end]
+                cols = split(row, '\t')
+                @test parse(Float64, cols[2]) >= 0
+            end
+        finally
+            for p in (data, model, out, score_out); isfile(p) && rm(p); end
+        end
+    end
+
+    @testset "transformer_encoder train + classify (kmeans on embeddings)" begin
+        data  = _toy_file()
+        model = tempname() * ".jld2"
+        out   = tempname() * ".tsv"
+        try
+            r1 = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "transformer_encoder", "--data", data, "--out", model,
+                "--epochs", "2", "--batch", "4", "--seqlen", "8",
+                "--d-model", "16", "--n-layers", "2",
+                "--n-heads", "4", "--n-kv-heads", "2",
+                "--mask-rate", "0.3", "--quiet"]))
+            @test r1.code == 0
+            @test isfile(model)
+
+            r2 = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model, "--data", data, "--out", out]))
+            @test r2.code == 0
+            rows = readlines(out)
+            @test length(rows) == length(TOY_LINES) + 1
+            ids = [parse(Int, split(row, '\t')[2]) for row in rows[2:end]]
+            # Cluster ids should not all be the same — embeddings ought to
+            # separate at least the INFO/ERROR lines.
+            @test length(unique(ids)) >= 2
+            for row in rows[2:end]
+                @test occursin("cluster-", split(row, '\t')[3])
+            end
+        finally
+            for p in (data, model, out); isfile(p) && rm(p); end
+        end
+    end
+
+    @testset "transformer GQA invariant errors are reported as ArgumentError" begin
+        data  = _toy_file()
+        model = tempname() * ".jld2"
+        try
+            # d_model=15 isn't divisible by n_heads=4 → friendly error.
+            r = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "transformer_decoder", "--data", data, "--out", model,
+                "--epochs", "1", "--batch", "2", "--seqlen", "4",
+                "--d-model", "15", "--n-heads", "4", "--n-kv-heads", "2",
+                "--quiet"]))
+            @test r.code == 2
+            @test occursin("d-model", r.err) || occursin("divisible", r.err)
+        finally
+            for p in (data, model); isfile(p) && rm(p); end
+        end
+    end
+
+    # -------------------------------------------------------------
     # score — load a saved ValueNoveltyDetector and emit per-line
     # anomaly scores. Round-trips the detector through
     # PersistenceGlue.save / load_and_rehydrate.
