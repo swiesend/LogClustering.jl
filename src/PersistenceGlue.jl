@@ -16,6 +16,8 @@ using ..Persistence
 using ..KATE: KATE, KCompetetive
 using ..DeepKATE: DeepKATE, deep_kate, latent_layer
 using ..SeqLSTM: SeqLSTM, seq_lstm, PeepholeLSTM
+using ..Transformer: Transformer, transformer_encoder, transformer_decoder,
+                     RMSNorm, GQAAttention, SwiGLUFFN
 using ..VQVAE: VQVAE, vq_vae, VectorQuantizer
 using ..Drain3: Drain3, Drain, default_parametrize, TreeNode, LogCluster
 using ..Instance: Instance, ValueNoveltyDetector
@@ -199,6 +201,111 @@ function _rehydrate_vq_vae(bundle)
 end
 
 # ---------------------------------------------------------------------------
+# Transformer — encoder + decoder share the same spec layout. The
+# `causal` flag is implicit in the `:transformer_decoder` kind, so the
+# rehydrator routes to the right factory without storing a redundant flag.
+# ---------------------------------------------------------------------------
+
+function _transformer_spec(; vocab_size, d_model, n_layers, n_heads,
+                            n_kv_heads, ffn_mult, max_seq_len, dropout,
+                            vocab, seqlen)
+    return (
+        vocab_size  = Int(vocab_size),
+        d_model     = Int(d_model),
+        n_layers    = Int(n_layers),
+        n_heads     = Int(n_heads),
+        n_kv_heads  = Int(n_kv_heads),
+        ffn_mult    = Float32(ffn_mult),
+        max_seq_len = Int(max_seq_len),
+        dropout     = Float32(dropout),
+        vocab       = vocab,
+        seqlen      = seqlen === nothing ? nothing : Int(seqlen),
+    )
+end
+
+function _save_transformer(path, kind::Symbol, model::Chain, ps, st;
+                           vocab_size::Integer, d_model::Integer,
+                           n_layers::Integer, n_heads::Integer,
+                           n_kv_heads::Integer, ffn_mult::Real,
+                           max_seq_len::Integer, dropout::Real,
+                           vocab::Union{Nothing, Vocabulary} = nothing,
+                           seqlen::Union{Nothing, Integer} = nothing,
+                           metadata::AbstractDict = Dict{String, Any}(),
+                           n_lines::Integer = 0)
+    spec = _transformer_spec(; vocab_size = vocab_size, d_model = d_model,
+                             n_layers = n_layers, n_heads = n_heads,
+                             n_kv_heads = n_kv_heads, ffn_mult = ffn_mult,
+                             max_seq_len = max_seq_len, dropout = dropout,
+                             vocab = vocab, seqlen = seqlen)
+    md = Dict{String, Any}(string(k) => v for (k, v) in metadata)
+    if vocab !== nothing && !haskey(md, "corpus_fingerprint")
+        md["corpus_fingerprint"] =
+            Persistence.corpus_fingerprint(vocab.tokens; n_lines = n_lines)
+    end
+    Persistence.save_lux(path; kind = kind, spec = spec,
+                         ps = ps, st = st, metadata = md)
+end
+
+"""
+    save_transformer_encoder(path, model, ps, st; vocab_size, d_model,
+        n_layers, n_heads, n_kv_heads, ffn_mult, max_seq_len, dropout,
+        vocab = nothing, seqlen = nothing, metadata = Dict(), n_lines = 0)
+
+Persist a `transformer_encoder` bundle. `vocab` + `n_lines` populate
+`metadata["corpus_fingerprint"]` so `--reuse` works the same way as for
+`deep_kate` / `seq_lstm` bundles.
+"""
+save_transformer_encoder(path, model::Chain, ps, st; kwargs...) =
+    _save_transformer(path, :transformer_encoder, model, ps, st; kwargs...)
+
+"""
+    save_transformer_decoder(path, model, ps, st; …)
+
+Persist a `transformer_decoder` bundle. Same kwargs as
+[`save_transformer_encoder`].
+"""
+save_transformer_decoder(path, model::Chain, ps, st; kwargs...) =
+    _save_transformer(path, :transformer_decoder, model, ps, st; kwargs...)
+
+function _rehydrate_transformer_encoder(bundle)
+    sp = bundle.spec
+    model = transformer_encoder(sp.vocab_size;
+        d_model     = sp.d_model,
+        n_layers    = sp.n_layers,
+        n_heads     = sp.n_heads,
+        n_kv_heads  = sp.n_kv_heads,
+        ffn_mult    = sp.ffn_mult,
+        max_seq_len = sp.max_seq_len,
+        dropout     = sp.dropout)
+    vocab  = hasproperty(sp, :vocab)  ? sp.vocab  : nothing
+    seqlen = hasproperty(sp, :seqlen) ? sp.seqlen : nothing
+    return (; model = model,
+              ps = bundle.payload.ps,
+              st = bundle.payload.st,
+              vocab = vocab,
+              seqlen = seqlen)
+end
+
+function _rehydrate_transformer_decoder(bundle)
+    sp = bundle.spec
+    model = transformer_decoder(sp.vocab_size;
+        d_model     = sp.d_model,
+        n_layers    = sp.n_layers,
+        n_heads     = sp.n_heads,
+        n_kv_heads  = sp.n_kv_heads,
+        ffn_mult    = sp.ffn_mult,
+        max_seq_len = sp.max_seq_len,
+        dropout     = sp.dropout)
+    vocab  = hasproperty(sp, :vocab)  ? sp.vocab  : nothing
+    seqlen = hasproperty(sp, :seqlen) ? sp.seqlen : nothing
+    return (; model = model,
+              ps = bundle.payload.ps,
+              st = bundle.payload.st,
+              vocab = vocab,
+              seqlen = seqlen)
+end
+
+# ---------------------------------------------------------------------------
 # Drain3 — the one case where a knob is a callable.
 # ---------------------------------------------------------------------------
 
@@ -295,6 +402,8 @@ function register_all!()
     Persistence.register_rehydrator!(:deep_kate,     _rehydrate_deep_kate)
     Persistence.register_rehydrator!(:seq_lstm,      _rehydrate_seq_lstm)
     Persistence.register_rehydrator!(:vq_vae,        _rehydrate_vq_vae)
+    Persistence.register_rehydrator!(:transformer_encoder, _rehydrate_transformer_encoder)
+    Persistence.register_rehydrator!(:transformer_decoder, _rehydrate_transformer_decoder)
     Persistence.register_rehydrator!(:drain,         _rehydrate_drain)
     Persistence.register_rehydrator!(:value_novelty, _rehydrate_value_novelty)
     Persistence.register_rehydrator!(:dedup,         _rehydrate_dedup)
@@ -336,7 +445,12 @@ function save(path, model::Chain, ps, st;
     kind === :deep_kate && return save_deep_kate(path, model, ps, st; kwargs...)
     kind === :seq_lstm  && return save_seq_lstm(path, model, ps, st; kwargs...)
     kind === :vq_vae    && return save_vq_vae(path, model, ps, st; kwargs...)
-    error("unknown Lux kind `$kind`. Use :deep_kate, :seq_lstm, or :vq_vae.")
+    kind === :transformer_encoder &&
+        return save_transformer_encoder(path, model, ps, st; kwargs...)
+    kind === :transformer_decoder &&
+        return save_transformer_decoder(path, model, ps, st; kwargs...)
+    error("unknown Lux kind `$kind`. Use :deep_kate, :seq_lstm, :vq_vae, " *
+          ":transformer_encoder, or :transformer_decoder.")
 end
 
 function save(path, layer::KCompetetive, ps, st; kwargs...)

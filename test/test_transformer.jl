@@ -251,4 +251,78 @@ end
         @test_throws ArgumentError GQAAttention(16; n_heads = 4, n_kv_heads = 3)
         @test_throws ArgumentError GQAAttention(12; n_heads = 4)        # head_dim=3 odd
     end
+
+    @testset "Persistence round-trip — encoder" begin
+        m = transformer_encoder(10; d_model = 16, n_layers = 2,
+                                n_heads = 4, n_kv_heads = 2,
+                                max_seq_len = 16, dropout = 0.0)
+        ps, st = Lux.setup(RNG_TX, m)
+        seq = rand(RNG_TX, 1:10, 6, 3)
+        h_before, _ = m(seq, ps, Lux.testmode(st))
+        path = tempname() * ".jld2"
+        try
+            LogClustering.PersistenceGlue.save_transformer_encoder(
+                path, m, ps, st;
+                vocab_size = 10, d_model = 16, n_layers = 2,
+                n_heads = 4, n_kv_heads = 2,
+                ffn_mult = 4, max_seq_len = 16, dropout = 0.0,
+                seqlen = 6,
+                metadata = Dict("source" => "test"))
+            bundle = LogClustering.Persistence.load(path)
+            @test bundle.kind === :transformer_encoder
+            art = LogClustering.Persistence.rehydrate(bundle)
+            h_after, _ = art.model(seq, art.ps, Lux.testmode(art.st))
+            @test isapprox(h_before, h_after; rtol = 1f-6)
+            @test art.seqlen == 6
+        finally
+            isfile(path) && rm(path; force = true)
+        end
+    end
+
+    @testset "Persistence round-trip — decoder" begin
+        m = transformer_decoder(10; d_model = 16, n_layers = 2,
+                                n_heads = 4, n_kv_heads = 2,
+                                max_seq_len = 16, dropout = 0.0)
+        ps, st = Lux.setup(RNG_TX, m)
+        seq = rand(RNG_TX, 1:10, 6, 3)
+        loss_before, _ = transformer_decoder_loss(m, ps, st, seq)
+        path = tempname() * ".jld2"
+        try
+            LogClustering.PersistenceGlue.save_transformer_decoder(
+                path, m, ps, st;
+                vocab_size = 10, d_model = 16, n_layers = 2,
+                n_heads = 4, n_kv_heads = 2,
+                ffn_mult = 4, max_seq_len = 16, dropout = 0.0,
+                seqlen = 6)
+            bundle = LogClustering.Persistence.load(path)
+            @test bundle.kind === :transformer_decoder
+            art = LogClustering.Persistence.rehydrate(bundle)
+            loss_after, _ = transformer_decoder_loss(art.model, art.ps, art.st, seq)
+            @test isapprox(loss_before, loss_after; rtol = 1f-6)
+        finally
+            isfile(path) && rm(path; force = true)
+        end
+    end
+
+    @testset "Persistence: dispatched save(path, model, ps, st; kind=:…)" begin
+        m = transformer_decoder(8; d_model = 16, n_layers = 2,
+                                n_heads = 4, n_kv_heads = 2,
+                                max_seq_len = 16, dropout = 0.0)
+        ps, st = Lux.setup(RNG_TX, m)
+        path = tempname() * ".jld2"
+        try
+            # Goes through the type-dispatched `save(path, model, ps, st; kind=…)`
+            LogClustering.PersistenceGlue.save(path, m, ps, st;
+                kind = :transformer_decoder,
+                vocab_size = 8, d_model = 16, n_layers = 2,
+                n_heads = 4, n_kv_heads = 2,
+                ffn_mult = 4, max_seq_len = 16, dropout = 0.0,
+                seqlen = 4)
+            art = LogClustering.Persistence.load_and_rehydrate(path)
+            @test art.model isa Lux.Chain
+            @test art.seqlen == 4
+        finally
+            isfile(path) && rm(path; force = true)
+        end
+    end
 end
