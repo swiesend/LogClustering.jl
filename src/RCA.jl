@@ -102,14 +102,20 @@ function root_cause(model, ps, st, vocab,
                     top_percentile::Real = 0.10,
                     min_sup::Integer = 3,
                     max_gap::Integer = 20,
-                    max_time_duration::Integer = 50)
+                    max_time_duration::Integer = 50,
+                    oov_policy::Symbol = :unk,
+                    oov_min_sim::Real = 0.3,
+                    oov_top_k::Integer = 3)
     isempty(lines) && throw(ArgumentError("root_cause needs at least one line"))
     (0 < top_percentile < 1) ||
         throw(ArgumentError("top_percentile must be in (0, 1); got $top_percentile"))
 
     # --- Mask + featurise (using the bundle's vocab) ---------------------
     templates, per_line_values = mask_lines_with_values(lines)
-    X = bow(templates, vocab; normalise = :l1)
+    X = bow(templates, vocab; normalise = :l1,
+            oov_policy = oov_policy,
+            oov_min_sim = oov_min_sim,
+            oov_top_k = oov_top_k)
 
     # --- Encode through the first `latent_layer(model)` layers ----------
     st_eval = Lux.testmode(st)

@@ -101,4 +101,103 @@ const TOY = [
         v = build_vocab(TOY)
         @test_throws ArgumentError sequence_matrix(TOY, v; seqlen = 0)
     end
+
+    # -----------------------------------------------------------------
+    # Inference-time OOV policies (:nearest, :distribute)
+    # -----------------------------------------------------------------
+
+    @testset "build_ngram_profile — shape + sentinels" begin
+        v = build_vocab(["error login", "warning logout"]; mask = false)
+        p = Featurise.build_ngram_profile(v; n = 3)
+        @test p.n == 3
+        @test length(p.grams) == length(v)
+        # id 1 is UNK → empty profile.
+        @test isempty(p.grams[1])
+        # "login" → ["<lo", "log", "ogi", "gin", "in>"]
+        idx = v.index["login"]
+        @test "<lo" in p.grams[idx]
+        @test "in>" in p.grams[idx]
+        # n must be ≥ 1.
+        @test_throws ArgumentError Featurise.build_ngram_profile(v; n = 0)
+    end
+
+    @testset "tokenise_ids — :nearest routes OOV to closest by Jaccard" begin
+        v = build_vocab(["error login", "warning logout"]; mask = false)
+        p = Featurise.build_ngram_profile(v)
+        # Known token unchanged.
+        @test tokenise_ids("login", v; oov_policy = :nearest, profile = p) ==
+              [v.index["login"]]
+        # OOV "loginn" shares many 3-grams with "login" → routed there.
+        ids = tokenise_ids("loginn", v; oov_policy = :nearest,
+                           profile = p, oov_min_sim = 0.3)
+        @test ids == [v.index["login"]]
+        # OOV totally unlike any vocab token → UNK.
+        ids_far = tokenise_ids("zzzzzzz", v; oov_policy = :nearest,
+                               profile = p, oov_min_sim = 0.3)
+        @test ids_far == [1]
+    end
+
+    @testset "tokenise_ids — :distribute rejected at the integer entry" begin
+        v = build_vocab(["a b c"]; mask = false)
+        @test_throws ArgumentError tokenise_ids("x", v;
+            oov_policy = :distribute)
+    end
+
+    @testset "tokenise_ids — unknown oov_policy is rejected" begin
+        v = build_vocab(["a b"]; mask = false)
+        @test_throws ArgumentError tokenise_ids("x", v; oov_policy = :bogus)
+    end
+
+    @testset "bow — :unk is the backward-compat default" begin
+        v = build_vocab(["error login", "warning logout"]; mask = false)
+        X_default  = bow(["totally new"], v; normalise = :count)
+        X_explicit = bow(["totally new"], v; normalise = :count,
+                         oov_policy = :unk)
+        @test X_default == X_explicit
+    end
+
+    @testset "bow — :nearest routes OOV to closest known token" begin
+        v = build_vocab(["error login", "warning logout"]; mask = false)
+        X = bow(["loginn"], v; normalise = :count, oov_policy = :nearest,
+                oov_min_sim = 0.3)
+        @test X[v.index["login"], 1] ≈ 1.0
+        # Below threshold → UNK.
+        X_far = bow(["qqqqqq"], v; normalise = :count, oov_policy = :nearest,
+                    oov_min_sim = 0.5)
+        @test X_far[1, 1] ≈ 1.0
+    end
+
+    @testset "bow — :distribute produces fractional top-k routing" begin
+        v = build_vocab(["login logout"]; mask = false)
+        X = bow(["logisn"], v; normalise = :count,
+                oov_policy = :distribute, oov_top_k = 2, oov_min_sim = 0.05)
+        # Exactly one OOV token → column sums to 1 (weighted split across
+        # top-k similar vocab tokens).
+        @test sum(X[:, 1]) ≈ 1.0 atol = 1e-6
+        # Mass lands on login + logout, not UNK.
+        @test X[1, 1] == 0
+        @test X[v.index["login"],  1] > 0
+        @test X[v.index["logout"], 1] > 0
+    end
+
+    @testset "bow — :distribute falls through to UNK when no match clears sim threshold" begin
+        v = build_vocab(["alpha beta"]; mask = false)
+        X = bow(["zz"], v; normalise = :count,
+                oov_policy = :distribute, oov_min_sim = 0.99)
+        @test X[1, 1] ≈ 1.0
+    end
+
+    @testset "sequence_matrix — :nearest threads through; :distribute rejected" begin
+        v = build_vocab(["error login", "warning logout"]; mask = false)
+        S = sequence_matrix(["loginn"], v; seqlen = 4,
+                            oov_policy = :nearest, oov_min_sim = 0.3)
+        @test S[end, 1] == v.index["login"]         # right-aligned
+        @test_throws ArgumentError sequence_matrix(["x"], v; seqlen = 4,
+            oov_policy = :distribute)
+    end
+
+    @testset "bow — rejects unknown oov_policy" begin
+        v = build_vocab(["a b"]; mask = false)
+        @test_throws ArgumentError bow(["x"], v; oov_policy = :bogus)
+    end
 end

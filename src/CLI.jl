@@ -612,10 +612,14 @@ function cmd_classify(args::Vector{String})::Int
         ("out",    "-",   :path),
         ("format", "tsv", :string),
         ("framed", false, :bool),
+        ("oov",           "unk", :string),   # unk | nearest | distribute
+        ("oov-min-sim",   0.3,   :float),
+        ("oov-top-k",     3,     :int),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_classify_help(); return 0)
     isempty(opts["model"]) && throw(ArgumentError("--model is required"))
+    _validate_oov_policy(opts)
     bundle = Persistence.load(opts["model"])
     artifact = Persistence.rehydrate(bundle)
 
@@ -643,6 +647,25 @@ function cmd_classify(args::Vector{String})::Int
     end
 end
 
+"""
+    _validate_oov_policy(opts)
+
+Throw a clear `ArgumentError` when `--oov` is misspelt. `:distribute`
+is BoW-only; `sequence_matrix`-driven kinds (e.g. seq_lstm) reject
+it downstream but we catch the obvious typos here.
+"""
+function _validate_oov_policy(opts)
+    v = String(opts["oov"])
+    v in ("unk", "nearest", "distribute") ||
+        throw(ArgumentError("--oov must be one of unk | nearest | distribute; got `$v`"))
+end
+
+@inline function _oov_kwargs(opts)
+    (oov_policy = Symbol(opts["oov"]),
+     oov_min_sim = Float64(opts["oov-min-sim"]),
+     oov_top_k   = Int(opts["oov-top-k"]))
+end
+
 function _require_vocab(artifact, kind)
     artifact.vocab === nothing && throw(ArgumentError(
         "`$kind` bundle has no vocabulary; save it with " *
@@ -658,7 +681,7 @@ end
 # pass + template voting, which the CLI currently stops short of.
 function _classify_deep_kate(art, bundle, bodies, opts)
     vocab = _require_vocab(art, :deep_kate)
-    X = bow(bodies, vocab; normalise = :l1)
+    X = bow(bodies, vocab; normalise = :l1, _oov_kwargs(opts)...)
     latent_idx = length(art.model.layers) - 5   # position of the sine bottleneck in deep_kate
     # Actually reach through to the Lux internals: thesis DeepKATE
     # has `latent_layer == 5`, the Dense(5 => latent, sin) output.
@@ -671,7 +694,7 @@ end
 
 function _classify_vq_vae(art, bundle, bodies, opts)
     vocab = _require_vocab(art, :vq_vae)
-    X = bow(bodies, vocab; normalise = :binary)
+    X = bow(bodies, vocab; normalise = :binary, _oov_kwargs(opts)...)
     codes = assign_codes(art.model, art.ps, art.st, X)
     labels = ["code-$(c)" for c in codes]
     _emit_classify(opts["out"], opts["format"], bodies, codes, labels)
@@ -681,7 +704,13 @@ end
 function _classify_seq_lstm(art, bundle, bodies, opts)
     vocab = _require_vocab(art, :seq_lstm)
     seqlen = art.seqlen === nothing ? 16 : Int(art.seqlen)
-    S = sequence_matrix(bodies, vocab; seqlen = seqlen)
+    oov_policy = Symbol(opts["oov"])
+    oov_policy === :distribute &&
+        throw(ArgumentError(":distribute is BoW-only; seq_lstm needs :unk or :nearest"))
+    S = sequence_matrix(bodies, vocab;
+                        seqlen = seqlen,
+                        oov_policy = oov_policy,
+                        oov_min_sim = Float64(opts["oov-min-sim"]))
     # seq_lstm output is (vocab_size, batch) logits — argmax = predicted
     # next token's id. We emit that as the "cluster id"; the template
     # is the predicted token string.
@@ -897,9 +926,13 @@ function cmd_rca(args::Vector{String})::Int
         ("sparsity-k",  5,        :int),
         ("max-vocab",   5000,     :int),
         ("min-count",   1,        :int),
+        ("oov",           "unk", :string),   # unk | nearest | distribute
+        ("oov-min-sim",   0.3,   :float),
+        ("oov-top-k",     3,     :int),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_rca_help(); return 0)
+    _validate_oov_policy(opts)
     lines = read_lines(opts["data"])
 
     detector = nothing
@@ -936,7 +969,8 @@ function cmd_rca(args::Vector{String})::Int
             top_percentile = Float64(opts["percentile"]),
             min_sup = Int(opts["min-sup"]),
             max_gap = Int(opts["max-gap"]),
-            max_time_duration = Int(opts["max-dur"]))
+            max_time_duration = Int(opts["max-dur"]),
+            _oov_kwargs(opts)...)
     else
         throw(ArgumentError("unknown --embedder `$(opts["embedder"])`; use `model` or `sparsity`"))
     end

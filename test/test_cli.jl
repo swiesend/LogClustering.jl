@@ -530,4 +530,63 @@ end
         @test r.code == 2
         @test occursin("unknown --embedder", r.err)
     end
+
+    # -------------------------------------------------------------
+    # --oov inference-time OOV policies (deep_kate classify path).
+    # -------------------------------------------------------------
+
+    @testset "classify --oov nearest re-routes unseen tokens" begin
+        # Train a tiny DeepKATE on a small fixture, then classify a
+        # line whose tokens are lexically-close OOVs.
+        train_data = tempname() * ".log"
+        infer_data = tempname() * ".log"
+        model_out  = tempname() * ".jld2"
+        out_unk    = tempname() * ".tsv"
+        out_near   = tempname() * ".tsv"
+        try
+            open(train_data, "w") do io
+                for _ in 1:20; println(io, "INFO session started"); end
+                for _ in 1:20; println(io, "ERROR disk failed"); end
+                for _ in 1:10; println(io, "WARN connection dropped"); end
+            end
+            # Inference line contains freshly-coined-but-similar tokens.
+            open(infer_data, "w") do io
+                println(io, "INFO sessionn startedd")
+            end
+
+            r_tr = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "deep_kate", "--data", train_data,
+                "--out", model_out,
+                "--epochs", "3", "--batch", "8", "--lr", "0.02",
+                "--min-count", "1", "--max-vocab", "64",
+                "--quiet"]))
+            @test r_tr.code == 0
+
+            # --oov unk (default): OOV tokens land in UNK.
+            r_u = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model_out, "--data", infer_data,
+                "--out", out_unk, "--oov", "unk"]))
+            @test r_u.code == 0
+            # --oov nearest: OOV tokens route to nearest vocab tokens.
+            r_n = _with_captured_stdio(() -> CLI.main(["classify",
+                "--model", model_out, "--data", infer_data,
+                "--out", out_near, "--oov", "nearest",
+                "--oov-min-sim", "0.3"]))
+            @test r_n.code == 0
+            # Both produce valid TSV with the same number of rows.
+            @test length(readlines(out_unk)) == length(readlines(out_near))
+        finally
+            for p in (train_data, infer_data, model_out, out_unk, out_near)
+                isfile(p) && rm(p)
+            end
+        end
+    end
+
+    @testset "classify --oov bogus is rejected" begin
+        r = _with_captured_stdio(() -> CLI.main(["classify",
+            "--model", "/dev/null", "--data", "/dev/null",
+            "--oov", "bogus"]))
+        @test r.code == 2
+        @test occursin("--oov", r.err)
+    end
 end
