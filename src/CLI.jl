@@ -111,6 +111,7 @@ function _print_top_help()
       score            per-line anomaly score
       stream           long-running line-by-line inference + rule alerts
       rules            print / validate / explain / dry-run rule bundles
+      patterns         pin / list / explain user-curated patterns (SQLite)
       select-model     find a registry bundle matching a corpus
       rca              root-cause-analysis report (cluster+anomaly+episodes)
       mask             apply the typed-slot regex battery
@@ -1367,6 +1368,7 @@ function cmd_stream(args::Vector{String})::Int
         ("memory-warm",        "",     :string),     # redis://... | inproc | ""
         ("memory-warm-namespace", "",  :string),     # override the auto namespace
         ("memory-warm-flush-on-boot", false, :bool),
+        ("use-patterns",       "",     :path),       # SQLite path; auto-promote pinned patterns
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
@@ -1389,6 +1391,24 @@ function cmd_stream(args::Vector{String})::Int
         Rules.load_rules(String(opts["rules"]);
                          warmup_lines = Int(opts["warmup-lines"]),
                          warmup_seconds = Float64(opts["warmup-seconds"]))
+    end
+
+    # Auto-promotion of pinned patterns into rules + drain sidecar.
+    drain_pinned = Memory.PatternCatalog.Pattern[]
+    if !isempty(opts["use-patterns"])
+        pdb = Memory.SQLite.open_db(String(opts["use-patterns"]); create = false)
+        Memory.SQLite.migrate!(pdb)
+        pinned = Memory.PatternCatalog.list(pdb; enabled_only = true)
+        for r in Memory.PatternCatalog.to_rules(pinned)
+            push!(rs.rules, r)
+            rs.state[r.id] = Rules._initial_state(r)
+        end
+        drain_pinned = Memory.PatternCatalog.drain_patterns(pinned)
+        StructuredLog.info("patterns loaded";
+                           total = length(pinned),
+                           synthesised_rules = length(rs.rules),
+                           drain_patterns = length(drain_pinned))
+        try; close(pdb); catch; end
     end
 
     inferer = _build_inferer(opts, framed_mode)
@@ -1484,6 +1504,28 @@ function cmd_stream(args::Vector{String})::Int
             lines_processed += 1
             ir = _infer(inferer, ev)
             triggers = Rules.evaluate(rs, ir)
+            # Sidecar: drain-cluster pinned patterns aren't part of the
+            # rule engine because the engine has no DrainTemplateRule
+            # kind. Match them directly and synthesise TriggerEvent
+            # rows so the downstream emit/persist paths see them.
+            for p in drain_pinned
+                Memory.PatternCatalog.match_line(p, ir) || continue
+                push!(triggers, Rules.TriggerEvent(
+                    "pattern:$(p.id):$(p.name)",
+                    :drain_pattern,
+                    p.severity,
+                    Int(get(ir, "line_id", ev.line_id)),
+                    String(get(ir, "line", ev.line)),
+                    Dict{String, Any}(
+                        "pattern_id" => p.id,
+                        "match_kind" => "drain",
+                        "cluster_id" => get(get(ir, "drain", Dict{String,Any}()),
+                                             "cluster_id", nothing),
+                    ),
+                    ["stdout"],
+                    Dates.now(Dates.UTC),
+                ))
+            end
             if !isempty(triggers) || opts["emit-all"]
                 _emit_line_records(ir, ev, triggers, opts)
                 # Forward triggers to the webhook sink (if any).
@@ -2015,12 +2057,208 @@ function _print_rules_help()
     """)
 end
 
+# ---------------------------------------------------------------------------
+# patterns — list / add / enable / disable / delete user-curated patterns.
+# ---------------------------------------------------------------------------
+
+function cmd_patterns(args::Vector{String})::Int
+    isempty(args) && (_print_patterns_help(); return 0)
+    sub = args[1]
+    rest = collect(String, args[2:end])
+    if sub == "--help" || sub == "-h" || sub == "help"
+        _print_patterns_help(); return 0
+    elseif sub == "list"
+        return _cmd_patterns_list(rest)
+    elseif sub == "add"
+        return _cmd_patterns_add(rest)
+    elseif sub == "enable" || sub == "disable"
+        return _cmd_patterns_toggle(rest, sub == "enable")
+    elseif sub == "delete" || sub == "rm"
+        return _cmd_patterns_delete(rest)
+    elseif sub == "explain"
+        return _cmd_patterns_explain(rest)
+    else
+        println(stderr, "logcluster patterns: unknown subcommand `$sub`")
+        return 2
+    end
+end
+
+function _cmd_patterns_list(args::Vector{String})::Int
+    specs = [("memory", "", :path), ("all", false, :bool), ("json", false, :bool)]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    rows = Memory.PatternCatalog.list(db; enabled_only = !opts["all"])
+    if opts["json"]
+        for p in rows
+            println(stdout, JSON3.write(Dict(
+                "id"             => p.id,
+                "name"           => p.name,
+                "description"    => p.description,
+                "severity"       => String(p.severity),
+                "cooldown_s"     => p.cooldown_s,
+                "match_kind"     => String(p.match_kind),
+                "drain_template" => p.match_drain_template_id,
+                "regex"          => p.match_regex === nothing ? nothing :
+                                    string(p.match_regex.pattern),
+                "keywords"       => p.match_keywords,
+                "enabled"        => p.enabled,
+            )))
+        end
+    else
+        println(stdout, "id\tname\tkind\tseverity\tenabled\tdetail")
+        for p in rows
+            detail = if p.match_kind === :drain
+                "template=$(p.match_drain_template_id)"
+            elseif p.match_kind === :regex
+                "regex=$(string(p.match_regex.pattern))"
+            else
+                "keywords=" * join(p.match_keywords, ",")
+            end
+            println(stdout, p.id, '\t', p.name, '\t', p.match_kind, '\t',
+                    p.severity, '\t', p.enabled ? "yes" : "no", '\t', detail)
+        end
+    end
+    return 0
+end
+
+function _cmd_patterns_add(args::Vector{String})::Int
+    specs = [
+        ("memory",        "",   :path),
+        ("name",          "",   :string),
+        ("description",   "",   :string),
+        ("severity",      "warn", :string),
+        ("cooldown-s",    60.0, :float),
+        ("from-trigger",  0,    :int),
+        ("kind",          "",   :string),    # keyword | regex | drain
+        ("regex",         "",   :string),
+        ("keyword",       "",   :string),    # repeatable not supported; comma-separated
+        ("drain-template",0,    :int),
+        ("case-sensitive", false, :bool),
+        ("created-by",    "",   :string),
+    ]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    isempty(opts["name"])   && throw(ArgumentError("--name is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+
+    pid = if opts["from-trigger"] > 0
+        mk = isempty(opts["kind"]) ? :drain : Symbol(opts["kind"])
+        Memory.PatternCatalog.pin_from_trigger(db, Int(opts["from-trigger"]);
+            name = String(opts["name"]),
+            description = String(opts["description"]),
+            severity = Symbol(opts["severity"]),
+            cooldown_s = Float64(opts["cooldown-s"]),
+            match_kind = mk,
+            case_sensitive = opts["case-sensitive"],
+            created_by = String(opts["created-by"]))
+    else
+        kind = Symbol(opts["kind"])
+        kind in (:keyword, :regex, :drain) ||
+            throw(ArgumentError("--kind must be keyword | regex | drain"))
+        kws = isempty(opts["keyword"]) ? String[] :
+              String[strip(String(k)) for k in split(String(opts["keyword"]), ',')]
+        Memory.PatternCatalog.pin_manual(db;
+            name = String(opts["name"]),
+            description = String(opts["description"]),
+            severity = Symbol(opts["severity"]),
+            cooldown_s = Float64(opts["cooldown-s"]),
+            match_kind = kind,
+            match_drain_template_id = opts["drain-template"] > 0 ?
+                Int(opts["drain-template"]) : nothing,
+            match_regex = String(opts["regex"]),
+            match_keywords = kws,
+            case_sensitive = opts["case-sensitive"],
+            created_by = String(opts["created-by"]))
+    end
+    println(stdout, JSON3.write(Dict("id" => pid, "name" => String(opts["name"]))))
+    return 0
+end
+
+function _cmd_patterns_toggle(args::Vector{String}, on::Bool)::Int
+    specs = [("memory", "", :path), ("id", 0, :int)]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    opts["id"] > 0          || throw(ArgumentError("--id is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    Memory.PatternCatalog.enable!(db, Int(opts["id"]), on)
+    return 0
+end
+
+function _cmd_patterns_delete(args::Vector{String})::Int
+    specs = [("memory", "", :path), ("id", 0, :int)]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    opts["id"] > 0          || throw(ArgumentError("--id is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    Memory.PatternCatalog.delete!(db, Int(opts["id"]))
+    return 0
+end
+
+function _cmd_patterns_explain(args::Vector{String})::Int
+    specs = [("memory", "", :path), ("id", 0, :int)]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    opts["id"] > 0          || throw(ArgumentError("--id is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    p = Memory.PatternCatalog.get_pattern(db, Int(opts["id"]))
+    p === nothing && (println(stderr, "pattern not found"); return 2)
+    println(stdout, JSON3.write(Dict(
+        "id"          => p.id,
+        "name"        => p.name,
+        "description" => p.description,
+        "severity"    => String(p.severity),
+        "cooldown_s"  => p.cooldown_s,
+        "match_kind"  => String(p.match_kind),
+        "drain_template" => p.match_drain_template_id,
+        "regex"       => p.match_regex === nothing ? nothing : string(p.match_regex.pattern),
+        "keywords"    => p.match_keywords,
+        "enabled"     => p.enabled,
+        "created_at"  => p.created_at,
+        "created_by"  => p.created_by,
+    )))
+    return 0
+end
+
+function _print_patterns_help()
+    println("""
+    usage: logcluster patterns list    --memory PATH [--all] [--json]
+           logcluster patterns add     --memory PATH --name N --kind K [...]
+           logcluster patterns add     --memory PATH --name N --from-trigger ID
+           logcluster patterns enable  --memory PATH --id N
+           logcluster patterns disable --memory PATH --id N
+           logcluster patterns delete  --memory PATH --id N
+           logcluster patterns explain --memory PATH --id N
+
+    Author / inspect user-curated patterns persisted in the SQLite
+    memory store. Patterns auto-promote into rules on the next
+    `stream` run when --use-patterns is set; drain-template patterns
+    are matched via an exact-cluster-id sidecar pass.
+
+    --kind selects the matcher: keyword | regex | drain.
+    --keyword "a,b,c"  comma-separated list of keywords (case insensitive
+                        by default; pass --case-sensitive to opt in).
+    --regex   "PAT"     literal regex.
+    --drain-template N  Drain-cluster id for kind = drain.
+
+    --from-trigger ID   pin a pattern from an existing trigger row.
+                        Uses the trigger's drain_cluster_id (default)
+                        or its raw line, depending on --kind.
+    """)
+end
+
 const SUBCOMMANDS = Dict{String, Function}(
     "train"            => cmd_train,
     "classify"         => cmd_classify,
     "score"            => cmd_score,
     "stream"           => cmd_stream,
     "rules"            => cmd_rules,
+    "patterns"         => cmd_patterns,
     "select-model"     => cmd_select,
     "rca"              => cmd_rca,
     "mask"             => cmd_mask,
