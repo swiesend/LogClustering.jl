@@ -102,6 +102,12 @@ using .RCA
 include("Rules.jl")
 using .Rules
 
+include("StructuredLog.jl")
+using .StructuredLog
+
+include("Stream.jl")
+using .Stream
+
 include("CLI.jl")
 using .CLI
 
@@ -113,7 +119,8 @@ export KATE, DeepKATE, DenoisingAE, SoftKATE, Framing, Masking, Dedup,
        Featurise, Episodes, Baselines, Instance, Sequence, SeqLSTM,
        Transformer, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
        Sparsity, Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
-       AutoTune, RCA, Rules, CLI, Purity, Typing, Merge, Rust
+       AutoTune, RCA, Rules, StructuredLog, Stream, CLI, Purity, Typing,
+       Merge, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
