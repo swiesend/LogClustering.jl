@@ -10,6 +10,10 @@
 *.model
 *.ods
 
+# Package-bundled JSON resources (rule bundles, schema samples) — not data.
+!src/rules/*.json
+!examples/*.json
+
 # Rust build artefacts
 /rust/target/
 

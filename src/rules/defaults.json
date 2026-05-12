@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "defaults": {
+    "severity": "warn",
+    "cooldown_s": 30,
+    "warmup_required": true
+  },
+  "rules": [
+    {
+      "id": "novel_template",
+      "kind": "novel_cluster",
+      "model": "drain",
+      "severity": "warn",
+      "cooldown_s": 60
+    },
+    {
+      "id": "score_p99",
+      "kind": "score_threshold",
+      "metric": "transformer_decoder.nll",
+      "comparison": ">",
+      "value": "auto:p99",
+      "severity": "warn",
+      "cooldown_s": 30
+    },
+    {
+      "id": "error_rate_spike",
+      "kind": "rate_spike",
+      "match": {
+        "kind": "regex",
+        "field": "line",
+        "pattern": "(?i)\\b(error|fail|failed|panic|exception|denied)\\b"
+      },
+      "window_s": 60,
+      "min_count": 10,
+      "baseline_multiplier": 3.0,
+      "severity": "crit",
+      "cooldown_s": 60
+    },
+    {
+      "id": "volume_anomaly",
+      "kind": "volume_anomaly",
+      "window_s": 60,
+      "baseline_multiplier": 5.0,
+      "severity": "warn",
+      "cooldown_s": 60
+    },
+    {
+      "id": "fatal_keywords",
+      "kind": "keyword",
+      "field": "line",
+      "keywords": ["FATAL", "PANIC", "OOM", "segfault", "kernel panic"],
+      "case_sensitive": false,
+      "severity": "crit",
+      "cooldown_s": 10,
+      "warmup_required": false
+    },
+    {
+      "id": "regex_oom_kill",
+      "kind": "regex",
+      "field": "line",
+      "pattern": "kernel:.*Out of memory.*Killed process",
+      "severity": "crit",
+      "cooldown_s": 10,
+      "warmup_required": false
+    }
+  ],
+  "routes": [
+    {
+      "match": { "severity": ["warn", "crit"] },
+      "sinks": ["stdout"]
+    },
+    {
+      "match": { "severity": ["crit"] },
+      "sinks": ["webhook:default"]
+    }
+  ],
+  "sinks": {
+    "webhook:default": {
+      "url": "https://alertmanager.example.com/api/v2/alerts",
+      "method": "POST",
+      "headers": { "Content-Type": "application/json" },
+      "secret_env": "ALERTMANAGER_TOKEN",
+      "format": "alertmanager"
+    }
+  }
+}
