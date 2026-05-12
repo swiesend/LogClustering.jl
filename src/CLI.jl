@@ -50,9 +50,14 @@ using ..Sparsity: sparsity_clusters
 using ..Pipeline: Pipeline, l2_normalise, kmeans_cluster
 using ..Framing: parse_frame, SOURCE_RAW
 using ..RCA: RCA, root_cause, root_cause_sparsity, render_markdown
+using ..Rules: Rules
+using ..StructuredLog: StructuredLog
+using ..Stream: Stream
+using ..SinksWebhook: SinksWebhook
 using Lux
 using Zygote
 using JSON3
+using Dates: Dates, DateTime, now, UTC
 using Random: MersenneTwister
 using Statistics: mean
 
@@ -103,11 +108,20 @@ function _print_top_help()
       train            fit a model on a log corpus
       classify         label each line with its template / cluster id
       score            per-line anomaly score
+      stream           long-running line-by-line inference + rule alerts
+      rules            print / validate / explain / dry-run rule bundles
       select-model     find a registry bundle matching a corpus
       rca              root-cause-analysis report (cluster+anomaly+episodes)
       mask             apply the typed-slot regex battery
       benchmark        run one parser vs a LogHub-2.0 CSV
       download-loghub  fetch the 2k subsets
+
+    Exit codes:
+      0   success (clean shutdown signal for `stream`).
+      1   at least one rule fired (only when --exit-on-trigger is set).
+      2   argument / config / schema error.
+      3   I/O error (model bundle missing, source file gone).
+      130 killed by SIGINT / SIGTERM during shutdown.
 
     Run `logcluster <command> --help` for subcommand flags.
     """)
@@ -771,6 +785,7 @@ function cmd_classify(args::Vector{String})::Int
         ("data",   "-",   :path),
         ("out",    "-",   :path),
         ("format", "tsv", :string),
+        ("json",   false, :bool),            # alias for --format json
         ("framed", false, :bool),
         ("oov",           "unk", :string),   # unk | nearest | distribute
         ("oov-min-sim",   0.3,   :float),
@@ -778,6 +793,7 @@ function cmd_classify(args::Vector{String})::Int
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_classify_help(); return 0)
+    opts["json"] && (opts["format"] = "json")
     isempty(opts["model"]) && throw(ArgumentError("--model is required"))
     _validate_oov_policy(opts)
     bundle = Persistence.load(opts["model"])
@@ -991,9 +1007,11 @@ function cmd_score(args::Vector{String})::Int
         ("data",     "-",  :path),
         ("out",      "-",  :path),
         ("format",   "tsv", :string),
+        ("json",     false, :bool),         # alias for --format json
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_score_help(); return 0)
+    opts["json"] && (opts["format"] = "json")
 
     have_det   = !isempty(opts["detector"])
     have_model = !isempty(opts["model"])
@@ -1191,9 +1209,11 @@ function cmd_rca(args::Vector{String})::Int
         ("oov",           "unk", :string),   # unk | nearest | distribute
         ("oov-min-sim",   0.3,   :float),
         ("oov-top-k",     3,     :int),
+        ("json",          false, :bool),       # alias for --format json
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_rca_help(); return 0)
+    opts["json"] && (opts["format"] = "json")
     _validate_oov_policy(opts)
     lines = read_lines(opts["data"])
 
@@ -1299,10 +1319,540 @@ function _print_rca_help()
     """)
 end
 
+# ---------------------------------------------------------------------------
+# stream — long-running line-by-line inference + rule evaluation.
+# ---------------------------------------------------------------------------
+
+"""
+    StreamInferer
+
+Bundle holding the loaded model + optional detector + framing mode
+for the streaming worker. One per process; reused for every line so
+allocations stay bounded.
+"""
+struct StreamInferer
+    bundle_kind::Union{Symbol, Nothing}
+    artifact::Any
+    detector::Any              # ::Union{ValueNoveltyDetector, Nothing}
+    framed::Symbol             # :raw | :auto
+end
+
+function cmd_stream(args::Vector{String})::Int
+    specs = [
+        ("model",              "",     :path),
+        ("detector",           "",     :path),
+        ("rules",              "",     :path),
+        ("data",               "",     :path),       # "" or "-" = stdin
+        ("tail",               false,  :bool),
+        ("framed",             "raw",  :string),     # raw | auto
+        ("emit-all",           false,  :bool),
+        ("warmup-lines",       500,    :int),
+        ("warmup-seconds",     30.0,   :float),
+        ("status-interval",    10.0,   :float),
+        ("max-line-bytes",     65_536, :int),
+        ("webhook",            "",     :string),
+        ("webhook-secret-env", "",     :string),
+        ("webhook-format",     "raw",  :string),     # raw | slack | alertmanager
+        ("quiet",              false,  :bool),
+        ("exit-on-trigger",    false,  :bool),
+        ("shutdown-timeout",   5.0,    :float),
+        ("log-format",         "json", :string),     # json | text
+        ("log-level",          "info", :string),     # debug | info | warn | error
+        ("max-events",         0,      :int),        # 0 = no limit (test hook)
+        ("channel-capacity",   4096,   :int),
+    ]
+    opts = parse_flags(args, specs)
+    get(opts, "help", false) && (_print_stream_help(); return 0)
+
+    # Configure logger before anything else so all subsequent diagnostics
+    # land in the right place.
+    StructuredLog.set_format!(Symbol(opts["log-format"]))
+    StructuredLog.set_level!(Symbol(opts["log-level"]))
+
+    framed_mode = Symbol(opts["framed"])
+    framed_mode in (:raw, :auto) ||
+        throw(ArgumentError("--framed must be raw | auto, got `$(opts["framed"])`"))
+
+    # Load rules; override with --webhook if supplied (synthesises a
+    # `webhook:cli` sink + an all-severity route).
+    rs = if isempty(opts["rules"])
+        Rules.default_rules(warmup_lines = Int(opts["warmup-lines"]),
+                            warmup_seconds = Float64(opts["warmup-seconds"]))
+    else
+        Rules.load_rules(String(opts["rules"]);
+                         warmup_lines = Int(opts["warmup-lines"]),
+                         warmup_seconds = Float64(opts["warmup-seconds"]))
+    end
+
+    inferer = _build_inferer(opts, framed_mode)
+
+    # Optional webhook sink injected at runtime from --webhook (the
+    # rules JSON's existing webhook sinks still apply alongside).
+    webhook_sink = _maybe_build_webhook_sink(opts)
+    webhook_ch::Union{Nothing, Channel{Dict{String, Any}}} = nothing
+    webhook_task::Union{Nothing, Task} = nothing
+    webhook_stop::Union{Nothing, Ref{Bool}} = nothing
+    if webhook_sink !== nothing
+        webhook_ch, webhook_task, webhook_stop =
+            SinksWebhook.start_webhook_task(webhook_sink; capacity = 1024)
+    end
+
+    # Producer task.
+    ch = Channel{Stream.LineEvent}(Int(opts["channel-capacity"]))
+    stop_signal = Stream.StopSignal()
+    tail_stats = Stream.TailStats()
+    producer = _spawn_producer(opts, ch, stop_signal, tail_stats)
+
+    started_at = time()
+    last_status = started_at
+    triggers_total = 0
+    by_rule = Dict{String, Int}()
+    lines_processed = 0
+    max_events = Int(opts["max-events"])
+    status_interval = Float64(opts["status-interval"])
+    exit_on_trigger = opts["exit-on-trigger"]
+
+    StructuredLog.info("stream started";
+                       model = String(opts["model"]),
+                       detector = String(opts["detector"]),
+                       rules = isempty(opts["rules"]) ? "<defaults>" : String(opts["rules"]),
+                       source = isempty(opts["data"]) || opts["data"] == "-" ? "stdin" : opts["data"],
+                       tail = opts["tail"])
+
+    try
+        for ev in ch
+            lines_processed += 1
+            ir = _infer(inferer, ev)
+            triggers = Rules.evaluate(rs, ir)
+            if !isempty(triggers) || opts["emit-all"]
+                _emit_line_records(ir, ev, triggers, opts)
+                # Forward triggers to the webhook sink (if any).
+                if webhook_ch !== nothing
+                    for t in triggers
+                        if "webhook:cli" in t.sinks ||
+                           any(startswith(s, "webhook:") for s in t.sinks)
+                            try
+                                put!(webhook_ch, _trigger_to_dict(t, ir))
+                            catch
+                            end
+                        end
+                    end
+                end
+            end
+            for t in triggers
+                triggers_total += 1
+                by_rule[t.rule_id] = get(by_rule, t.rule_id, 0) + 1
+            end
+            if status_interval > 0 && !opts["quiet"] &&
+               (time() - last_status) >= status_interval
+                _emit_status(started_at, lines_processed, triggers_total,
+                             by_rule, tail_stats, ch)
+                last_status = time()
+            end
+            if max_events > 0 && lines_processed >= max_events
+                Stream.stop!(stop_signal)
+                break
+            end
+        end
+    finally
+        Stream.stop!(stop_signal)
+        try; close(ch); catch; end
+        try
+            timedwait(() -> istaskdone(producer),
+                      Float64(opts["shutdown-timeout"]))
+        catch
+        end
+        if webhook_ch !== nothing
+            try; close(webhook_ch); catch; end
+            try; webhook_stop[] = true; catch; end
+            try
+                timedwait(() -> istaskdone(webhook_task),
+                          Float64(opts["shutdown-timeout"]))
+            catch
+            end
+        end
+        _emit_shutdown(triggers_total)
+    end
+
+    return (exit_on_trigger && triggers_total > 0) ? 1 : 0
+end
+
+function _spawn_producer(opts, ch, stop_signal, stats)
+    src = String(opts["data"])
+    max_bytes = Int(opts["max-line-bytes"])
+    if isempty(src) || src == "-"
+        # Stdin path. The redirected `stdin` inside the test harness
+        # works the same way.
+        return @async begin
+            try
+                Stream.stream_stdin!(stdin, ch; stop = stop_signal,
+                                      stats = stats,
+                                      max_line_bytes = max_bytes)
+            finally
+                try; close(ch); catch; end
+            end
+        end
+    elseif opts["tail"]
+        return @async begin
+            try
+                Stream.tail_file!(src, ch; stop = stop_signal, stats = stats,
+                                   max_line_bytes = max_bytes,
+                                   from_start = false)
+            finally
+                try; close(ch); catch; end
+            end
+        end
+    else
+        return @async begin
+            try
+                open(src, "r") do io
+                    Stream.stream_stdin!(io, ch; stop = stop_signal,
+                                          stats = stats,
+                                          max_line_bytes = max_bytes)
+                end
+            finally
+                try; close(ch); catch; end
+            end
+        end
+    end
+end
+
+function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
+    bundle_kind = nothing
+    artifact    = nothing
+    if !isempty(opts["model"])
+        bundle = Persistence.load(String(opts["model"]))
+        bundle_kind = bundle.kind
+        artifact    = Persistence.rehydrate(bundle)
+    end
+    det = nothing
+    if !isempty(opts["detector"])
+        det = Persistence.load_and_rehydrate(String(opts["detector"]))
+        det isa ValueNoveltyDetector ||
+            throw(ArgumentError("--detector must be a ValueNoveltyDetector bundle"))
+    end
+    return StreamInferer(bundle_kind, artifact, det, framed_mode)
+end
+
+"""
+    _infer(inf, ev) -> Dict{String, Any}
+
+Build the InferResult dict consumed by the rule engine and emitted
+on stdout. Stable shape per plan §3.
+"""
+function _infer(inf::StreamInferer, ev::Stream.LineEvent)
+    raw_line = ev.line
+    body = raw_line
+    frame_payload = nothing
+    if inf.framed === :auto
+        f = parse_frame(raw_line)
+        body = String(f.message)
+        frame_payload = Dict{String, Any}(
+            "source"    => string(f.source),
+            "host"      => String(f.host),
+            "app"       => String(f.app),
+            "timestamp" => String(f.timestamp),
+        )
+    end
+
+    ir = Dict{String, Any}(
+        "line"    => body,
+        "line_id" => ev.line_id,
+        "ts"      => string(ev.ts),
+    )
+    frame_payload === nothing || (ir["frame"] = frame_payload)
+    ev.partial && (ir["partial"] = true)
+
+    if inf.bundle_kind === :drain
+        cid, tpl = process!(inf.artifact, body)
+        ir["drain"] = Dict{String, Any}("cluster_id" => cid, "template" => tpl)
+    elseif inf.bundle_kind === :transformer_decoder
+        nll = _per_line_decoder_nll(inf.artifact, [body])[1]
+        ir["transformer_decoder"] = Dict{String, Any}("nll" => Float64(nll))
+    end
+
+    if inf.detector !== nothing
+        _, values = mask_lines_with_values([body])
+        if !isempty(values)
+            nov = value_novelty(inf.detector, values[1])
+            ir["novelty"] = Dict{String, Any}("value_novelty" => Float64(nov))
+        end
+    end
+    return ir
+end
+
+# ---------------------------------------------------------------------------
+# JSON emitters — stable on-the-wire schema (see docs/json-schema.md).
+# ---------------------------------------------------------------------------
+
+_iso_now() = string(Dates.format(now(UTC),
+                                  Dates.dateformat"yyyy-mm-ddTHH:MM:SS.sss"), "Z")
+
+function _emit_line_records(ir, ev, triggers, opts)
+    if opts["emit-all"]
+        rec = Dict{String, Any}("event" => "line")
+        for (k, v) in ir
+            rec[k] = v
+        end
+        rec["triggered"] = [t.rule_id for t in triggers]
+        println(stdout, JSON3.write(rec))
+    end
+    for t in triggers
+        rec = Dict{String, Any}(
+            "event"     => "trigger",
+            "ts"        => string(t.ts),
+            "rule_id"   => t.rule_id,
+            "rule_kind" => string(t.rule_kind),
+            "severity"  => string(t.severity),
+            "line_id"   => t.line_id,
+            "line"      => t.line,
+            "fields"    => t.fields,
+            "sinks"     => t.sinks,
+        )
+        if haskey(ir, "frame")
+            rec["frame"] = ir["frame"]
+        end
+        if haskey(ir, "drain")
+            rec["drain"] = ir["drain"]
+        end
+        if haskey(ir, "transformer_decoder")
+            rec["transformer_decoder"] = ir["transformer_decoder"]
+        end
+        println(stdout, JSON3.write(rec))
+    end
+    flush(stdout)
+end
+
+function _emit_status(started_at, lines_processed, triggers_total,
+                      by_rule, tail_stats, ch)
+    uptime = time() - started_at
+    rate = uptime > 0 ? lines_processed / uptime : 0.0
+    rec = Dict{String, Any}(
+        "event"   => "status",
+        "ts"      => _iso_now(),
+        "uptime_s" => uptime,
+        "lines"   => Dict{String, Any}(
+            "total"            => lines_processed,
+            "rate_per_s"       => round(rate; digits = 2),
+            "dropped_oversize" => tail_stats.dropped_oversize,
+        ),
+        "triggers" => Dict{String, Any}(
+            "total"   => triggers_total,
+            "by_rule" => by_rule,
+        ),
+        "rotations" => tail_stats.rotations,
+        "queue"     => Dict{String, Any}(
+            "ingest" => length(ch.data),
+        ),
+    )
+    println(stdout, JSON3.write(rec))
+    flush(stdout)
+end
+
+function _emit_shutdown(triggers_total)
+    rec = Dict{String, Any}(
+        "event"     => "shutdown",
+        "ts"        => _iso_now(),
+        "reason"    => "eof",
+        "triggers_total" => triggers_total,
+    )
+    try
+        println(stdout, JSON3.write(rec))
+        flush(stdout)
+    catch
+    end
+end
+
+function _trigger_to_dict(t, ir)
+    return Dict{String, Any}(
+        "event"     => "trigger",
+        "ts"        => string(t.ts),
+        "rule_id"   => t.rule_id,
+        "rule_kind" => string(t.rule_kind),
+        "severity"  => string(t.severity),
+        "line_id"   => t.line_id,
+        "line"      => t.line,
+        "fields"    => t.fields,
+    )
+end
+
+function _maybe_build_webhook_sink(opts)
+    isempty(opts["webhook"]) && return nothing
+    url = String(opts["webhook"])
+    fmt = Symbol(opts["webhook-format"])
+    fmt in (:raw, :slack, :alertmanager) ||
+        throw(ArgumentError("--webhook-format must be raw|slack|alertmanager"))
+    spec = Rules.SinkSpec("webhook:cli", :webhook, url, "POST",
+                          Dict{String,String}("Content-Type" => "application/json"),
+                          String(opts["webhook-secret-env"]), fmt)
+    return SinksWebhook.WebhookSink(spec = spec)
+end
+
+function _print_stream_help()
+    println("""
+    usage: logcluster stream [--model PATH] [--detector PATH] [--rules PATH]
+                             [--data FILE] [--tail] [--framed raw|auto]
+                             [--emit-all] [--warmup-lines N] [--warmup-seconds S]
+                             [--status-interval S] [--max-line-bytes N]
+                             [--webhook URL] [--webhook-secret-env VAR]
+                             [--webhook-format raw|slack|alertmanager]
+                             [--quiet] [--exit-on-trigger]
+                             [--shutdown-timeout S]
+                             [--log-format json|text] [--log-level LVL]
+                             [--max-events N]
+
+    Long-running line-by-line inference + rule evaluation. Reads
+    newline-terminated records from stdin (default) or --data, runs
+    each one through the loaded model (if any), evaluates the rule
+    bundle, and emits JSON-line trigger records on stdout. See
+    docs/json-schema.md for the wire schema.
+
+    Sources:
+      --data FILE           file path; defaults to stdin when omitted or `-`.
+      --tail                follow --data forever, honouring logrotate-style
+                            rotation (inode change) and in-place truncation.
+
+    Inference:
+      --model PATH          drain | transformer_decoder bundle. Drain
+                            contributes cluster_id + template; transformer
+                            contributes per-line nll (perplexity proxy).
+      --detector PATH       ValueNoveltyDetector bundle; adds value_novelty.
+      --framed auto         strip the collector envelope (RFC 5424 / CRI /
+                            Docker JSON) before scoring; the frame metadata
+                            is attached to each record.
+
+    Rules:
+      --rules PATH          rules.json (see plan §2). Defaults to
+                            `Rules.default_rules()` (novel template,
+                            score p99, error rate spike, volume anomaly,
+                            fatal keywords, OOM-killer regex).
+      --warmup-lines N      buffer the first N lines before any rule with
+                            warmup_required can fire (default 500).
+      --warmup-seconds S    fallback wall-clock warmup (default 30 s).
+
+    Output:
+      --emit-all            emit one `event:"line"` record per input line
+                            (default off — triggers + status only).
+      --status-interval S   emit a `event:"status"` heartbeat every S
+                            seconds (default 10 s; 0 disables).
+      --webhook URL         shorthand for a webhook:cli sink overlayed
+                            onto the rules; triggers route to it.
+      --log-format text|json (default json). Stderr is JSON-lines by
+                            default for log shippers.
+      --log-level LVL       debug | info | warn | error (default info).
+
+    Lifecycle:
+      --quiet               suppress the stdout status heartbeat.
+      --exit-on-trigger     return 1 if at least one rule fired.
+      --shutdown-timeout S  graceful drain budget (default 5 s).
+      --max-events N        stop after processing N lines (test hook).
+    """)
+end
+
+# ---------------------------------------------------------------------------
+# rules — introspection / authoring helper.
+# ---------------------------------------------------------------------------
+
+function cmd_rules(args::Vector{String})::Int
+    specs = [
+        ("print-defaults", false, :bool),
+        ("validate",       "",    :path),
+        ("explain",        "",    :path),
+        ("dry-run",        false, :bool),
+        ("rules",          "",    :path),
+        ("data",           "-",   :path),
+        ("model",          "",    :path),
+        ("warmup-lines",   0,     :int),
+        ("warmup-seconds", 0.0,   :float),
+    ]
+    opts = parse_flags(args, specs)
+    get(opts, "help", false) && (_print_rules_help(); return 0)
+
+    if opts["print-defaults"]
+        path = joinpath(@__DIR__, "rules", "defaults.json")
+        print(stdout, read(path, String))
+        return 0
+    end
+
+    if !isempty(opts["validate"])
+        try
+            Rules.load_rules(String(opts["validate"]))
+            println(stderr, "rules: OK")
+            return 0
+        catch e
+            println(stderr, "rules: ", sprint(showerror, e))
+            return 2
+        end
+    end
+
+    if !isempty(opts["explain"])
+        rs = Rules.load_rules(String(opts["explain"]))
+        for r in rs.rules
+            println(stdout, rpad(r.id, 24),
+                    "  kind=", Rules._kind_symbol(r),
+                    "  severity=", r.severity,
+                    "  cooldown_s=", r.cooldown_s)
+        end
+        return 0
+    end
+
+    if opts["dry-run"]
+        isempty(opts["rules"]) &&
+            throw(ArgumentError("--dry-run needs --rules FILE"))
+        rs = Rules.load_rules(String(opts["rules"]);
+                              warmup_lines   = Int(opts["warmup-lines"]),
+                              warmup_seconds = Float64(opts["warmup-seconds"]))
+        inferer = _build_inferer(Dict("model"    => opts["model"],
+                                       "detector" => "",
+                                       "framed"   => "raw"), :raw)
+        lines = read_lines(opts["data"])
+        by_rule = Dict{String, Int}()
+        for (i, l) in enumerate(lines)
+            ev = Stream.LineEvent(String(l), Int(i), now(UTC); partial = false)
+            ir = _infer(inferer, ev)
+            for t in Rules.evaluate(rs, ir)
+                by_rule[t.rule_id] = get(by_rule, t.rule_id, 0) + 1
+            end
+        end
+        println(stdout, JSON3.write(Dict("lines" => length(lines),
+                                          "by_rule" => by_rule)))
+        return 0
+    end
+
+    _print_rules_help()
+    return 0
+end
+
+function _print_rules_help()
+    println("""
+    usage: logcluster rules --print-defaults
+           logcluster rules --validate FILE
+           logcluster rules --explain  FILE
+           logcluster rules --dry-run --rules FILE --data FILE [--model M]
+
+    Introspect / author rules bundles.
+
+    --print-defaults    dump the bundled `Rules.default_rules()` JSON
+                        to stdout (handy as a starting template).
+    --validate FILE     parse + type-check; exits 0 on success, 2 on
+                        schema problems.
+    --explain  FILE     print each rule's resolved severity, cooldown,
+                        and dispatch kind.
+    --dry-run           replay --data through the rule engine offline
+                        and print `{lines, by_rule}` JSON, so you can
+                        tune thresholds before going live. Optional
+                        --model adds drain / transformer signals so
+                        score_threshold + novel_cluster rules see real
+                        data.
+    """)
+end
+
 const SUBCOMMANDS = Dict{String, Function}(
     "train"            => cmd_train,
     "classify"         => cmd_classify,
     "score"            => cmd_score,
+    "stream"           => cmd_stream,
+    "rules"            => cmd_rules,
     "select-model"     => cmd_select,
     "rca"              => cmd_rca,
     "mask"             => cmd_mask,

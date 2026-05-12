@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "defaults": {
+    "severity": "warn",
+    "cooldown_s": 10,
+    "warmup_required": false
+  },
+  "rules": [
+    {
+      "id": "fatal_keywords",
+      "kind": "keyword",
+      "field": "line",
+      "keywords": ["FATAL", "PANIC", "OOM"],
+      "case_sensitive": false,
+      "severity": "crit"
+    },
+    {
+      "id": "p99_nll",
+      "kind": "score_threshold",
+      "metric": "transformer_decoder.nll",
+      "comparison": ">",
+      "value": "auto:p99",
+      "severity": "warn",
+      "warmup_required": true
+    }
+  ]
+}
