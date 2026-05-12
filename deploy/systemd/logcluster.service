@@ -1,0 +1,57 @@
+[Unit]
+Description=LogClustering streaming inference + alerting
+Documentation=https://github.com/swiesend/LogClustering.jl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=logcluster
+Group=logcluster
+
+# Secret material (ALERTMANAGER_TOKEN, SLACK_WEBHOOK_URL, ...) lives
+# here, owned by root with mode 0640. The leading `-` makes the file
+# optional so a fresh install boots without it.
+EnvironmentFile=-/etc/logcluster/env
+
+Environment=JULIA_PROJECT=/opt/logclustering
+Environment=JULIA_SYSIMAGE_PATH=/opt/logclustering/LogClustering.so
+
+ExecStart=/opt/logclustering/bin/logcluster stream \
+  --model /etc/logcluster/models/transformer-decoder.jld2 \
+  --detector /etc/logcluster/models/value-novelty.jld2 \
+  --rules /etc/logcluster/rules.json \
+  --data /var/log/syslog \
+  --tail \
+  --framed auto \
+  --status-interval 30 \
+  --log-format json \
+  --log-level info
+
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+# stdout is the durable trigger sink; ship it to disk and let your
+# log collector (vector / fluent-bit / promtail) pick it up.
+StandardOutput=append:/var/log/logcluster/triggers.jsonl
+StandardError=journal
+
+Nice=10
+LimitNOFILE=65536
+
+# Hardening — read-only deploy tree, writable only where needed.
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/logcluster /opt/logclustering
+ReadWritePaths=/var/log/logcluster /var/lib/logcluster
+
+# Resource limits — bound memory + cpu so a runaway worker doesn't
+# starve the host. Tune to your workload.
+MemoryMax=2G
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

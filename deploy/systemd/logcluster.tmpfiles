@@ -1,0 +1,6 @@
+# systemd-tmpfiles: create runtime + log directories for logcluster.
+# Drop into /etc/tmpfiles.d/logcluster.conf.
+#
+# Type Path                       Mode UID         GID         Age Argument
+d      /var/log/logcluster        0755 logcluster  logcluster  -   -
+d      /var/lib/logcluster        0750 logcluster  logcluster  -   -

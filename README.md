@@ -70,7 +70,15 @@ bin/logcluster classify --model model.jld2 --data newlog.txt --format tsv
 bin/logcluster score    --detector det.jld2 --data newlog.txt
 bin/logcluster benchmark data/HDFS_2k.log_structured.csv drain
 bin/logcluster download-loghub --all
+
+# Production streaming + rule-based triggers (see docs/deployment.md).
+bin/logcluster stream --rules examples/rules-production.json --tail /var/log/syslog
+bin/logcluster rules  --print-defaults > /etc/logcluster/rules.json
 ```
+
+For long-running deployments see [`docs/deployment.md`](docs/deployment.md)
+(Docker + systemd) and [`docs/json-schema.md`](docs/json-schema.md)
+(stream wire format).
 
 Every subcommand also works in-process: `LogClustering.CLI.main(["mask",
 "--data", path])` returns an exit code without shelling out.
