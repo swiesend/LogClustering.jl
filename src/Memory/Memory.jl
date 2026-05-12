@@ -14,6 +14,14 @@ include("SQLite.jl")
 using .SQLiteStore
 const SQLite = SQLiteStore
 
-export Schema, SQLiteStore, SQLite
+include("Redis.jl")
+using .RedisClient
+
+include("WarmStore.jl")
+using .WarmStoreModule
+const WarmStore = WarmStoreModule
+
+export Schema, SQLiteStore, SQLite, RedisClient, WarmStore,
+       WarmStoreModule
 
 end # module Memory

@@ -1364,6 +1364,9 @@ function cmd_stream(args::Vector{String})::Int
         ("memory",             "",     :path),       # SQLite filename for triggers
         ("persist-lines",      "none", :string),     # none | sampled | all
         ("persist-lines-rate", 100,    :int),        # 1-in-N sampling rate
+        ("memory-warm",        "",     :string),     # redis://... | inproc | ""
+        ("memory-warm-namespace", "",  :string),     # override the auto namespace
+        ("memory-warm-flush-on-boot", false, :bool),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
@@ -1389,6 +1392,28 @@ function cmd_stream(args::Vector{String})::Int
     end
 
     inferer = _build_inferer(opts, framed_mode)
+
+    # Optional short-term warm state (Redis): hydrates novel-cluster
+    # baselines so a restart doesn't re-fire every template the
+    # operator has already seen.
+    if !isempty(opts["memory-warm"])
+        ns = isempty(opts["memory-warm-namespace"]) ?
+             _rules_fingerprint(opts) :
+             String(opts["memory-warm-namespace"])
+        try
+            warm = Memory.WarmStore.open_warm(String(opts["memory-warm"]);
+                rules_fingerprint = ns)
+            Rules.attach_warm_store!(rs, warm)
+            StructuredLog.info("warm store attached";
+                               url = String(opts["memory-warm"]),
+                               namespace = ns)
+        catch e
+            StructuredLog.error_event("warm store open failed";
+                                      url = String(opts["memory-warm"]),
+                                      error = sprint(showerror, e))
+            return 3
+        end
+    end
 
     # Optional long-term memory: SQLite writer + session row. The
     # async writer absorbs back-pressure so the inference loop never
@@ -1535,6 +1560,20 @@ function cmd_stream(args::Vector{String})::Int
     end
 
     return (exit_on_trigger && triggers_total > 0) ? 1 : 0
+end
+
+using SHA: sha256
+
+"""
+    _rules_fingerprint(opts) -> String
+
+12-hex-char SHA-256 of the resolved rules path (or the literal
+`<defaults>` token) so two stream instances pointed at the same
+rules file share warm-state namespace.
+"""
+function _rules_fingerprint(opts)
+    s = isempty(opts["rules"]) ? "<defaults>" : String(opts["rules"])
+    return bytes2hex(sha256(s))[1:12]
 end
 
 # Build the WriteTrigger payload from a Rules.TriggerEvent + the

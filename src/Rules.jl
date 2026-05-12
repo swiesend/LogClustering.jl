@@ -173,8 +173,14 @@ end
 In-memory rule bundle plus mutable per-rule state. The struct itself
 is mostly immutable; only `state` dicts and `warmup` mutate on each
 [`evaluate`] call.
+
+`warm_store` is an optional hook into a long-term backing store
+([`Memory.WarmStore`]). When set, the `novel_cluster` rule consults
+it across evaluations so a process restart doesn't re-fire every
+template the operator has already seen. Default is `nothing` — the
+engine behaves exactly as before.
 """
-struct RuleSet
+mutable struct RuleSet
     version::Int
     defaults::Dict{Symbol, Any}
     rules::Vector{AbstractRule}
@@ -182,6 +188,8 @@ struct RuleSet
     sinks::Dict{String, SinkSpec}
     state::Dict{String, Dict{Symbol, Any}}
     warmup::WarmupState
+    warm_store::Any   # ::Union{Nothing, Memory.WarmStore} — typed as Any to
+                      # avoid a circular module dependency between Rules ↔ Memory.
 end
 
 """
@@ -288,8 +296,45 @@ function _build_ruleset(raw, warmup_lines::Int, warmup_seconds::Float64)
     end
 
     warmup = WarmupState(time(), 0, warmup_lines, warmup_seconds, false)
-    return RuleSet(version, d, rules, routes, sinks, state, warmup)
+    return RuleSet(version, d, rules, routes, sinks, state, warmup, nothing)
 end
+
+"""
+    attach_warm_store!(rs::RuleSet, store) -> RuleSet
+
+Bind a `Memory.WarmStore` to the rule set. Hydrates the in-process
+`:seen` set on every `novel_cluster` rule from the store so a
+restart doesn't replay alerts. Returns `rs` (chainable).
+"""
+function attach_warm_store!(rs::RuleSet, store)
+    rs.warm_store = store
+    for r in rs.rules
+        r isa NovelClusterRule || continue
+        # Cheap to call hydrator even when store == InProcWarmStore (no-op).
+        previously = _warm_load_set(store, r.id)
+        st = rs.state[r.id]
+        st[:warm] = store
+        for v in previously
+            push!(st[:seen], v)
+        end
+    end
+    return rs
+end
+
+# Warm-store hooks. The `::Nothing` methods cover the default
+# (no warm store attached); `Memory.WarmStoreModule` adds methods
+# on concrete `WarmStore` subtypes by extending these symbols
+# directly.
+_warm_load_set(::Nothing, _rule_id) = String[]
+_warm_seen_member(::Nothing, _rule_id, _value) = false
+_warm_add_member!(::Nothing, _rule_id, _value) = false
+
+# Generic fallbacks for any non-`Nothing` store that hasn't yet had
+# a method defined — keep the system safe to evaluate even before
+# Memory loads.
+_warm_load_set(_s, _rule_id) = String[]
+_warm_seen_member(_s, _rule_id, _value) = false
+_warm_add_member!(_s, _rule_id, _value) = false
 
 # Shared helpers for parsing the common fields.
 @inline function _common_fields(r, defaults::Dict{Symbol, Any})
@@ -586,7 +631,17 @@ end
 
 function _ingest!(r::NovelClusterRule, ir, st, _t)
     cid = _lookup(ir, "$(r.model).cluster_id")
-    cid !== nothing && push!(st[:seen], cid)
+    cid === nothing && return nothing
+    cid_s = string(cid)
+    push!(st[:seen], cid_s)
+    warm = get(st, :warm, nothing)
+    if warm !== nothing
+        try
+            _warm_add_member!(warm, r.id, cid_s)
+        catch
+        end
+    end
+    return nothing
 end
 
 function _ingest!(r::NovelTokenRule, ir, st, _t)
@@ -670,8 +725,19 @@ end
 function _fire_check(r::NovelClusterRule, ir, st, _t)
     cid = _lookup(ir, "$(r.model).cluster_id")
     cid === nothing && return (false, Dict{String, Any}())
-    novel = !(cid in st[:seen])
-    push!(st[:seen], cid)
+    # Canonicalise the cluster id as String so the warm store and the
+    # in-memory cache speak the same language across restarts.
+    cid_s = string(cid)
+    novel = !(cid_s in st[:seen])
+    push!(st[:seen], cid_s)
+    warm = get(st, :warm, nothing)
+    if warm !== nothing && novel
+        try
+            _warm_add_member!(warm, r.id, cid_s)
+        catch e
+            @debug "warm_store add_member! failed" rule=r.id exception=e
+        end
+    end
     return (novel, Dict{String, Any}(
         "model"      => r.model,
         "cluster_id" => cid,
