@@ -34,6 +34,7 @@ using LogClustering
     include("test_memory_sqlite.jl")
     include("test_memory_redis.jl")
     include("test_pattern_catalog.jl")
+    include("test_insights.jl")
     include("test_stream_e2e.jl")
     include("test_memory_e2e.jl")
     include("test_cli.jl")

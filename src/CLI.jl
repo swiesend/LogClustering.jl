@@ -112,6 +112,9 @@ function _print_top_help()
       stream           long-running line-by-line inference + rule alerts
       rules            print / validate / explain / dry-run rule bundles
       patterns         pin / list / explain user-curated patterns (SQLite)
+      query            triggers / sessions / patterns from the SQLite store
+      insights         top rules / novel templates / episodes / transitions
+      report           Markdown / JSON report bundling the insights
       select-model     find a registry bundle matching a corpus
       rca              root-cause-analysis report (cluster+anomaly+episodes)
       mask             apply the typed-slot regex battery
@@ -2252,6 +2255,414 @@ function _print_patterns_help()
     """)
 end
 
+# ---------------------------------------------------------------------------
+# query / insights / report — read-only views over the SQLite store.
+# ---------------------------------------------------------------------------
+
+function cmd_query(args::Vector{String})::Int
+    isempty(args) && (_print_query_help(); return 0)
+    sub = args[1]
+    rest = collect(String, args[2:end])
+    sub == "--help" && (_print_query_help(); return 0)
+    if sub == "triggers"
+        return _cmd_query_triggers(rest)
+    elseif sub == "sessions"
+        return _cmd_query_sessions(rest)
+    elseif sub == "patterns"
+        return _cmd_query_patterns(rest)
+    else
+        println(stderr, "logcluster query: unknown subcommand `$sub`"); return 2
+    end
+end
+
+function _cmd_query_triggers(args::Vector{String})::Int
+    specs = [
+        ("memory",  "",     :path),
+        ("since",   "24h",  :string),
+        ("until",   "",     :string),
+        ("rule",    "",     :string),
+        ("severity", "",    :string),
+        ("cluster", 0,      :int),
+        ("limit",   50,     :int),
+        ("json",    false,  :bool),
+    ]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    since = Memory.SQLite.epoch_ms_since(String(opts["since"]))
+    until = isempty(opts["until"]) ? nothing :
+            Memory.SQLite.epoch_ms_since(String(opts["until"]))
+    rows = Memory.SQLite.triggers(db;
+        since = since, until = until,
+        rule_id = isempty(opts["rule"]) ? nothing : String(opts["rule"]),
+        severity = isempty(opts["severity"]) ? nothing : String(opts["severity"]),
+        cluster_id = opts["cluster"] > 0 ? Int(opts["cluster"]) : nothing,
+        limit = Int(opts["limit"]))
+    _emit_rows(rows, opts["json"];
+        cols = (:id, :ts, :rule_id, :severity, :line_id, :line))
+    return 0
+end
+
+function _cmd_query_sessions(args::Vector{String})::Int
+    specs = [
+        ("memory", "",    :path),
+        ("since",  "30d", :string),
+        ("limit",  50,    :int),
+        ("json",   false, :bool),
+    ]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    since_ms = Memory.SQLite.epoch_ms_since(String(opts["since"]))
+    rows = Memory.SQLite._rows(db,
+        "SELECT id, started_at, ended_at, host, model_path, rules_path, " *
+        "exit_code FROM sessions WHERE started_at >= ? " *
+        "ORDER BY id DESC LIMIT ?",
+        (string(since_ms), Int(opts["limit"])))
+    _emit_rows(rows, opts["json"];
+        cols = (:id, :started_at, :ended_at, :host, :exit_code))
+    return 0
+end
+
+function _cmd_query_patterns(args::Vector{String})::Int
+    specs = [("memory", "", :path), ("json", false, :bool)]
+    opts = parse_flags(args, specs)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    rows = Memory.PatternCatalog.list(db; enabled_only = false)
+    if opts["json"]
+        for p in rows
+            println(stdout, JSON3.write(Dict("id" => p.id, "name" => p.name,
+                "kind" => String(p.match_kind), "enabled" => p.enabled,
+                "severity" => String(p.severity))))
+        end
+    else
+        println(stdout, "id\tname\tkind\tseverity\tenabled")
+        for p in rows
+            println(stdout, p.id, '\t', p.name, '\t', p.match_kind, '\t',
+                    p.severity, '\t', p.enabled ? "yes" : "no")
+        end
+    end
+    return 0
+end
+
+function _emit_rows(rows, json::Bool; cols::Tuple)
+    if json
+        for r in rows
+            println(stdout, JSON3.write(_row_to_dict(r)))
+        end
+    else
+        println(stdout, join(String.(cols), '\t'))
+        for r in rows
+            vals = [string(get(r, c, "")) for c in cols]
+            println(stdout, join(vals, '\t'))
+        end
+    end
+end
+
+_row_to_dict(r::NamedTuple) =
+    Dict{String, Any}(String(k) => v for (k, v) in pairs(r))
+
+function _print_query_help()
+    println("""
+    usage: logcluster query triggers --memory PATH [--since 24h] [--rule X]
+                                     [--severity S] [--cluster N] [--limit 50]
+                                     [--json]
+           logcluster query sessions  --memory PATH [--since 30d] [--limit 50]
+           logcluster query patterns  --memory PATH [--json]
+
+    Read-only SQL-backed views over the long-term store.
+
+    --since DUR | ISO     accepts 24h, 7d, 30m, 45s, or an ISO-8601 timestamp.
+    --json                emit NDJSON instead of TSV.
+    """)
+end
+
+function cmd_insights(args::Vector{String})::Int
+    specs = [
+        ("memory",   "",   :path),
+        ("since",    "24h", :string),
+        ("until",    "",    :string),
+        ("limit",    20,    :int),
+        ("top-rules",      false, :bool),
+        ("novel",          false, :bool),
+        ("burstiness",     "",    :string),    # rule_id
+        ("cluster",        0,     :int),
+        ("transitions",    false, :bool),
+        ("episodes",       false, :bool),
+        ("pinned",         false, :bool),
+        ("bucket-s",       60,    :int),
+        ("min-sup",        3,     :int),
+        ("max-gap",        20,    :int),
+        ("max-dur",        50,    :int),
+        ("json",           false, :bool),
+    ]
+    opts = parse_flags(args, specs)
+    get(opts, "help", false) && (_print_insights_help(); return 0)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    since = Memory.SQLite.epoch_ms_since(String(opts["since"]))
+    until = isempty(opts["until"]) ? nothing :
+            Memory.SQLite.epoch_ms_since(String(opts["until"]))
+
+    result = Dict{String, Any}()
+    if opts["top-rules"]
+        result["top_rules"] = Memory.Insights.top_rules_window(db;
+            since = since, until = until, limit = Int(opts["limit"]))
+    end
+    if opts["novel"]
+        result["novel"] = Memory.Insights.novel_clusters_window(db;
+            since = since, until = until)
+    end
+    if !isempty(opts["burstiness"])
+        result["burstiness"] = Memory.Insights.burstiness(db;
+            rule_id = String(opts["burstiness"]),
+            since = since, until = until,
+            bucket_s = Int(opts["bucket-s"]))
+    end
+    if opts["cluster"] > 0
+        result["cluster"] = Memory.Insights.cluster_view(db;
+            cluster_id = Int(opts["cluster"]),
+            since = since, until = until,
+            bucket_s = Int(opts["bucket-s"]))
+    end
+    if opts["transitions"]
+        result["transitions"] = Memory.Insights.transitions(db;
+            since = since, until = until, top = Int(opts["limit"]))
+    end
+    if opts["episodes"]
+        result["episodes"] = Memory.Insights.episodes(db;
+            since = since, until = until,
+            min_sup = Int(opts["min-sup"]),
+            max_gap = Int(opts["max-gap"]),
+            max_time_duration = Int(opts["max-dur"]),
+            top = Int(opts["limit"]))
+    end
+    if opts["pinned"]
+        result["pinned"] = Memory.Insights.pinned_summary(db;
+            since = since, until = until)
+    end
+
+    if isempty(result)
+        _print_insights_help()
+        return 0
+    end
+    if opts["json"]
+        println(stdout, JSON3.write(_jsonable(result)))
+    else
+        _render_insights_text(result)
+    end
+    return 0
+end
+
+# Convert a NamedTuple-keyed result tree into something JSON3 can
+# serialise without choking on Missing.
+function _jsonable(x)
+    if x isa AbstractDict
+        return Dict{String, Any}(String(k) => _jsonable(v) for (k, v) in x)
+    elseif x isa AbstractVector
+        return Any[_jsonable(v) for v in x]
+    elseif x isa NamedTuple
+        return Dict{String, Any}(String(k) => _jsonable(v) for (k, v) in pairs(x))
+    elseif x isa Missing
+        return nothing
+    else
+        return x
+    end
+end
+
+function _render_insights_text(result::AbstractDict)
+    for (section, rows) in result
+        println(stdout, "## ", section)
+        if isempty(rows)
+            println(stdout, "  (no rows)")
+            continue
+        end
+        first_row = rows[1]
+        cols = first_row isa NamedTuple ? collect(keys(first_row)) : Symbol[]
+        if !isempty(cols)
+            println(stdout, "  ", join(String.(cols), '\t'))
+        end
+        for r in rows
+            if r isa NamedTuple
+                vals = [string(getproperty(r, c)) for c in cols]
+                println(stdout, "  ", join(vals, '\t'))
+            else
+                println(stdout, "  ", r)
+            end
+        end
+        println(stdout)
+    end
+end
+
+function _print_insights_help()
+    println("""
+    usage: logcluster insights --memory PATH [--since 24h] [--until ISO]
+                               [--top-rules] [--novel]
+                               [--burstiness RULE] [--cluster N]
+                               [--transitions] [--episodes] [--pinned]
+                               [--limit 20] [--bucket-s 60]
+                               [--min-sup 3] [--max-gap 20] [--max-dur 50]
+                               [--json]
+
+    Compose any number of view flags into one analysis run. Each
+    flag adds a section to the output keyed by name. With --json,
+    the output is a single Dict whose keys are the requested views.
+
+    Views:
+      --top-rules        rule_id counts in the window, by severity.
+      --novel            Drain clusters first seen in the window.
+      --burstiness R     bucketed trigger counts for rule R.
+      --cluster N        bucketed trigger counts for drain cluster N.
+      --transitions      top-K (from -> to) drain transitions.
+      --episodes         top-K episodes mined over the cluster sequence.
+      --pinned           per-pattern match counts (curated patterns).
+
+    --since DUR | ISO    24h, 7d, 30m, 45s, or an ISO-8601 timestamp.
+    --bucket-s N         bucket width for burstiness / cluster views.
+    --min-sup / --max-gap / --max-dur tune Mining.Episodes.mv_span.
+    """)
+end
+
+function cmd_report(args::Vector{String})::Int
+    specs = [
+        ("memory",  "",    :path),
+        ("since",   "24h", :string),
+        ("until",   "",    :string),
+        ("format",  "md",  :string),     # md | json
+        ("topk",    10,    :int),
+        ("min-sup", 3,     :int),
+        ("max-gap", 20,    :int),
+        ("max-dur", 50,    :int),
+    ]
+    opts = parse_flags(args, specs)
+    get(opts, "help", false) && (_print_report_help(); return 0)
+    isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    since = Memory.SQLite.epoch_ms_since(String(opts["since"]))
+    until = isempty(opts["until"]) ? nothing :
+            Memory.SQLite.epoch_ms_since(String(opts["until"]))
+
+    bundle = Dict{String, Any}(
+        "since"  => opts["since"],
+        "until"  => isempty(opts["until"]) ? "now" : opts["until"],
+        "top_rules" => Memory.Insights.top_rules_window(db;
+            since = since, until = until, limit = Int(opts["topk"])),
+        "novel"     => Memory.Insights.novel_clusters_window(db;
+            since = since, until = until),
+        "transitions" => Memory.Insights.transitions(db;
+            since = since, until = until, top = Int(opts["topk"])),
+        "episodes"    => Memory.Insights.episodes(db;
+            since = since, until = until,
+            min_sup = Int(opts["min-sup"]), max_gap = Int(opts["max-gap"]),
+            max_time_duration = Int(opts["max-dur"]),
+            top = Int(opts["topk"])),
+        "pinned"      => Memory.Insights.pinned_summary(db;
+            since = since, until = until),
+    )
+
+    if opts["format"] == "json"
+        println(stdout, JSON3.write(_jsonable(bundle)))
+    else
+        print(stdout, _render_report_md(bundle))
+    end
+    return 0
+end
+
+function _render_report_md(b::AbstractDict)
+    io = IOBuffer()
+    println(io, "# LogClustering insights report")
+    println(io)
+    println(io, "Window: ", b["since"], " → ", b["until"])
+    println(io)
+    println(io, "## Top rules")
+    println(io)
+    if isempty(b["top_rules"])
+        println(io, "_no triggers in window_")
+    else
+        println(io, "| rule_id | severity | count |")
+        println(io, "|---------|----------|-------|")
+        for r in b["top_rules"]
+            println(io, "| ", r.rule_id, " | ", r.severity, " | ", r.n, " |")
+        end
+    end
+    println(io)
+
+    println(io, "## Novel templates")
+    println(io)
+    if isempty(b["novel"])
+        println(io, "_none_")
+    else
+        println(io, "| cluster_id | first_seen_ms |")
+        println(io, "|------------|---------------|")
+        for r in b["novel"]
+            println(io, "| ", r.cluster_id, " | ", r.first_seen_ms, " |")
+        end
+    end
+    println(io)
+
+    println(io, "## Top cluster transitions")
+    println(io)
+    if isempty(b["transitions"])
+        println(io, "_none_")
+    else
+        println(io, "| from | to | count |")
+        println(io, "|------|----|-------|")
+        for r in b["transitions"]
+            println(io, "| ", r.from, " | ", r.to, " | ", r.n, " |")
+        end
+    end
+    println(io)
+
+    println(io, "## Episodes")
+    println(io)
+    if isempty(b["episodes"])
+        println(io, "_no episodes mined_")
+    else
+        println(io, "| pattern | support |")
+        println(io, "|---------|---------|")
+        for r in b["episodes"]
+            println(io, "| ", join(r.pattern, ","), " | ", r.support, " |")
+        end
+    end
+    println(io)
+
+    println(io, "## Pinned-pattern activity")
+    println(io)
+    if isempty(b["pinned"])
+        println(io, "_no patterns pinned_")
+    else
+        println(io, "| pattern | severity | matches |")
+        println(io, "|---------|----------|---------|")
+        for r in b["pinned"]
+            println(io, "| ", r.name, " | ", r.severity, " | ", r.n, " |")
+        end
+    end
+    println(io)
+    return String(take!(io))
+end
+
+function _print_report_help()
+    println("""
+    usage: logcluster report --memory PATH [--since 24h] [--until ISO]
+                             [--format md|json] [--topk 10]
+                             [--min-sup 3] [--max-gap 20] [--max-dur 50]
+
+    Bundled report (Markdown by default, JSON with --format json)
+    over the past window. Sections: top rules, novel templates, top
+    cluster transitions, mined episodes, pinned-pattern activity.
+
+    Drop into a runbook with:
+      logcluster report --since 24h --memory /var/lib/logcluster/triggers.sqlite \\
+        > /var/log/logcluster/daily.md
+    """)
+end
+
 const SUBCOMMANDS = Dict{String, Function}(
     "train"            => cmd_train,
     "classify"         => cmd_classify,
@@ -2259,6 +2670,9 @@ const SUBCOMMANDS = Dict{String, Function}(
     "stream"           => cmd_stream,
     "rules"            => cmd_rules,
     "patterns"         => cmd_patterns,
+    "query"            => cmd_query,
+    "insights"         => cmd_insights,
+    "report"           => cmd_report,
     "select-model"     => cmd_select,
     "rca"              => cmd_rca,
     "mask"             => cmd_mask,

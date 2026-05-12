@@ -24,7 +24,10 @@ const WarmStore = WarmStoreModule
 include("PatternCatalog.jl")
 using .PatternCatalog
 
+include("Insights.jl")
+using .Insights
+
 export Schema, SQLiteStore, SQLite, RedisClient, WarmStore,
-       WarmStoreModule, PatternCatalog
+       WarmStoreModule, PatternCatalog, Insights
 
 end # module Memory
