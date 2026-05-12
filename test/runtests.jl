@@ -33,6 +33,7 @@ using LogClustering
     include("test_sinks_webhook.jl")
     include("test_memory_sqlite.jl")
     include("test_stream_e2e.jl")
+    include("test_memory_e2e.jl")
     include("test_cli.jl")
     include("test_ad.jl")
     include("test_rust.jl")

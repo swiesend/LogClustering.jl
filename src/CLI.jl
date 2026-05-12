@@ -54,6 +54,7 @@ using ..Rules: Rules
 using ..StructuredLog: StructuredLog
 using ..Stream: Stream
 using ..SinksWebhook: SinksWebhook
+using ..Memory: Memory
 using Lux
 using Zygote
 using JSON3
@@ -1360,6 +1361,9 @@ function cmd_stream(args::Vector{String})::Int
         ("log-level",          "info", :string),     # debug | info | warn | error
         ("max-events",         0,      :int),        # 0 = no limit (test hook)
         ("channel-capacity",   4096,   :int),
+        ("memory",             "",     :path),       # SQLite filename for triggers
+        ("persist-lines",      "none", :string),     # none | sampled | all
+        ("persist-lines-rate", 100,    :int),        # 1-in-N sampling rate
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
@@ -1385,6 +1389,37 @@ function cmd_stream(args::Vector{String})::Int
     end
 
     inferer = _build_inferer(opts, framed_mode)
+
+    # Optional long-term memory: SQLite writer + session row. The
+    # async writer absorbs back-pressure so the inference loop never
+    # waits on disk I/O.
+    persist_lines_mode = Symbol(opts["persist-lines"])
+    persist_lines_mode in (:none, :sampled, :all) ||
+        throw(ArgumentError("--persist-lines must be none | sampled | all"))
+    persist_lines_rate = max(1, Int(opts["persist-lines-rate"]))
+    mem_db = nothing
+    mem_ch = nothing
+    mem_task = nothing
+    mem_stop = nothing
+    mem_session_id = 0
+    if !isempty(opts["memory"])
+        mem_db = Memory.SQLite.open_db(String(opts["memory"]))
+        Memory.SQLite.migrate!(mem_db)
+        mem_session_id = Memory.SQLite.insert_session!(mem_db;
+            host          = gethostname(),
+            model_path    = String(opts["model"]),
+            detector_path = String(opts["detector"]),
+            rules_path    = isempty(opts["rules"]) ? "<defaults>" : String(opts["rules"]),
+            rules_sha256  = "",
+            meta = Dict{String, Any}(
+                "framed"          => String(opts["framed"]),
+                "warmup_lines"    => Int(opts["warmup-lines"]),
+                "warmup_seconds"  => Float64(opts["warmup-seconds"]),
+                "persist_lines"   => String(opts["persist-lines"]),
+            ))
+        mem_ch, mem_task, mem_stop = Memory.SQLite.spawn_writer(mem_db;
+            batch = 100, flush_ms = 250)
+    end
 
     # Optional webhook sink injected at runtime from --webhook (the
     # rules JSON's existing webhook sinks still apply alongside).
@@ -1439,6 +1474,17 @@ function cmd_stream(args::Vector{String})::Int
                     end
                 end
             end
+            # Persist triggers + optionally the line itself.
+            if mem_ch !== nothing
+                for t in triggers
+                    _enqueue_trigger_write(mem_ch, mem_session_id, t, ir)
+                end
+                if persist_lines_mode === :all ||
+                   (persist_lines_mode === :sampled &&
+                    (lines_processed % persist_lines_rate) == 1)
+                    _enqueue_line_write(mem_ch, mem_session_id, ev, ir)
+                end
+            end
             for t in triggers
                 triggers_total += 1
                 by_rule[t.rule_id] = get(by_rule, t.rule_id, 0) + 1
@@ -1471,10 +1517,83 @@ function cmd_stream(args::Vector{String})::Int
             catch
             end
         end
+        if mem_ch !== nothing
+            try; mem_stop[] = true; catch; end
+            try; close(mem_ch); catch; end
+            try
+                timedwait(() -> istaskdone(mem_task),
+                          Float64(opts["shutdown-timeout"]))
+            catch
+            end
+            try
+                Memory.SQLite.finalize_session!(mem_db, mem_session_id;
+                    exit_code = (exit_on_trigger && triggers_total > 0) ? 1 : 0)
+            catch
+            end
+        end
         _emit_shutdown(triggers_total)
     end
 
     return (exit_on_trigger && triggers_total > 0) ? 1 : 0
+end
+
+# Build the WriteTrigger payload from a Rules.TriggerEvent + the
+# InferResult dict and push it onto the writer channel. Best-effort
+# — a closed channel during shutdown is swallowed.
+function _enqueue_trigger_write(ch, session_id::Int, t, ir::AbstractDict)
+    frame  = get(ir, "frame", nothing)
+    drain  = get(ir, "drain", nothing)
+    dcid   = drain isa AbstractDict ? get(drain, "cluster_id", nothing) : nothing
+    sig    = _model_signals_for_ir(ir)
+    payload = Dict{Symbol, Any}(
+        :session_id        => session_id,
+        :rule_id           => t.rule_id,
+        :rule_kind         => string(t.rule_kind),
+        :severity          => string(t.severity),
+        :line_id           => t.line_id,
+        :line              => t.line,
+        :fields            => t.fields,
+        :ts                => t.ts,
+        :frame             => frame,
+        :drain_cluster_id  => dcid,
+        :model_signals     => sig,
+    )
+    try
+        put!(ch, Memory.SQLite.WriteTrigger(payload))
+    catch
+    end
+end
+
+function _enqueue_line_write(ch, session_id::Int, ev, ir::AbstractDict)
+    drain = get(ir, "drain", nothing)
+    dcid  = drain isa AbstractDict ? get(drain, "cluster_id", nothing) : nothing
+    sig   = _model_signals_for_ir(ir)
+    payload = Dict{Symbol, Any}(
+        :session_id        => session_id,
+        :line_id           => ev.line_id,
+        :line              => ev.line,
+        :ts                => ev.ts,
+        :drain_cluster_id  => dcid,
+        :model_signals     => sig,
+    )
+    try
+        put!(ch, Memory.SQLite.WriteLine(payload))
+    catch
+    end
+end
+
+# Extract the "model signals" slice of an InferResult: every key
+# whose value is itself a Dict (the per-model namespaces) plus the
+# `novelty` block when present. Skip the stable top-level fields.
+function _model_signals_for_ir(ir::AbstractDict)
+    keep = Dict{String, Any}()
+    for (k, v) in ir
+        ks = String(k)
+        ks in ("line", "line_id", "ts", "drain", "frame", "partial") && continue
+        v isa AbstractDict || continue
+        keep[ks] = v
+    end
+    return isempty(keep) ? nothing : keep
 end
 
 function _spawn_producer(opts, ch, stop_signal, stats)
@@ -1746,6 +1865,16 @@ function _print_stream_help()
       --exit-on-trigger     return 1 if at least one rule fired.
       --shutdown-timeout S  graceful drain budget (default 5 s).
       --max-events N        stop after processing N lines (test hook).
+
+    Long-term memory:
+      --memory PATH         SQLite database for triggers + sessions.
+                            The file is created + migrated to head on
+                            boot. Writes go through an async batched
+                            writer (no I/O on the inference path).
+      --persist-lines MODE  none (default) | sampled | all. Sampled
+                            keeps 1-in-N (--persist-lines-rate, default
+                            100) full line records so `insights
+                            --episodes` has a cluster-id stream to mine.
     """)
 end
 
