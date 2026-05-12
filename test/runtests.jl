@@ -30,6 +30,7 @@ using LogClustering
     include("test_rca.jl")
     include("test_rules.jl")
     include("test_stream.jl")
+    include("test_sinks_webhook.jl")
     include("test_cli.jl")
     include("test_ad.jl")
     include("test_rust.jl")

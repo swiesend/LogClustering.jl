@@ -108,6 +108,9 @@ using .StructuredLog
 include("Stream.jl")
 using .Stream
 
+include("SinksWebhook.jl")
+using .SinksWebhook
+
 include("CLI.jl")
 using .CLI
 
@@ -119,8 +122,8 @@ export KATE, DeepKATE, DenoisingAE, SoftKATE, Framing, Masking, Dedup,
        Featurise, Episodes, Baselines, Instance, Sequence, SeqLSTM,
        Transformer, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
        Sparsity, Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
-       AutoTune, RCA, Rules, StructuredLog, Stream, CLI, Purity, Typing,
-       Merge, Rust
+       AutoTune, RCA, Rules, StructuredLog, Stream, SinksWebhook, CLI,
+       Purity, Typing, Merge, Rust
 
 # ---------------------------------------------------------------------------
 # Precompile workload
