@@ -241,4 +241,70 @@ end
         @test String(triggers[1]["rule_kind"]) == "drain_pattern"
     end
 
+    @testset "drain sidecar honours cooldown_s (no per-line flood)" begin
+        rules_path = tempname() * ".json"
+        open(rules_path, "w") do io
+            JSON3.write(io, Dict("version" => 1, "rules" => []))
+        end
+        model_path = tempname() * ".jld2"
+        train_data = tempname() * ".log"
+        open(train_data, "w") do io; println(io, "HOT event"); end
+        _capture(() -> CLI.main(["train", "--kind", "drain",
+                                  "--data", train_data,
+                                  "--out", model_path, "--quiet"]))
+        d = _fresh_db()
+        pin_manual(d.db; name = "hot", match_kind = :drain,
+            match_drain_template_id = 1, severity = :warn, cooldown_s = 3600.0)
+
+        # 5 identical lines → same cluster_id 1 → without cooldown that
+        # would be 5 triggers; with a 1h cooldown it must be exactly 1.
+        data_path = tempname() * ".log"
+        open(data_path, "w") do io
+            for _ in 1:5; println(io, "HOT event"); end
+        end
+        r = _stdin(data_path, () -> _capture(() ->
+            CLI.main(["stream", "--rules", rules_path,
+                      "--use-patterns", d.path, "--model", model_path,
+                      "--memory", d.path,
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0",
+                      "--quiet", "--log-level", "error"])))
+        @test r.code == 0
+        events = [JSON3.read(l) for l in filter(!isempty, split(r.out, '\n'))]
+        triggers = filter(e -> String(e["event"]) == "trigger", events)
+        @test length(triggers) == 1     # cooldown collapsed the flood
+
+        # And the firing recorded a pattern_matches row so insights see it.
+        db2 = LogClustering.Memory.SQLite.open_db(d.path; create = false)
+        rows = LogClustering.Memory.SQLite._rows(db2,
+            "SELECT COUNT(*) AS n FROM pattern_matches")
+        @test Int(rows[1].n) >= 1
+    end
+
+    @testset "keyword pattern firing writes a pattern_matches row" begin
+        d = _fresh_db()
+        pid = pin_manual(d.db; name = "kwmatch",
+            match_kind = :keyword, match_keywords = ["ZAP"], severity = :warn,
+            cooldown_s = 0.0)     # no cooldown → both ZAP lines fire
+        rules_path = tempname() * ".json"
+        open(rules_path, "w") do io
+            JSON3.write(io, Dict("version" => 1, "rules" => []))
+        end
+        data_path = tempname() * ".log"
+        open(data_path, "w") do io
+            println(io, "ZAP one"); println(io, "quiet"); println(io, "ZAP two")
+        end
+        _stdin(data_path, () -> _capture(() ->
+            CLI.main(["stream", "--rules", rules_path,
+                      "--use-patterns", d.path, "--memory", d.path,
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0",
+                      "--quiet", "--log-level", "error"])))
+        db2 = LogClustering.Memory.SQLite.open_db(d.path; create = false)
+        rows = LogClustering.Memory.SQLite._rows(db2,
+            "SELECT COUNT(*) AS n FROM pattern_matches WHERE pattern_id = ?",
+            (pid,))
+        @test Int(rows[1].n) == 2       # two ZAP lines
+    end
+
 end

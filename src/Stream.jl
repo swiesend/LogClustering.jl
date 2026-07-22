@@ -151,7 +151,14 @@ with `partial = true` on the resulting `LineEvent`.
 
 `stats.bytes_total` counts bytes read (not lines emitted), so a
 truncated file's byte counter still reflects bytes consumed before
-the rotation.
+the rotation. On a rotation the old file descriptor is drained to
+EOF *before* reopening, so complete lines written just before
+`logrotate` renamed the file are not lost.
+
+Fundamental limitation: a `copytruncate` rotation whose replacement
+content grows past the old read offset within a single poll interval
+cannot be detected by size alone and may skip data — prefer
+`create`-mode rotation (inode change), which is handled exactly.
 """
 function tail_file!(path::AbstractString, ch::Channel{LineEvent};
                     stop::StopSignal = StopSignal(),
@@ -161,12 +168,51 @@ function tail_file!(path::AbstractString, ch::Channel{LineEvent};
                     poll_seconds::Float64 = 0.05,
                     line_stale_seconds::Float64 = 5.0,
                     start_line_id::Int = 1)
-    line_id = start_line_id
+    line_id = Ref(start_line_id)
     io = open(path, "r")
     from_start || seekend(io)
     file_inode = _inode(path)
     partial_buf = IOBuffer()
-    partial_started_at = NaN
+    partial_started = Ref(NaN)
+
+    # Drain every byte currently available on `src` into `partial_buf`,
+    # emitting complete lines. Returns the number of lines emitted.
+    # Shared by the steady-state read pass and the pre-rotation drain
+    # of the old fd, so a rename never strands buffered complete lines.
+    function drain_fd!(src)
+        n_emitted = 0
+        while !eof(src) && !is_stopped(stop)
+            chunk = readavailable(src)
+            isempty(chunk) && break
+            stats.bytes_total += length(chunk)
+            for b in chunk
+                if b == UInt8('\n')
+                    line = String(take!(partial_buf))
+                    partial_started[] = NaN
+                    n_emitted += 1
+                    if sizeof(line) > max_line_bytes
+                        stats.dropped_oversize += 1
+                        StructuredLog.warn("line dropped";
+                                           reason = "oversize",
+                                           bytes  = sizeof(line),
+                                           limit  = max_line_bytes,
+                                           line_id = line_id[])
+                        line_id[] += 1
+                        continue
+                    end
+                    stats.lines_total += 1
+                    put!(ch, LineEvent(line, line_id[], now(UTC); partial = false))
+                    line_id[] += 1
+                else
+                    write(partial_buf, b)
+                    if isnan(partial_started[])
+                        partial_started[] = time()
+                    end
+                end
+            end
+        end
+        return n_emitted
+    end
 
     try
         while !is_stopped(stop)
@@ -175,76 +221,48 @@ function tail_file!(path::AbstractString, ch::Channel{LineEvent};
             cur_size  = _filesize(path)
             cur_pos   = try; position(io); catch; 0; end
             if cur_inode !== nothing && cur_inode != file_inode
+                # create-mode rotation: drain the old fd's remaining
+                # complete lines before switching, then reset the
+                # partial buffer (its bytes belonged to the old fd).
+                drain_fd!(io)
                 close(io)
                 io = open(path, "r")
                 file_inode = cur_inode
                 stats.rotations += 1
                 StructuredLog.info("file rotated"; path = path, reason = "inode_change")
-                # Reset partial buffer — its contents belonged to the old fd.
                 partial_buf = IOBuffer()
-                partial_started_at = NaN
+                partial_started[] = NaN
                 continue
             elseif cur_size !== nothing && cur_size < cur_pos
-                # Truncation: same inode, but file shrunk.
+                # Truncation (copytruncate): drain what we can, then
+                # re-read from the start of the shrunk file.
+                drain_fd!(io)
                 close(io)
                 io = open(path, "r")
                 stats.rotations += 1
                 StructuredLog.info("file rotated"; path = path, reason = "truncation")
                 partial_buf = IOBuffer()
-                partial_started_at = NaN
+                partial_started[] = NaN
                 continue
             end
 
-            # Read whatever bytes are available right now.
-            n_emitted = 0
-            while !eof(io) && !is_stopped(stop)
-                chunk = readavailable(io)
-                isempty(chunk) && break
-                stats.bytes_total += length(chunk)
-                # Walk the chunk byte-by-byte, splitting at newlines and
-                # honouring the oversize cutoff at flush time so we don't
-                # buffer a multi-MB blob forever.
-                for b in chunk
-                    if b == UInt8('\n')
-                        line = String(take!(partial_buf))
-                        partial_started_at = NaN
-                        n_emitted += 1
-                        if sizeof(line) > max_line_bytes
-                            stats.dropped_oversize += 1
-                            StructuredLog.warn("line dropped";
-                                               reason = "oversize",
-                                               bytes  = sizeof(line),
-                                               limit  = max_line_bytes,
-                                               line_id = line_id)
-                            line_id += 1
-                            continue
-                        end
-                        stats.lines_total += 1
-                        put!(ch, LineEvent(line, line_id, now(UTC); partial = false))
-                        line_id += 1
-                    else
-                        write(partial_buf, b)
-                        if isnan(partial_started_at)
-                            partial_started_at = time()
-                        end
-                    end
-                end
-            end
+            n_emitted = drain_fd!(io)
 
             # If a partial line has been hanging around past the stale
             # window, flush it with partial = true so downstream sees
             # something rather than blocking the worker forever.
-            if !isnan(partial_started_at) && partial_buf.size > 0 &&
-               (time() - partial_started_at) >= line_stale_seconds
+            if !isnan(partial_started[]) && partial_buf.size > 0 &&
+               (time() - partial_started[]) >= line_stale_seconds
                 line = String(take!(partial_buf))
-                partial_started_at = NaN
+                partial_started[] = NaN
                 if sizeof(line) <= max_line_bytes
                     stats.lines_total += 1
                     stats.partial_flushes += 1
-                    put!(ch, LineEvent(line, line_id, now(UTC); partial = true))
-                    line_id += 1
+                    put!(ch, LineEvent(line, line_id[], now(UTC); partial = true))
+                    line_id[] += 1
                 else
                     stats.dropped_oversize += 1
+                    line_id[] += 1
                 end
             end
 

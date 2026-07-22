@@ -176,6 +176,62 @@ end
         @test count(e -> String(e["event"]) == "shutdown", events) == 1
     end
 
+    @testset "missing --data file exits 3 (I/O contract)" begin
+        r = _e2e_capture(() ->
+            CLI.main(["stream", "--data", "/no/such/file.log",
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0", "--quiet",
+                      "--log-level", "error"]))
+        @test r.code == 3
+    end
+
+    @testset "missing --model bundle exits 3" begin
+        data_path = _write_lines(["x"])
+        r = _e2e_stdin(data_path, () -> _e2e_capture(() ->
+            CLI.main(["stream", "--model", "/no/such/model.jld2",
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0", "--quiet",
+                      "--log-level", "error"])))
+        @test r.code == 3
+    end
+
+    @testset "shutdown event carries reason=eof on clean stdin EOF" begin
+        rules_path = _write_json(Dict("version" => 1, "rules" => []))
+        data_path = _write_lines(["a", "b"])
+        r = _e2e_stdin(data_path, () -> _e2e_capture(() ->
+            CLI.main(["stream", "--rules", rules_path,
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0", "--quiet",
+                      "--log-level", "error"])))
+        events = [JSON3.read(l) for l in filter(!isempty, split(r.out, '\n'))]
+        sd = only(filter(e -> String(e["event"]) == "shutdown", events))
+        @test String(sd["reason"]) == "eof"
+    end
+
+    @testset "--webhook synthesises an all-severity route" begin
+        # A route-less rules file with a single warn keyword rule: the
+        # webhook must still receive it because --webhook adds a
+        # catch-all route. We assert on the trigger's `sinks` since a
+        # live HTTP endpoint isn't available in-test.
+        rules_path = _write_json(Dict(
+            "version" => 1,
+            "defaults" => Dict("warmup_required" => false, "cooldown_s" => 0),
+            "rules" => [Dict("id" => "warnkw", "kind" => "keyword",
+                              "field" => "line", "keywords" => ["WARN"],
+                              "severity" => "warn")]))
+        data_path = _write_lines(["WARN something"])
+        r = _e2e_stdin(data_path, () -> _e2e_capture(() ->
+            CLI.main(["stream", "--rules", rules_path,
+                      "--webhook", "http://127.0.0.1:59999/hook",
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0", "--quiet",
+                      "--shutdown-timeout", "1",
+                      "--log-level", "error"])))
+        events = [JSON3.read(l) for l in filter(!isempty, split(r.out, '\n'))]
+        trig = only(filter(e -> String(e["event"]) == "trigger", events))
+        @test "webhook:cli" in [String(s) for s in trig["sinks"]]
+    end
+
 end
 
 @testset "classify --json / score --json — aliases for --format json" begin

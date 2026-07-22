@@ -134,6 +134,32 @@ StructuredLog.set_format!(:json; stream = _LOG_SINK)
         end
     end
 
+    @testset "tail_file!: rotation drains complete lines written just before rename" begin
+        mktempdir() do dir
+            path = joinpath(dir, "log.txt")
+            open(path, "w") do io; write(io, "a1\n"); end
+            ch    = Channel{LineEvent}(64)
+            stop  = StopSignal()
+            stats = TailStats()
+            t = @async tail_file!(path, ch; from_start = true,
+                                  stop = stop, stats = stats,
+                                  poll_seconds = 0.05)
+            sleep(0.15)
+            # Append several COMPLETE lines, then immediately rotate —
+            # these must not be lost when the old fd is closed.
+            open(path, "a") do io; write(io, "a2\na3\na4\n"); end
+            mv(path, path * ".1"; force = true)
+            open(path, "w") do io; write(io, "b1\n"); end
+            sleep(0.3)
+            stop!(stop)
+            wait(t)
+            close(ch)
+            got = [e.line for e in _drain(ch)]
+            # The pre-rotation tail (a2,a3,a4) survives the rename.
+            @test ["a1", "a2", "a3", "a4", "b1"] ⊆ got
+        end
+    end
+
     @testset "tail_file!: truncation triggers re-open" begin
         mktempdir() do dir
             path = joinpath(dir, "log.txt")

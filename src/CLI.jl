@@ -1390,6 +1390,27 @@ function cmd_stream(args::Vector{String})::Int
     framed_mode in (:raw, :auto) ||
         throw(ArgumentError("--framed must be raw | auto, got `$(opts["framed"])`"))
 
+    # Pre-validate input files so a missing bundle / source / rules
+    # file exits with the documented I/O code (3) up front, rather
+    # than surfacing as an opaque ArgumentError → 2 deep in the loop.
+    for (flag, label) in (("model", "model bundle"),
+                          ("detector", "detector bundle"),
+                          ("rules", "rules file"),
+                          ("use-patterns", "patterns db"))
+        p = String(opts[flag])
+        if !isempty(p) && !isfile(p)
+            StructuredLog.error_event("input not found";
+                                      flag = "--$flag", path = p)
+            return 3
+        end
+    end
+    src = String(opts["data"])
+    if !isempty(src) && src != "-" && !isfile(src)
+        StructuredLog.error_event("input not found";
+                                  flag = "--data", path = src)
+        return 3
+    end
+
     # Load rules; override with --webhook if supplied (synthesises a
     # `webhook:cli` sink + an all-severity route).
     rs = if isempty(opts["rules"])
@@ -1432,6 +1453,13 @@ function cmd_stream(args::Vector{String})::Int
         try
             warm = Memory.WarmStore.open_warm(String(opts["memory-warm"]);
                 rules_fingerprint = ns)
+            if opts["memory-warm-flush-on-boot"]
+                for r in rs.rules
+                    r isa Rules.NovelClusterRule || r isa Rules.NovelTokenRule || continue
+                    Memory.WarmStore.flush_rule!(warm, r.id)
+                end
+                StructuredLog.info("warm store flushed on boot"; namespace = ns)
+            end
             Rules.attach_warm_store!(rs, warm)
             StructuredLog.info("warm store attached";
                                url = String(opts["memory-warm"]),
@@ -1478,11 +1506,16 @@ function cmd_stream(args::Vector{String})::Int
 
     # Optional webhook sink injected at runtime from --webhook (the
     # rules JSON's existing webhook sinks still apply alongside).
+    # Synthesise an all-severity route to the `webhook:cli` sink so
+    # every fired rule — not just crit ones already routed in the
+    # rules file — reaches the CLI webhook.
     webhook_sink = _maybe_build_webhook_sink(opts)
     webhook_ch::Union{Nothing, Channel{Dict{String, Any}}} = nothing
     webhook_task::Union{Nothing, Task} = nothing
     webhook_stop::Union{Nothing, Ref{Bool}} = nothing
     if webhook_sink !== nothing
+        push!(rs.routes, Rules.Route(Set{Symbol}(), Set{String}(),
+                                     ["webhook:cli"]))
         webhook_ch, webhook_task, webhook_stop =
             SinksWebhook.start_webhook_task(webhook_sink; capacity = 1024)
     end
@@ -1499,6 +1532,8 @@ function cmd_stream(args::Vector{String})::Int
     by_rule = Dict{String, Int}()
     lines_processed = 0
     mem_writes_dropped = 0
+    producer_failed = false
+    drain_last_fired = Dict{String, Float64}()   # sidecar cooldown clock
     max_events = Int(opts["max-events"])
     status_interval = Float64(opts["status-interval"])
     exit_on_trigger = opts["exit-on-trigger"]
@@ -1510,6 +1545,15 @@ function cmd_stream(args::Vector{String})::Int
                        source = isempty(opts["data"]) || opts["data"] == "-" ? "stdin" : opts["data"],
                        tail = opts["tail"])
 
+    # SIGINT (which the systemd unit / Docker STOPSIGNAL send on stop)
+    # raises InterruptException into this task instead of hard-killing
+    # the process, so the finally block can drain channels + finalize
+    # the session. There is no getter to restore the prior setting;
+    # leaving it disabled is the intended long-running-daemon
+    # behaviour and is harmless for in-process (test) callers.
+    Base.exit_on_sigint(false)
+    shutdown_reason = "eof"
+
     try
         for ev in ch
             lines_processed += 1
@@ -1519,10 +1563,20 @@ function cmd_stream(args::Vector{String})::Int
             # rule engine because the engine has no DrainTemplateRule
             # kind. Match them directly and synthesise TriggerEvent
             # rows so the downstream emit/persist paths see them.
+            # Honour each pattern's cooldown_s (per-pattern last-fired
+            # clock in `drain_last_fired`) and route by severity/rule_id
+            # so a crit drain pattern reaches webhooks — a hot template
+            # would otherwise flood one alert per matching line.
+            now_t = time()
             for p in drain_pinned
                 Memory.PatternCatalog.match_line(p, ir) || continue
+                rid = "pattern:$(p.id):$(p.name)"
+                if (now_t - get(drain_last_fired, rid, -Inf)) < p.cooldown_s
+                    continue
+                end
+                drain_last_fired[rid] = now_t
                 push!(triggers, Rules.TriggerEvent(
-                    "pattern:$(p.id):$(p.name)",
+                    rid,
                     :drain_pattern,
                     p.severity,
                     Int(get(ir, "line_id", ev.line_id)),
@@ -1533,7 +1587,7 @@ function cmd_stream(args::Vector{String})::Int
                         "cluster_id" => get(get(ir, "drain", Dict{String,Any}()),
                                              "cluster_id", nothing),
                     ),
-                    ["stdout"],
+                    Rules.route_sinks_for(rs; severity = p.severity, rule_id = rid),
                     Dates.now(Dates.UTC),
                 ))
             end
@@ -1558,6 +1612,15 @@ function cmd_stream(args::Vector{String})::Int
                 for t in triggers
                     _enqueue_trigger_write(mem_ch, mem_session_id, t, ir) ||
                         (mem_writes_dropped += 1)
+                    # Triggers originating from a pinned pattern (synthesised
+                    # rule or drain sidecar) also record a pattern_matches
+                    # row so `insights --pinned` / report reflect activity.
+                    pid = _pattern_id_from_rule(t.rule_id)
+                    if pid !== nothing
+                        _enqueue_pattern_match_write(mem_ch, mem_session_id,
+                                                     pid, t) ||
+                            (mem_writes_dropped += 1)
+                    end
                 end
                 if persist_lines_mode === :all ||
                    (persist_lines_mode === :sampled &&
@@ -1577,9 +1640,17 @@ function cmd_stream(args::Vector{String})::Int
                 last_status = time()
             end
             if max_events > 0 && lines_processed >= max_events
+                shutdown_reason = "max_events"
                 Stream.stop!(stop_signal)
                 break
             end
+        end
+    catch e
+        if e isa InterruptException
+            shutdown_reason = "signal"
+            StructuredLog.info("shutdown signal received")
+        else
+            rethrow()
         end
     finally
         Stream.stop!(stop_signal)
@@ -1588,6 +1659,14 @@ function cmd_stream(args::Vector{String})::Int
             timedwait(() -> istaskdone(producer),
                       Float64(opts["shutdown-timeout"]))
         catch
+        end
+        # A producer that died on an I/O error (source removed mid-run,
+        # permission loss) → documented exit 3, not a silent clean exit.
+        if istaskdone(producer) && istaskfailed(producer)
+            producer_failed = true
+            err = try; producer.result; catch e; e; end
+            StructuredLog.error_event("input source failed";
+                                      error = sprint(showerror, err))
         end
         if webhook_ch !== nothing
             # Close (no stop flag) so the worker drains queued alerts,
@@ -1624,9 +1703,16 @@ function cmd_stream(args::Vector{String})::Int
                     flush_errors = mem_stats === nothing ? 0 : mem_stats.flush_errors)
             end
         end
-        _emit_shutdown(triggers_total)
+        _emit_shutdown(triggers_total, shutdown_reason)
     end
 
+    # Exit-code contract (docs/json-schema.md):
+    #   130 killed by signal during shutdown
+    #   3   I/O error (source failed)
+    #   1   at least one rule fired (only with --exit-on-trigger)
+    #   0   clean
+    shutdown_reason == "signal" && return 130
+    producer_failed && return 3
     return (exit_on_trigger && triggers_total > 0) ? 1 : 0
 end
 
@@ -1723,6 +1809,27 @@ function _enqueue_line_write(ch, session_id::Int, ev, ir::AbstractDict)
         :model_signals     => sig,
     )
     return Memory.SQLite.try_put!(ch, Memory.SQLite.WriteLine(payload))
+end
+
+# Rule ids for pattern-origin triggers are "pattern:<id>:<name>".
+# Names may contain ':' so we parse only the numeric second field.
+function _pattern_id_from_rule(rule_id::AbstractString)
+    startswith(rule_id, "pattern:") || return nothing
+    rest = SubString(rule_id, ncodeunits("pattern:") + 1)
+    colon = findfirst(':', rest)
+    idstr = colon === nothing ? rest : SubString(rest, 1, colon - 1)
+    return tryparse(Int, idstr)
+end
+
+function _enqueue_pattern_match_write(ch, session_id::Int, pattern_id::Int, t)
+    payload = Dict{Symbol, Any}(
+        :session_id => session_id,
+        :pattern_id => pattern_id,
+        :line_id    => t.line_id,
+        :ts         => t.ts,
+        :evidence   => t.fields,
+    )
+    return Memory.SQLite.try_put!(ch, Memory.SQLite.WritePatternMatch(payload))
 end
 
 # Extract the "model signals" slice of an InferResult: every key
@@ -1911,11 +2018,11 @@ function _emit_status(started_at, lines_processed, triggers_total,
     flush(stdout)
 end
 
-function _emit_shutdown(triggers_total)
+function _emit_shutdown(triggers_total, reason::AbstractString = "eof")
     rec = Dict{String, Any}(
         "event"     => "shutdown",
         "ts"        => _iso_now(),
-        "reason"    => "eof",
+        "reason"    => reason,
         "triggers_total" => triggers_total,
     )
     try

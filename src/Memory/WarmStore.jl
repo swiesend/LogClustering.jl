@@ -33,7 +33,7 @@ using Sockets
 
 export WarmStore, InProcWarmStore, RedisWarmStore,
        open_warm, namespace_for,
-       seen_member, add_member!, load_set, healthy
+       seen_member, add_member!, load_set, healthy, flush_rule!
 
 abstract type WarmStore end
 
@@ -151,6 +151,19 @@ end
 
 @inline _set_key(s::RedisWarmStore, rule_id) =
     "$(s.namespace):set:$rule_id"
+
+"""
+    flush_rule!(s, rule_id)
+
+Delete the stored set for `rule_id` (the `--memory-warm-flush-on-boot`
+reset). No-op for [`InProcWarmStore`].
+"""
+flush_rule!(::InProcWarmStore, _rule_id) = nothing
+
+function flush_rule!(s::RedisWarmStore, rule_id::AbstractString)
+    RedisClient.del!(s.client, _set_key(s, rule_id))
+    return nothing
+end
 
 # Plug WarmStore subtypes into the rules engine's warm-store hooks.
 Rules._warm_load_set(s::WarmStore, rule_id) =
