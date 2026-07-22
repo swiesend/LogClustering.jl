@@ -1454,6 +1454,7 @@ function cmd_stream(args::Vector{String})::Int
     mem_ch = nothing
     mem_task = nothing
     mem_stop = nothing
+    mem_stats = nothing
     mem_session_id = 0
     if !isempty(opts["memory"])
         mem_db = Memory.SQLite.open_db(String(opts["memory"]))
@@ -1470,7 +1471,7 @@ function cmd_stream(args::Vector{String})::Int
                 "warmup_seconds"  => Float64(opts["warmup-seconds"]),
                 "persist_lines"   => String(opts["persist-lines"]),
             ))
-        mem_ch, mem_task, mem_stop = Memory.SQLite.spawn_writer(mem_db;
+        mem_ch, mem_task, mem_stop, mem_stats = Memory.SQLite.spawn_writer(mem_db;
             batch = 100, flush_ms = 250)
     end
 
@@ -1496,6 +1497,7 @@ function cmd_stream(args::Vector{String})::Int
     triggers_total = 0
     by_rule = Dict{String, Int}()
     lines_processed = 0
+    mem_writes_dropped = 0
     max_events = Int(opts["max-events"])
     status_interval = Float64(opts["status-interval"])
     exit_on_trigger = opts["exit-on-trigger"]
@@ -1549,15 +1551,18 @@ function cmd_stream(args::Vector{String})::Int
                     end
                 end
             end
-            # Persist triggers + optionally the line itself.
+            # Persist triggers + optionally the line itself. Drops on a
+            # full writer channel are counted, never blocking.
             if mem_ch !== nothing
                 for t in triggers
-                    _enqueue_trigger_write(mem_ch, mem_session_id, t, ir)
+                    _enqueue_trigger_write(mem_ch, mem_session_id, t, ir) ||
+                        (mem_writes_dropped += 1)
                 end
                 if persist_lines_mode === :all ||
                    (persist_lines_mode === :sampled &&
-                    (lines_processed % persist_lines_rate) == 1)
-                    _enqueue_line_write(mem_ch, mem_session_id, ev, ir)
+                    (lines_processed - 1) % persist_lines_rate == 0)
+                    _enqueue_line_write(mem_ch, mem_session_id, ev, ir) ||
+                        (mem_writes_dropped += 1)
                 end
             end
             for t in triggers
@@ -1605,6 +1610,13 @@ function cmd_stream(args::Vector{String})::Int
                     exit_code = (exit_on_trigger && triggers_total > 0) ? 1 : 0)
             catch
             end
+            if mem_writes_dropped > 0 ||
+               (mem_stats !== nothing && mem_stats.dropped_ops > 0)
+                StructuredLog.warn("memory writes incomplete";
+                    dropped_enqueue = mem_writes_dropped,
+                    dropped_ops = mem_stats === nothing ? 0 : mem_stats.dropped_ops,
+                    flush_errors = mem_stats === nothing ? 0 : mem_stats.flush_errors)
+            end
         end
         _emit_shutdown(triggers_total)
     end
@@ -1627,8 +1639,10 @@ function _rules_fingerprint(opts)
 end
 
 # Build the WriteTrigger payload from a Rules.TriggerEvent + the
-# InferResult dict and push it onto the writer channel. Best-effort
-# — a closed channel during shutdown is swallowed.
+# InferResult dict and push it onto the writer channel. Non-blocking:
+# a full or closed channel drops the write (counted by the caller via
+# the returned Bool) rather than stalling the inference loop —
+# stdout remains the durable sink.
 function _enqueue_trigger_write(ch, session_id::Int, t, ir::AbstractDict)
     frame  = get(ir, "frame", nothing)
     drain  = get(ir, "drain", nothing)
@@ -1647,10 +1661,7 @@ function _enqueue_trigger_write(ch, session_id::Int, t, ir::AbstractDict)
         :drain_cluster_id  => dcid,
         :model_signals     => sig,
     )
-    try
-        put!(ch, Memory.SQLite.WriteTrigger(payload))
-    catch
-    end
+    return Memory.SQLite.try_put!(ch, Memory.SQLite.WriteTrigger(payload))
 end
 
 function _enqueue_line_write(ch, session_id::Int, ev, ir::AbstractDict)
@@ -1665,10 +1676,7 @@ function _enqueue_line_write(ch, session_id::Int, ev, ir::AbstractDict)
         :drain_cluster_id  => dcid,
         :model_signals     => sig,
     )
-    try
-        put!(ch, Memory.SQLite.WriteLine(payload))
-    catch
-    end
+    return Memory.SQLite.try_put!(ch, Memory.SQLite.WriteLine(payload))
 end
 
 # Extract the "model signals" slice of an InferResult: every key

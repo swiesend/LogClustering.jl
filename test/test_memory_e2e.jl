@@ -119,6 +119,46 @@ end
         @test Int(line_rows[1].n) == 4
     end
 
+    @testset "two --persist-lines sessions against one DB don't collide" begin
+        rules_path = _write_rules(Dict("version" => 1, "rules" => []))
+        db_path = tempname() * ".sqlite"
+        for run in 1:2
+            data_path = _write_lines(["run$run line $i" for i in 1:5])
+            r = _e2e_stdin(data_path, () -> _e2e_capture(() ->
+                CLI.main(["stream", "--rules", rules_path,
+                          "--memory", db_path,
+                          "--persist-lines", "all",
+                          "--warmup-lines", "0", "--warmup-seconds", "0",
+                          "--status-interval", "0",
+                          "--quiet", "--log-level", "error"])))
+            @test r.code == 0
+        end
+        db = open_db(db_path; create = false)
+        rows = LogClustering.Memory.SQLite._rows(db,
+            "SELECT COUNT(*) AS n FROM lines")
+        # Both sessions' 5 lines each — the pre-v2 PK collision would
+        # have dropped the whole second batch (and killed the writer).
+        @test Int(rows[1].n) == 10
+    end
+
+    @testset "--persist-lines-rate 1 keeps every line" begin
+        rules_path = _write_rules(Dict("version" => 1, "rules" => []))
+        data_path = _write_lines(["l$i" for i in 1:7])
+        db_path = tempname() * ".sqlite"
+        _e2e_stdin(data_path, () -> _e2e_capture(() ->
+            CLI.main(["stream", "--rules", rules_path,
+                      "--memory", db_path,
+                      "--persist-lines", "sampled",
+                      "--persist-lines-rate", "1",
+                      "--warmup-lines", "0", "--warmup-seconds", "0",
+                      "--status-interval", "0",
+                      "--quiet", "--log-level", "error"])))
+        db = open_db(db_path; create = false)
+        rows = LogClustering.Memory.SQLite._rows(db,
+            "SELECT COUNT(*) AS n FROM lines")
+        @test Int(rows[1].n) == 7
+    end
+
     @testset "--memory survives no triggers (empty triggers table)" begin
         rules_path = _write_rules(Dict("version" => 1, "rules" => []))
         data_path = _write_lines(["a", "b", "c"])

@@ -25,16 +25,24 @@ using Dates: Dates, DateTime, now, UTC
 
 export set_level!, set_format!, log_event, info, warn, error_event, debug
 
-const _LEVELS = (:debug => 10, :info => 20, :warn => 30, :error => 40)
+const _LEVEL_MAP = Dict{Symbol, Int}(
+    :debug => 10, :info => 20, :warn => 30, :error => 40)
 
-const _STATE = Ref{NamedTuple{(:level, :format, :stream), Tuple{Int, Symbol, IO}}}(
-    (level = 20, format = :json, stream = Base.stderr))
+# `stream === nothing` means "resolve `Base.stderr` at call time".
+# Never store `Base.stderr` here at module scope: the handle captured
+# during precompilation is stale in every fresh process, and a logger
+# that throws on its default configuration poisons every caller's
+# error path.
+const _STATE = Ref{NamedTuple{(:level, :format, :stream),
+                              Tuple{Int, Symbol, Union{IO, Nothing}}}}(
+    (level = 20, format = :json, stream = nothing))
 const _LOCK = ReentrantLock()
 
-_level_int(s::Symbol) = something(findfirst(p -> p[1] === s, _LEVELS),
-                                   nothing) === nothing ?
-    error("unknown log level: $s") :
-    _LEVELS[findfirst(p -> p[1] === s, _LEVELS)][2]
+function _level_int(s::Symbol)
+    v = get(_LEVEL_MAP, s, nothing)
+    v === nothing && error("unknown log level: $s (use debug|info|warn|error)")
+    return v
+end
 
 """
     set_level!(level::Symbol)
@@ -50,13 +58,15 @@ function set_level!(level::Symbol)
 end
 
 """
-    set_format!(fmt::Symbol; stream::IO = Base.stderr)
+    set_format!(fmt::Symbol; stream::Union{IO, Nothing} = nothing)
 
 Switch the wire format. `:json` (default) emits one JSON object per
 line; `:text` falls back to a human-readable `LEVEL ts msg key=value`
-form for development use.
+form for development use. `stream = nothing` (the default) writes to
+the *current* `Base.stderr`, resolved on every call — pass an
+explicit `IO` to capture output (tests do this).
 """
-function set_format!(fmt::Symbol; stream::IO = Base.stderr)
+function set_format!(fmt::Symbol; stream::Union{IO, Nothing} = nothing)
     fmt in (:json, :text) || error("unknown log format: $fmt")
     lock(_LOCK) do
         _STATE[] = (level = _STATE[].level, format = fmt, stream = stream)
@@ -69,15 +79,18 @@ _iso_now() = string(Dates.format(now(UTC), Dates.dateformat"yyyy-mm-ddTHH:MM:SS.
 _redact_key(k::AbstractString) =
     occursin(r"(?i)(authorization|token|secret|api[_-]?key|password|cookie)", k)
 
-"Replace sensitive header / kwarg values with `***`. Operates on the
-dict in place (a fresh dict is built by the caller)."
+"Replace sensitive header / kwarg values with `***`. The top-level
+dict is mutated in place (it is always freshly built by `log_event`),
+but nested dicts are **copied** before redaction so a caller's live
+dict — e.g. an HTTP headers map about to be sent — is never
+destroyed by logging it."
 function _redact!(d::AbstractDict)
     for (k, v) in d
         ks = String(string(k))
         if _redact_key(ks)
             d[k] = "***"
         elseif v isa AbstractDict
-            _redact!(v)
+            d[k] = _redact!(Dict{Any, Any}(pairs(v)))
         end
     end
     return d
@@ -94,6 +107,7 @@ JSON fields after the fixed `level` / `ts` / `msg` triple. Returns
 function log_event(level::Symbol, msg::AbstractString; kwargs...)
     state = _STATE[]
     _level_int(level) < state.level && return nothing
+    io = state.stream === nothing ? Base.stderr : state.stream
 
     if state.format === :json
         d = Dict{String, Any}(
@@ -106,10 +120,7 @@ function log_event(level::Symbol, msg::AbstractString; kwargs...)
         end
         _redact!(d)
         body = JSON3.write(d)
-        lock(_LOCK) do
-            println(state.stream, body)
-            flush(state.stream)
-        end
+        _write_line(io, body)
     else
         kv = IOBuffer()
         for (k, v) in kwargs
@@ -117,11 +128,21 @@ function log_event(level::Symbol, msg::AbstractString; kwargs...)
             vs = _redact_key(ks) ? "***" : string(v)
             print(kv, " ", ks, "=", vs)
         end
+        _write_line(io, string(uppercase(String(level)), " ", _iso_now(),
+                               " ", msg, String(take!(kv))))
+    end
+    return nothing
+end
+
+# Logging must never throw into a caller's error path — a broken or
+# redirected-away stream drops the line instead of propagating.
+function _write_line(io::IO, body::AbstractString)
+    try
         lock(_LOCK) do
-            println(state.stream, uppercase(String(level)), " ", _iso_now(),
-                    " ", msg, String(take!(kv)))
-            flush(state.stream)
+            println(io, body)
+            flush(io)
         end
+    catch
     end
     return nothing
 end

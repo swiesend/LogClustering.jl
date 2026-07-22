@@ -21,7 +21,7 @@ using SQLite: SQLite, DB
 @inline _exec!(db::DB, sql::AbstractString, params) =
     (foreach(identity, SQLite.DBInterface.execute(db, sql, params)); nothing)
 
-const HEAD = 1
+const HEAD = 2
 
 """
     MIGRATIONS
@@ -123,6 +123,37 @@ const MIGRATIONS = [
 
     CREATE INDEX idx_annot_target ON annotations(target_kind, target_id);
     """),
+
+    # v2 — `lines.line_id` was the table PRIMARY KEY, but line ids
+    # restart at 1 every stream run, so the second `--persist-lines`
+    # session collided on the very first insert. Recreate with a
+    # surrogate rowid PK and a (session_id, line_id) lookup index.
+    (2, raw"""
+    ALTER TABLE lines RENAME TO lines_v1;
+
+    CREATE TABLE lines (
+        id                 INTEGER PRIMARY KEY,
+        line_id            INTEGER NOT NULL,
+        session_id         INTEGER REFERENCES sessions(id),
+        ts                 TEXT    NOT NULL,
+        ts_epoch_ms        INTEGER NOT NULL,
+        line               TEXT    NOT NULL,
+        drain_cluster_id   INTEGER,
+        model_signals_json TEXT
+    );
+
+    INSERT INTO lines (line_id, session_id, ts, ts_epoch_ms, line,
+                       drain_cluster_id, model_signals_json)
+        SELECT line_id, session_id, ts, ts_epoch_ms, line,
+               drain_cluster_id, model_signals_json
+        FROM lines_v1;
+
+    DROP TABLE lines_v1;
+
+    CREATE INDEX idx_lines_ts           ON lines(ts_epoch_ms);
+    CREATE INDEX idx_lines_cluster      ON lines(drain_cluster_id, ts_epoch_ms);
+    CREATE INDEX idx_lines_session_line ON lines(session_id, line_id);
+    """),
 ]
 
 """
@@ -162,6 +193,13 @@ single transaction. Bumps `schema_version` after each. Idempotent.
 """
 function apply_migrations!(db::DB)
     cur = current_version(db)
+    cur >= last(MIGRATIONS)[1] && return cur
+    # DDL (ALTER/DROP TABLE) fails with "table is locked" while any
+    # prepared statement referencing the table is still un-finalized —
+    # SQLite.jl keeps GC-managed Stmt handles alive indefinitely.
+    # Finalize everything first; migrations run at boot, when no other
+    # statement is legitimately in flight on this connection.
+    SQLite.finalize_statements!(db)
     # Use explicit BEGIN/COMMIT so DDL + the version bookkeeping land
     # atomically; SQLite.transaction has flaky semantics around DDL.
     SQLite.execute(db, "BEGIN")

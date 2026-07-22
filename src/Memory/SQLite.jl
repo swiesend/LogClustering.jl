@@ -27,6 +27,7 @@ module SQLiteStore
 
 using SQLite: SQLite, DB
 using ..Schema: Schema
+using ...StructuredLog: StructuredLog
 using JSON3
 using Dates: Dates, DateTime, UTC, now, datetime2unix
 
@@ -47,7 +48,8 @@ function _rows(db::DB, sql::AbstractString, params = ())
     return out
 end
 
-export open_db, migrate!, schema_version, spawn_writer,
+export open_db, migrate!, schema_version, spawn_writer, try_put!,
+       WriterStats,
        insert_session!, finalize_session!, insert_trigger!,
        insert_line!, insert_pattern_match!,
        triggers, top_rules, novel_clusters, cluster_timeline,
@@ -249,33 +251,73 @@ struct WriteLine           <: WriteOp; payload::Dict{Symbol, Any} end
 struct WritePatternMatch   <: WriteOp; payload::Dict{Symbol, Any} end
 
 """
+    WriterStats
+
+Mutable counters mirrored into the streaming status heartbeat.
+`dropped_ops` counts individual write ops that failed inside a
+batch (e.g. a constraint violation) — the failing op is discarded,
+the rest of the batch still commits, and the writer stays alive.
+"""
+Base.@kwdef mutable struct WriterStats
+    flushed_total::Int = 0
+    dropped_ops::Int   = 0
+    flush_errors::Int  = 0
+end
+
+"""
     spawn_writer(db; batch = 100, flush_ms = 250, capacity = 4096)
-        -> (channel, task, stop_ref)
+        -> (channel, task, stop_ref, stats)
 
 Spawn an async task that drains `channel` and bulk-inserts the
 batch inside a single `BEGIN IMMEDIATE … COMMIT` block. The producer
 calls `put!(channel, WriteTrigger(...))` etc.; the writer flushes
 when either `batch` ops are queued or `flush_ms` ms have elapsed.
 
-Setting `stop_ref[]` to `true` *and* closing the channel signals
-clean shutdown: the writer drains, commits, and exits.
+Failure containment: each op is applied inside its own try/catch,
+so one bad row (constraint violation, malformed payload) is dropped
+and counted on `stats.dropped_ops` while the rest of the batch
+commits. No exception can kill the writer task.
+
+Clean shutdown: set `stop_ref[] = true` and `close(channel)`; the
+writer drains, commits, and exits. Closing the channel alone also
+terminates the loop once drained (no busy spin).
 """
 function spawn_writer(db::DB; batch::Int = 100, flush_ms::Int = 250,
                       capacity::Int = 4096)
     ch = Channel{WriteOp}(capacity)
     stop = Ref(false)
-    task = @async _writer_loop(db, ch, batch, flush_ms, stop)
-    return (ch, task, stop)
+    stats = WriterStats()
+    task = @async _writer_loop(db, ch, batch, flush_ms, stop, stats)
+    return (ch, task, stop, stats)
+end
+
+"""
+    try_put!(ch::Channel, op) -> Bool
+
+Non-blocking put for a **single-producer** channel: returns `false`
+instead of blocking when the channel is full, and `false` (instead
+of throwing) when it is closed. The capacity check is check-then-act,
+which is only race-free because exactly one task produces onto the
+writer channel — do not share the producing side across tasks.
+"""
+function try_put!(ch::Channel, op)
+    isopen(ch) || return false
+    Base.n_avail(ch) >= ch.sz_max && return false
+    try
+        put!(ch, op)
+        return true
+    catch
+        return false
+    end
 end
 
 function _writer_loop(db::DB, ch::Channel{WriteOp}, batch::Int,
-                      flush_ms::Int, stop::Ref{Bool})
+                      flush_ms::Int, stop::Ref{Bool}, stats::WriterStats)
     pending = WriteOp[]
     last_flush = time()
     try
-        while !stop[] || isready(ch) || !isempty(pending)
-            timeout = max(0.001, flush_ms / 1000)
-            op = _try_take!(ch, timeout)
+        while true
+            op = _try_take!(ch, max(0.001, flush_ms / 1000))
             if op !== nothing
                 push!(pending, op)
             end
@@ -285,18 +327,25 @@ function _writer_loop(db::DB, ch::Channel{WriteOp}, batch::Int,
                 op === nothing
             )
             if should_flush
-                _flush_batch!(db, pending)
+                _flush_batch!(db, pending, stats)
                 empty!(pending)
                 last_flush = time()
             end
-            stop[] && !isready(ch) && isempty(pending) && break
+            # Exit when: told to stop and drained, or channel closed
+            # and drained. The closed-and-drained arm prevents the
+            # zero-sleep spin a bare `close(ch)` used to cause.
+            drained = !isready(ch) && isempty(pending)
+            (stop[] || !isopen(ch)) && drained && break
         end
     catch e
-        @debug "writer loop exited" exception=(e, catch_backtrace())
+        # Should be unreachable — _flush_batch! contains its errors —
+        # but never let the writer die silently if it happens.
+        StructuredLog.error_event("memory writer crashed";
+                                   error = sprint(showerror, e))
     finally
         if !isempty(pending)
             try
-                _flush_batch!(db, pending)
+                _flush_batch!(db, pending, stats)
             catch
             end
         end
@@ -310,16 +359,38 @@ function _try_take!(ch::Channel, timeout::Float64)
         sleep(0.005)
     end
     isready(ch) && return take!(ch)
-    !isopen(ch) && isready(ch) && return take!(ch)
     return nothing
 end
 
-function _flush_batch!(db::DB, ops::Vector{WriteOp})
+function _flush_batch!(db::DB, ops::Vector{WriteOp}, stats::WriterStats)
     isempty(ops) && return
-    SQLite.transaction(db) do
-        for op in ops
-            _apply_op!(db, op)
+    try
+        SQLite.transaction(db) do
+            for op in ops
+                try
+                    _apply_op!(db, op)
+                catch e
+                    # Drop the failing op, keep the batch. Constraint
+                    # violations land here; the transaction survives
+                    # because the statement-level error doesn't abort
+                    # SQLite's enclosing transaction.
+                    stats.dropped_ops += 1
+                    StructuredLog.error_event("memory write dropped";
+                        op = string(typeof(op)),
+                        error = sprint(showerror, e))
+                end
+            end
         end
+        stats.flushed_total += length(ops)
+    catch e
+        # Transaction-level failure (disk full, db locked beyond
+        # busy timeout). Count and drop the batch — durability is
+        # best-effort; stdout remains the primary sink.
+        stats.flush_errors += 1
+        stats.dropped_ops += length(ops)
+        StructuredLog.error_event("memory batch flush failed";
+            n_ops = length(ops),
+            error = sprint(showerror, e))
     end
 end
 

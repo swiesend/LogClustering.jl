@@ -9,10 +9,15 @@ using LogClustering.Memory.SQLite: open_db, migrate!, schema_version,
                                     cluster_timeline, cluster_id_sequence,
                                     WriteTrigger, WriteLine,
                                     WritePatternMatch
-using LogClustering.Memory.SQLite: epoch_ms_since
-using LogClustering.Memory.Schema: HEAD
+using LogClustering.Memory.SQLite: epoch_ms_since, try_put!, WriterStats
+using LogClustering.Memory.Schema: HEAD, MIGRATIONS
 using SQLite: SQLite
 using Dates: Dates, DateTime, now, UTC
+using LogClustering.StructuredLog
+
+# Park logger output (the poison-op test emits an expected error line).
+const _SQLITE_TEST_LOG = IOBuffer()
+StructuredLog.set_format!(:json; stream = _SQLITE_TEST_LOG)
 
 @testset "Memory.SQLite" begin
 
@@ -92,6 +97,100 @@ using Dates: Dates, DateTime, now, UTC
             # 5 unique rule_ids x 2 severities (some rules have both warn + crit)
             # so we just assert we have at least 5 distinct rule_ids.
             @test length(unique(String(r.rule_id) for r in top)) == 5
+        end
+    end
+
+    @testset "writer survives a poison op — batch commits, task lives" begin
+        mktempdir() do dir
+            db = open_db(joinpath(dir, "t.sqlite"))
+            migrate!(db)
+            sid = insert_session!(db; host = "h")
+
+            good(i) = WriteTrigger(Dict{Symbol, Any}(
+                :session_id => sid, :rule_id => "ok", :rule_kind => "keyword",
+                :severity => "warn", :line_id => i, :line => "L$i",
+                :fields => Dict()))
+            # Poison: missing required payload keys → insert_trigger!
+            # throws inside the batch.
+            poison = WriteTrigger(Dict{Symbol, Any}(:session_id => sid))
+
+            ch, task, stop, stats = spawn_writer(db; batch = 10, flush_ms = 20)
+            put!(ch, good(1))
+            put!(ch, poison)
+            put!(ch, good(2))
+            stop[] = true
+            close(ch)
+            @test timedwait(() -> istaskdone(task), 5.0) === :ok
+            # Both good ops landed despite the poison in between.
+            rows = triggers(db; limit = 10)
+            @test length(rows) == 2
+            @test stats.dropped_ops == 1
+        end
+    end
+
+    @testset "writer terminates on bare close(ch) without stop[] (no spin)" begin
+        mktempdir() do dir
+            db = open_db(joinpath(dir, "t.sqlite"))
+            migrate!(db)
+            sid = insert_session!(db; host = "h")
+            ch, task, stop, _ = spawn_writer(db; batch = 10, flush_ms = 20)
+            put!(ch, WriteTrigger(Dict{Symbol, Any}(
+                :session_id => sid, :rule_id => "x", :rule_kind => "keyword",
+                :severity => "warn", :line_id => 1, :line => "L",
+                :fields => Dict())))
+            close(ch)   # note: stop[] never set
+            @test timedwait(() -> istaskdone(task), 5.0) === :ok
+            @test length(triggers(db; limit = 10)) == 1
+        end
+    end
+
+    @testset "try_put! drops on full / closed instead of blocking" begin
+        ch = Channel{Int}(2)
+        @test try_put!(ch, 1)
+        @test try_put!(ch, 2)
+        @test !try_put!(ch, 3)          # full → false, no block
+        take!(ch)
+        @test try_put!(ch, 3)           # space again
+        close(ch)
+        @test !try_put!(ch, 4)          # closed → false, no throw
+    end
+
+    @testset "v1 → v2 migration recreates lines and keeps data" begin
+        mktempdir() do dir
+            path = joinpath(dir, "t.sqlite")
+            db = open_db(path)
+            # Hand-build a v1 database: replay only the v1 migration.
+            SQLite.execute(db, "BEGIN")
+            for stmt in split(MIGRATIONS[1][2], ';')
+                isempty(strip(stmt)) && continue
+                SQLite.execute(db, stmt)
+            end
+            SQLite.execute(db, "INSERT INTO schema_version (version) VALUES (1)")
+            SQLite.execute(db, "COMMIT")
+            @test schema_version(db) == 1
+            sid = insert_session!(db; host = "h")
+            insert_line!(db; session_id = sid, line_id = 1, line = "keep me")
+
+            @test migrate!(db) == HEAD
+            rows = LogClustering.Memory.SQLite._rows(db,
+                "SELECT line_id, line FROM lines")
+            @test length(rows) == 1
+            @test String(rows[1].line) == "keep me"
+        end
+    end
+
+    @testset "duplicate line_id across sessions no longer collides" begin
+        mktempdir() do dir
+            db = open_db(joinpath(dir, "t.sqlite"))
+            migrate!(db)
+            sid1 = insert_session!(db; host = "h")
+            sid2 = insert_session!(db; host = "h")
+            insert_line!(db; session_id = sid1, line_id = 1, line = "s1-l1")
+            # This was a PK violation before schema v2.
+            insert_line!(db; session_id = sid2, line_id = 1, line = "s2-l1")
+            rows = LogClustering.Memory.SQLite._rows(db,
+                "SELECT COUNT(*) AS n FROM lines")
+            @test Int(rows[1].n) == 2
         end
     end
 
