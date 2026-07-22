@@ -5,7 +5,7 @@ using LogClustering.Memory.RedisClient: Client, connect_redis, call,
                                          sadd!, sismember, smembers,
                                          zadd!, zcard, zremrangebyscore!,
                                          set!, get_str, expire!, del!,
-                                         ping, flushdb!
+                                         ping, flushdb!, _parse_url
 using LogClustering.Memory.WarmStore
 using LogClustering.Memory.WarmStore: InProcWarmStore, RedisWarmStore,
                                        open_warm, healthy,
@@ -39,7 +39,17 @@ end
 function _fake_redis(; auth::String = "")
     server = Sockets.listen(Sockets.localhost, 0)
     port = Sockets.getsockname(server)[2]
-    fr = _FakeRedis(server, Int(port), Dict{String, Set{String}}(),
+    return _fake_redis_from(server, Int(port), auth)
+end
+
+# Bind a fresh fake server on a specific port (for reconnect tests).
+function _fake_redis_on_port(port::Int; auth::String = "")
+    server = Sockets.listen(Sockets.localhost, port)
+    return _fake_redis_from(server, port, auth)
+end
+
+function _fake_redis_from(server, port::Int, auth::String)
+    fr = _FakeRedis(server, port, Dict{String, Set{String}}(),
                     Dict{String, String}(), nothing)
     fr.task = @async begin
         try
@@ -190,10 +200,38 @@ end
             @test isempty(smembers(c, "purge:set"))
         end
 
+        @testset "reconnects after the server drops the connection" begin
+            # Restart the fake server on the SAME port: the client's
+            # socket is now dead but may still report open, so the next
+            # command must transparently reconnect + retry once.
+            port = fr.port
+            close(fr)
+            sleep(0.1)
+            fr2 = _fake_redis_on_port(port)
+            try
+                sleep(0.1)
+                @test set!(c, "after-restart", "v") == "OK"
+                @test get_str(c, "after-restart") == "v"
+            finally
+                close(fr2)
+            end
+        end
+
         close(c)
     finally
         close(fr)
     end
+end
+
+@testset "Memory.RedisClient — URL parsing edge cases" begin
+    @test _parse_url("redis://localhost")        == ("localhost", 6379, 0, "")
+    @test _parse_url("redis://localhost/")       == ("localhost", 6379, 0, "")
+    @test _parse_url("redis://localhost:6380/2") == ("localhost", 6380, 2, "")
+    @test _parse_url("redis://:secret@h:6379/0") == ("h", 6379, 0, "secret")
+    # IPv6 literals — brackets stripped, port split on ']'.
+    @test _parse_url("redis://[::1]:6379/1")     == ("::1", 6379, 1, "")
+    @test _parse_url("redis://[::1]")            == ("::1", 6379, 0, "")
+    @test_throws ArgumentError _parse_url("memcached://x")
 end
 
 @testset "Memory.WarmStore — InProc + Redis adapters" begin

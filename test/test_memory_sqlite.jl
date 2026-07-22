@@ -317,4 +317,22 @@ StructuredLog.set_format!(:json; stream = _SQLITE_TEST_LOG)
         @test ms_iso > 0
     end
 
+    @testset "epoch_ms_since throws on unparseable input (no silent now)" begin
+        @test_throws ArgumentError epoch_ms_since("garbage")
+        @test_throws ArgumentError epoch_ms_since("12x")
+        # ISO with a UTC offset isn't supported — must error, not
+        # silently mean "now".
+        @test_throws ArgumentError epoch_ms_since("2026-07-22T10:00:00+02:00")
+    end
+
+    @testset "iso_from_epoch_ms round-trips to a sortable ISO string" begin
+        ms = epoch_ms_since("2026-04-27T14:00:00.000")
+        iso = LogClustering.Memory.SQLite.iso_from_epoch_ms(ms)
+        @test startswith(iso, "2026-04-27T14:00:00")
+        # ISO strings sort in chronological order (used by query sessions).
+        earlier = LogClustering.Memory.SQLite.iso_from_epoch_ms(
+            epoch_ms_since("2020-01-01T00:00:00.000"))
+        @test earlier < iso
+    end
+
 end

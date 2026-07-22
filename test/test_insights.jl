@@ -11,6 +11,7 @@ using LogClustering.Memory.Insights: top_rules_window, novel_clusters_window,
                                       episodes, pinned_summary
 using LogClustering.Memory.PatternCatalog: pin_manual
 using LogClustering.StructuredLog
+using SQLite: SQLite
 using JSON3
 using Dates: Dates, DateTime
 
@@ -171,6 +172,26 @@ end
                 d = JSON3.read(l)
                 @test haskey(d, "rule_id")
             end
+        end
+    end
+
+    @testset "query sessions --since actually filters (ISO comparison)" begin
+        mktempdir() do dir
+            db_path = joinpath(dir, "t.sqlite")
+            db = open_db(db_path); migrate!(db)
+            # One old session (hand-inserted ISO), one recent.
+            foreach(identity, SQLite.DBInterface.execute(db,
+                "INSERT INTO sessions (started_at, host) VALUES (?, ?)",
+                ("2020-01-01T00:00:00.000Z", "old")))
+            insert_session!(db; host = "recent")
+            # --since 1h must exclude the 2020 session.
+            r = _capture(() -> CLI.main(["query", "sessions",
+                "--memory", db_path, "--since", "1h", "--json"]))
+            @test r.code == 0
+            rows = [JSON3.read(l) for l in filter(!isempty, split(r.out, '\n'))]
+            hosts = [String(x["host"]) for x in rows]
+            @test "recent" in hosts
+            @test !("old" in hosts)
         end
     end
 

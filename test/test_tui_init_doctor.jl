@@ -26,6 +26,14 @@ function _capture(f)
     return (code = code, out = read(rr_out, String), err = read(rr_err, String))
 end
 
+function _e2e_run(data_path, f)
+    orig = stdin
+    open(data_path, "r") do io
+        redirect_stdin(io)
+        try; f(); finally; redirect_stdin(orig); end
+    end
+end
+
 function _seeded_db(path)
     db = open_db(path)
     migrate!(db)
@@ -163,5 +171,62 @@ end
             old_data === nothing ? delete!(ENV, "XDG_DATA_HOME") :
                                     (ENV["XDG_DATA_HOME"] = old_data)
         end
+    end
+end
+
+@testset "config file wires into stream (CLI > config > default)" begin
+    mktempdir() do dir
+        db_path  = joinpath(dir, "cfg.sqlite")
+        cfg_path = joinpath(dir, "config.toml")
+        open(cfg_path, "w") do io
+            write(io, """
+            [stream]
+            memory = "$db_path"
+            log-level = "error"
+            """)
+        end
+        rules_path = joinpath(dir, "rules.json")
+        open(rules_path, "w") do io
+            JSON3.write(io, Dict("version" => 1, "rules" => []))
+        end
+        data_path = joinpath(dir, "in.log")
+        open(data_path, "w") do io; println(io, "a"); println(io, "b"); end
+
+        old_cfg = get(ENV, "LOGCLUSTERING_CONFIG", nothing)
+        ENV["LOGCLUSTERING_CONFIG"] = cfg_path
+        try
+            # --memory is NOT passed on the CLI: it must come from config.
+            r = _e2e_run(data_path, () -> _capture(() ->
+                CLI.main(["stream", "--rules", rules_path,
+                          "--warmup-lines", "0", "--warmup-seconds", "0",
+                          "--status-interval", "0", "--quiet"])))
+            @test r.code == 0
+            # The config's memory path was used → the db exists + migrated.
+            @test isfile(db_path)
+            db = LogClustering.Memory.SQLite.open_db(db_path; create = false)
+            srows = LogClustering.Memory.SQLite._rows(db,
+                "SELECT COUNT(*) AS n FROM sessions")
+            @test Int(srows[1].n) == 1
+        finally
+            old_cfg === nothing ? delete!(ENV, "LOGCLUSTERING_CONFIG") :
+                                   (ENV["LOGCLUSTERING_CONFIG"] = old_cfg)
+        end
+    end
+end
+
+@testset "TUI truncates a multibyte line without StringIndexError" begin
+    mktempdir() do dir
+        path = joinpath(dir, "t.sqlite")
+        db = open_db(path); migrate!(db)
+        sid = insert_session!(db; host = "h")
+        # A line with a multi-byte char (…) straddling byte 80.
+        line = repeat("x", 78) * "…" * repeat("y", 40)
+        insert_trigger!(db; session_id = sid, rule_id = "r",
+                        rule_kind = "keyword", severity = "warn",
+                        line_id = 1, line = line, fields = Dict(),
+                        drain_cluster_id = 1)
+        # Must render without throwing.
+        s = TUI.render(db; since = "1000d", colour = false)
+        @test occursin("Latest triggers", s)
     end
 end

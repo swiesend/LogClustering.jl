@@ -156,6 +156,10 @@ function parse_flags(args::AbstractVector{<:AbstractString},
         out[name] = default
     end
     kinds = Dict{String, Symbol}(String(n) => k for (n, _, k) in specs)
+    # Names the operator explicitly set on the command line, so the
+    # config-file overlay (`_apply_config!`) knows which keys NOT to
+    # override. Stashed under a reserved key ignored by all consumers.
+    provided = Set{String}()
     i = 1
     while i <= length(args)
         tok = args[i]
@@ -174,6 +178,7 @@ function parse_flags(args::AbstractVector{<:AbstractString},
         end
         haskey(kinds, name) ||
             throw(ArgumentError("unknown flag `--$name`"))
+        push!(provided, name)
         kind = kinds[name]
         if kind === :bool
             out[name] = val === nothing ? true : lowercase(val) in ("1", "true", "yes")
@@ -190,7 +195,39 @@ function parse_flags(args::AbstractVector{<:AbstractString},
             out[name] = _coerce(val, kind)
         end
     end
+    out["__cli_provided"] = provided
     return out
+end
+
+"""
+    _apply_config!(opts, section::AbstractString)
+
+Overlay the `[section]` block of the user's config.toml onto `opts`,
+skipping keys the operator set on the command line (tracked in
+`opts["__cli_provided"]`) and keys the subcommand doesn't define.
+Values are coerced to the type of the existing default. Precedence:
+CLI flag > config file > built-in default.
+"""
+function _apply_config!(opts::AbstractDict, section::AbstractString)
+    cfg = try
+        Config.load()
+    catch e
+        StructuredLog.warn("config ignored"; error = sprint(showerror, e))
+        return opts
+    end
+    haskey(cfg, section) || return opts
+    provided = get(opts, "__cli_provided", Set{String}())
+    for (k, v) in cfg[section]
+        ks = String(k)
+        (ks in provided || !haskey(opts, ks)) && continue
+        cur = opts[ks]
+        opts[ks] = cur isa Bool ? Bool(v) :              # Bool <: Integer — test first
+                   cur isa Integer && v isa Number ? Int(v) :
+                   cur isa AbstractFloat && v isa Number ? Float64(v) :
+                   cur isa AbstractString ? String(v) :
+                   v
+    end
+    return opts
 end
 
 function _coerce(val::AbstractString, kind::Symbol)
@@ -1380,6 +1417,7 @@ function cmd_stream(args::Vector{String})::Int
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
+    _apply_config!(opts, "stream")
 
     # Configure logger before anything else so all subsequent diagnostics
     # land in the right place.
@@ -2327,8 +2365,13 @@ function _cmd_patterns_add(args::Vector{String})::Int
         kind = Symbol(opts["kind"])
         kind in (:keyword, :regex, :drain) ||
             throw(ArgumentError("--kind must be keyword | regex | drain"))
+        # Drop empty tokens ("a,,b" / trailing comma) — an empty
+        # keyword would `occursin("", line)`-match every line.
         kws = isempty(opts["keyword"]) ? String[] :
-              String[strip(String(k)) for k in split(String(opts["keyword"]), ',')]
+              String[String(strip(k)) for k in split(String(opts["keyword"]), ',')
+                     if !isempty(strip(k))]
+        kind === :keyword && isempty(kws) &&
+            throw(ArgumentError("--kind keyword needs at least one non-empty --keyword"))
         Memory.PatternCatalog.pin_manual(db;
             name = String(opts["name"]),
             description = String(opts["description"]),
@@ -2481,12 +2524,16 @@ function _cmd_query_sessions(args::Vector{String})::Int
     isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
     db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
     Memory.SQLite.migrate!(db)
-    since_ms = Memory.SQLite.epoch_ms_since(String(opts["since"]))
+    # sessions.started_at is ISO-8601 TEXT, so compare against an ISO
+    # cutoff (not the epoch-ms integer, which sorts lexicographically
+    # wrong against ISO text and made --since a silent no-op).
+    since_iso = Memory.SQLite.iso_from_epoch_ms(
+        Memory.SQLite.epoch_ms_since(String(opts["since"])))
     rows = Memory.SQLite._rows(db,
         "SELECT id, started_at, ended_at, host, model_path, rules_path, " *
         "exit_code FROM sessions WHERE started_at >= ? " *
         "ORDER BY id DESC LIMIT ?",
-        (string(since_ms), Int(opts["limit"])))
+        (since_iso, Int(opts["limit"])))
     _emit_rows(rows, opts["json"];
         cols = (:id, :started_at, :ended_at, :host, :exit_code))
     return 0
@@ -2568,6 +2615,7 @@ function cmd_insights(args::Vector{String})::Int
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_insights_help(); return 0)
+    _apply_config!(opts, "insights")
     isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
     db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
     Memory.SQLite.migrate!(db)
@@ -2707,6 +2755,7 @@ function cmd_report(args::Vector{String})::Int
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_report_help(); return 0)
+    _apply_config!(opts, "report")
     isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
     db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
     Memory.SQLite.migrate!(db)
@@ -2842,6 +2891,7 @@ function cmd_top(args::Vector{String})::Int
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_top_subhelp(); return 0)
+    _apply_config!(opts, "top")
     isempty(opts["memory"]) && throw(ArgumentError("--memory is required"))
     db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
     Memory.SQLite.migrate!(db)
@@ -2884,8 +2934,7 @@ function cmd_init(args::Vector{String})::Int
              dirname(Config.default_path()) :
              String(opts["prefix"])
     mkpath(prefix)
-    data_dir = joinpath(dirname(prefix), "..", "local", "share", "logcluster")
-    # Resolve via the same scheme as default_path but for the data location.
+    # Data (SQLite db) lives under XDG_DATA_HOME, config under prefix.
     home = try; homedir(); catch; "."; end
     data_dir = joinpath(get(ENV, "XDG_DATA_HOME",
                             joinpath(home, ".local", "share")),

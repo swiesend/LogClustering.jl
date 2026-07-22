@@ -83,12 +83,27 @@ function _parse_url(url::AbstractString)
     slash = findfirst('/', rest)
     if slash !== nothing
         host = rest[1:prevind(rest, slash)]
-        db = parse(Int, rest[nextind(rest, slash):end])
+        dbstr = rest[nextind(rest, slash):end]
+        db = isempty(dbstr) ? 0 : parse(Int, dbstr)   # trailing "/" ⇒ db 0
     end
-    colon = findlast(':', host)
-    if colon !== nothing
-        port = parse(Int, host[nextind(host, colon):end])
-        host = host[1:prevind(host, colon)]
+    # IPv6 literal: `[::1]` or `[::1]:6379`. Strip brackets and split the
+    # port on the ']' boundary so a colon inside the address isn't
+    # mistaken for the port separator.
+    if startswith(host, "[")
+        close_br = findfirst(']', host)
+        close_br === nothing && throw(ArgumentError("malformed IPv6 redis host: $host"))
+        addr = host[2:prevind(host, close_br)]
+        after = host[nextind(host, close_br):end]
+        if startswith(after, ":")
+            port = parse(Int, after[2:end])
+        end
+        host = addr
+    else
+        colon = findlast(':', host)
+        if colon !== nothing
+            port = parse(Int, host[nextind(host, colon):end])
+            host = host[1:prevind(host, colon)]
+        end
     end
     return host, port, db, pw
 end
@@ -123,11 +138,30 @@ end
 Send one Redis command and return the parsed reply. Bulk strings
 come back as `String`; integers as `Int`; arrays as `Vector{Any}`;
 `nil` replies as `nothing`. Errors raise `ErrorException`.
+
+A half-dead connection (server restarted, NAT idle-timeout) usually
+still reports `isopen`, so the write/read here fails rather than the
+`isopen` check in `_ensure_open!`. On an I/O failure the socket is
+closed and the command retried **once** on a fresh connection; a
+second failure propagates. Redis command errors (`-ERR ...`) are
+NOT retried — they are not connection problems.
 """
 function call(c::Client, args::AbstractString...)
-    sock = _ensure_open!(c)
-    _write_command(sock, args)
-    return _read_reply(sock)
+    try
+        sock = _ensure_open!(c)
+        _write_command(sock, args)
+        return _read_reply(sock)
+    catch e
+        # A RESP command error carries "Redis: " — surfaced, not a
+        # transport failure, so don't reconnect.
+        (e isa ErrorException && occursin("Redis: ", e.msg)) && rethrow()
+        # Transport failure — drop the socket and retry once.
+        try; c.sock === nothing || close(c.sock); catch; end
+        c.sock = nothing
+        sock = _ensure_open!(c)
+        _write_command(sock, args)
+        return _read_reply(sock)
+    end
 end
 
 call(c::Client, args::Vector{String}) = call(c, args...)

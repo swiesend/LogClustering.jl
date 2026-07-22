@@ -578,14 +578,49 @@ function epoch_ms_since(s::AbstractString)
     s = strip(s)
     if !isempty(s) && s[end] in ('s', 'm', 'h', 'd')
         unit = s[end]
-        n = parse(Float64, s[1:end-1])
+        n = tryparse(Float64, s[1:end-1])
+        n === nothing && throw(ArgumentError(
+            "invalid --since `$s`: expected e.g. 24h, 7d, 30m, 45s, or an ISO-8601 timestamp"))
         mul = unit == 's' ? 1_000 :
               unit == 'm' ? 60_000 :
               unit == 'h' ? 3_600_000 :
                             86_400_000
         return _epoch_ms(_now_utc()) - Int(round(n * mul))
     end
-    return _epoch_ms(_parse_dt(s))
+    # Absolute timestamp — must parse cleanly. A silent "now" fallback
+    # would turn a typo'd offset (e.g. "...+02:00") into an empty result.
+    dt = _try_parse_dt(s)
+    dt === nothing && throw(ArgumentError(
+        "invalid --since `$s`: expected e.g. 24h, 7d, 30m, 45s, or an ISO-8601 " *
+        "timestamp without a UTC offset (times are treated as UTC)"))
+    return _epoch_ms(dt)
+end
+
+"""
+    iso_from_epoch_ms(ms) -> String
+
+Render an epoch-ms cutoff back to the `_iso` TEXT form so it can be
+compared lexicographically against the ISO `started_at` column
+(ISO-8601 sorts in chronological order for a fixed format).
+"""
+iso_from_epoch_ms(ms::Integer) =
+    _iso(Dates.unix2datetime(ms / 1000))
+
+# Strict variant of _parse_dt used by epoch_ms_since: returns nothing
+# instead of falling back to now() so callers can raise a clear error.
+function _try_parse_dt(s::AbstractString)
+    for fmt in (Dates.dateformat"yyyy-mm-ddTHH:MM:SS.sss",
+                Dates.dateformat"yyyy-mm-ddTHH:MM:SS")
+        try
+            return DateTime(strip(replace(String(s), "Z" => "")), fmt)
+        catch
+        end
+    end
+    try
+        return DateTime(strip(replace(String(s), "Z" => "")))
+    catch
+        return nothing
+    end
 end
 
 end # module SQLiteStore

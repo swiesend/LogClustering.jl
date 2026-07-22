@@ -95,7 +95,9 @@ function render(db;
             sev = String(r.severity)
             sev_col = sev == "crit" ? RED : sev == "warn" ? YEL : GRN
             line = String(r.line)
-            line = sizeof(line) > 80 ? String(SubString(line, 1, 80)) * "…" : line
+            # Character-safe truncation — a byte-index SubString throws
+            # StringIndexError when byte 80 lands mid-UTF-8-sequence.
+            line = length(line) > 80 ? first(line, 80) * "…" : line
             print(io, "  ", ts[12:min(end, 19)], "  ")
             colour && print(io, sev_col)
             print(io, rpad(sev, 4))
