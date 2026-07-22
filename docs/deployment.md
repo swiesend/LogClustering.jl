@@ -238,8 +238,39 @@ follow-up `crit` from a different rule still fires.
 
 ### Drop-on-full webhooks
 
-Webhook delivery is best-effort. If the rate of `crit` triggers
-exceeds the webhook endpoint's tolerance for any reason, the producer
-**drops** the delivery (with a stderr warning) so the inference loop
-keeps up. stdout JSON is the durable record — the dropped delivery
-shows up there.
+Webhook delivery is best-effort. Deliveries queue on a bounded
+channel; when it fills (a slow or down endpoint, a burst of `crit`
+triggers), the producer **drops** the delivery via a non-blocking
+enqueue — counted on `webhooks_dropped_total` and logged on stderr —
+so the inference loop is never stalled. stdout JSON is the durable
+record; the dropped delivery still appears there. On a clean shutdown
+the queue is drained (bounded by `--shutdown-timeout`) so already-
+queued alerts are delivered, not lost.
+
+### Stopping the service
+
+`stream` installs a SIGINT handler for graceful shutdown: it stops
+the producer, drains the ingest / webhook / memory-writer channels,
+finalizes the SQLite session row, emits a final
+`{"event":"shutdown","reason":"signal"}` line, and exits 130. Stop
+the service with **SIGINT**, not SIGTERM:
+
+- systemd: the unit sets `KillSignal=SIGINT` — `systemctl stop`
+  just works.
+- Docker: the image sets `STOPSIGNAL SIGINT` and the compose file
+  sets `stop_signal: SIGINT` — `docker stop` just works.
+
+A hard SIGKILL (or SIGTERM without the above) skips the drain: the
+session row is left with a NULL `ended_at` and buffered SQLite
+writes are lost.
+
+### Log rotation and the tailer
+
+`--tail` handles `logrotate` **create**-mode rotation exactly: on the
+inode change it drains the renamed file's remaining complete lines
+before switching to the new file, so nothing written just before the
+rename is lost. In-place truncation (`copytruncate`) is detected by a
+size drop, but a `copytruncate` whose replacement content grows past
+the old read offset within one poll interval cannot be detected by
+size alone and may skip data — prefer `create`-mode rotation for the
+tailed file.

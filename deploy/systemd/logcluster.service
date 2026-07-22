@@ -16,6 +16,9 @@ EnvironmentFile=-/etc/logcluster/env
 
 Environment=JULIA_PROJECT=/opt/logclustering
 Environment=JULIA_SYSIMAGE_PATH=/opt/logclustering/LogClustering.so
+# Point at the baked depot so jll artifacts (SQLite / TLS / HDF5)
+# resolve. Match wherever the deploy tree's depot was installed.
+Environment=JULIA_DEPOT_PATH=/opt/julia-depot
 
 ExecStart=/opt/logclustering/bin/logcluster stream \
   --model /etc/logcluster/models/transformer-decoder.jld2 \
@@ -30,6 +33,10 @@ ExecStart=/opt/logclustering/bin/logcluster stream \
 
 Restart=on-failure
 RestartSec=2
+# Stop with SIGINT so the stream subcommand raises InterruptException
+# and runs its graceful drain (finalize session, flush writers, emit
+# the shutdown event) within TimeoutStopSec before systemd SIGKILLs.
+KillSignal=SIGINT
 TimeoutStopSec=10
 
 # stdout is the durable trigger sink; ship it to disk and let your

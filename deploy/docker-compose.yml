@@ -13,15 +13,22 @@ services:
     #   dockerfile: deploy/Dockerfile
     container_name: logcluster
     restart: unless-stopped
+    # --tail is a boolean flag; the file goes to --data. (Passing the
+    # path to --tail would coerce the bool to false and read stdin.)
     command:
       - stream
       - --model=/etc/logcluster/models/transformer-decoder.jld2
       - --detector=/etc/logcluster/models/value-novelty.jld2
       - --rules=/etc/logcluster/rules.json
-      - --tail=/var/log/host/syslog
+      - --data=/var/log/host/syslog
+      - --tail
       - --framed=auto
       - --status-interval=30
       - --log-format=json
+    # Send SIGINT on `docker stop` so the stream subcommand drains its
+    # channels and finalizes the session before exiting.
+    stop_signal: SIGINT
+    stop_grace_period: 10s
     environment:
       ALERTMANAGER_URL: "http://alertmanager:9093/api/v2/alerts"
       ALERTMANAGER_TOKEN: "${ALERTMANAGER_TOKEN:-}"

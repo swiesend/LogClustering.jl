@@ -86,6 +86,10 @@ Emitted every `--status-interval` seconds (default 10; set 0 to disable).
 
 ### `event: "shutdown"` — final line of the run
 
+`reason` is `"eof"` (input ended), `"signal"` (SIGINT — a graceful
+`docker stop` / `systemctl stop`, exit 130), or `"max_events"`
+(the `--max-events` limit was reached).
+
 ```jsonc
 { "event":         "shutdown",
   "ts":            "...",
@@ -105,11 +109,14 @@ One JSON object per call (`--log-format json`, default):
 { "level": "warn",  "ts": "...", "msg": "line dropped",
   "reason": "oversize", "bytes": 1048577, "limit": 65536 }
 { "level": "error", "ts": "...", "msg": "webhook failed",
-  "url": "https://...", "status": 503, "attempt": 5 }
+  "url": "https://hooks.slack.com/…", "status": 503, "attempt": 5 }
 ```
 
 Sensitive kwargs (`authorization`, `token`, `secret`, `api_key`,
-`password`, `cookie`) are redacted to `***` before write.
+`password`, `cookie`) are redacted to `***` before write. Webhook
+URLs are logged as `scheme://host/…` only — path, query, and
+userinfo are stripped, since Slack incoming-webhook URLs and
+`?token=` query params are themselves secrets.
 
 Switch to human text for development:
 
@@ -186,5 +193,5 @@ firing rule.
 | 0    | Success (clean shutdown signal for `stream`).           |
 | 1    | At least one rule fired (only when `--exit-on-trigger`). |
 | 2    | Argument / config / schema error (no work done).        |
-| 3    | I/O error (model bundle missing, source file gone).     |
-| 130  | Killed by SIGINT / SIGTERM during shutdown.             |
+| 3    | I/O error: a model / detector / rules / patterns / data file was missing at boot, or the input source failed mid-run. |
+| 130  | `stream` received SIGINT and shut down gracefully (drained channels, finalized the session, emitted the `shutdown` event). Deployments should stop the service with SIGINT — the systemd unit sets `KillSignal=SIGINT` and the container image `STOPSIGNAL SIGINT`. |
