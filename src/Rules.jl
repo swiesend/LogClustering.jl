@@ -56,7 +56,7 @@ using Dates: Dates, DateTime, now, UTC
 using Statistics: mean, std
 
 export RuleSet, TriggerEvent, default_rules, load_rules, evaluate,
-       snapshot, route_sinks
+       snapshot, route_sinks, route_sinks_for, attach_warm_store!
 
 # ---------------------------------------------------------------------------
 # Rule structs (one per kind for type-stable dispatch).
@@ -295,7 +295,8 @@ function _build_ruleset(raw, warmup_lines::Int, warmup_seconds::Float64)
         state[r.id] = _initial_state(r)
     end
 
-    warmup = WarmupState(time(), 0, warmup_lines, warmup_seconds, false)
+    # started_at = NaN → stamped lazily on the first evaluate call.
+    warmup = WarmupState(NaN, 0, warmup_lines, warmup_seconds, false)
     return RuleSet(version, d, rules, routes, sinks, state, warmup, nothing)
 end
 
@@ -546,6 +547,14 @@ end
 
 function _bump_warmup!(rs::RuleSet)
     rs.warmup.completed && return true
+    # The warmup clock starts at the FIRST line, not at load_rules —
+    # model loading between construction and the first evaluate call
+    # must not eat the wall-clock warmup budget (which would freeze
+    # rate/volume baselines at zero and permanently disable those
+    # rules).
+    if isnan(rs.warmup.started_at)
+        rs.warmup.started_at = time()
+    end
     rs.warmup.lines_seen += 1
     elapsed = time() - rs.warmup.started_at
     # "Buffer the first N lines" — strict `>` so line N is still warmup
@@ -598,9 +607,13 @@ function evaluate(rs::RuleSet, ir::AbstractDict)
             continue
         end
         if (now_t - Float64(st[:last_fired])) < rule.cooldown_s
-            # Still let stateful rules ingest data even when cooldown-suppressed
-            # so they don't lose their windows during a quiet period.
-            _ingest!(rule, ir, st, now_t)
+            # Window/reservoir rules keep ingesting during cooldown so
+            # they don't lose their state in a quiet period. Novelty
+            # rules must NOT: recording a first-seen id here would
+            # silently swallow that alert forever (it can only fire on
+            # a first sighting). Skipping ingest preserves the alert —
+            # it fires on the next sighting after cooldown expires.
+            _ingest_during_cooldown(rule) && _ingest!(rule, ir, st, now_t)
             continue
         end
         fired, fields = _fire_check(rule, ir, st, now_t)
@@ -618,6 +631,14 @@ end
 # ---------------------------------------------------------------------------
 # Warmup ingestion — accumulate baselines without firing.
 # ---------------------------------------------------------------------------
+
+# Whether a rule's _ingest! is safe to run while the rule is
+# cooldown-suppressed. True for window/reservoir state; false for
+# novelty rules, whose ingest would permanently swallow first
+# sightings observed during another firing's cooldown.
+_ingest_during_cooldown(::AbstractRule)     = true
+_ingest_during_cooldown(::NovelClusterRule) = false
+_ingest_during_cooldown(::NovelTokenRule)   = false
 
 function _ingest!(r::ScoreThresholdRule, ir, st, _t)
     v = _lookup(ir, r.metric)
@@ -875,11 +896,23 @@ _kind_symbol(::RegexRule)          = :regex
 Resolve which sink names a triggered rule routes to. `"stdout"` is
 always included; explicit routes can add webhook sinks.
 """
-function route_sinks(rs::RuleSet, rule::AbstractRule)
+route_sinks(rs::RuleSet, rule::AbstractRule) =
+    route_sinks_for(rs; severity = rule.severity, rule_id = rule.id)
+
+"""
+    route_sinks_for(rs::RuleSet; severity::Symbol, rule_id::AbstractString)
+        -> Vector{String}
+
+Value-based variant of [`route_sinks`] for triggers that don't come
+from an `AbstractRule` (e.g. the drain-pattern sidecar in the
+streaming CLI).
+"""
+function route_sinks_for(rs::RuleSet; severity::Symbol,
+                         rule_id::AbstractString)
     sinks = String["stdout"]
     for rt in rs.routes
-        sev_ok = isempty(rt.severities) || rule.severity in rt.severities
-        rid_ok = isempty(rt.rule_ids)   || rule.id      in rt.rule_ids
+        sev_ok = isempty(rt.severities) || severity in rt.severities
+        rid_ok = isempty(rt.rule_ids)   || String(rule_id) in rt.rule_ids
         sev_ok && rid_ok && append!(sinks, rt.sinks)
     end
     return unique!(sinks)

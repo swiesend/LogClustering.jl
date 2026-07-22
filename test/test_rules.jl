@@ -255,6 +255,81 @@ end
         sinks = route_sinks(rs, rule)
         @test "stdout" in sinks
         @test "webhook:default" in sinks
+
+        # Value-based variant matches by severity/rule_id without a rule.
+        sinks2 = Rules.route_sinks_for(rs; severity = :crit,
+                                       rule_id = "pattern:1:x")
+        @test "webhook:default" in sinks2
+        sinks3 = Rules.route_sinks_for(rs; severity = :info,
+                                       rule_id = "pattern:1:x")
+        @test sinks3 == ["stdout"]
+    end
+
+    @testset "warmup clock starts at first evaluate, not at load" begin
+        # Time-based warmup of 0.15 s. Simulate slow model loading by
+        # sleeping AFTER load_rules but BEFORE the first line: the
+        # clock must not have started, so line 1 is still warmup.
+        body = """
+        { "version": 1,
+          "defaults": { "warmup_required": true, "cooldown_s": 0 },
+          "rules": [
+            { "id": "fatal", "kind": "keyword",
+              "field": "line", "keywords": ["FATAL"] }]}
+        """
+        rs = load_rules(IOBuffer(body);
+                        warmup_lines = 1000, warmup_seconds = 0.15)
+        sleep(0.3)   # "model loading" — longer than the warmup budget
+        @test isempty(evaluate(rs, _ir("FATAL right after load")))
+        sleep(0.2)   # now the (line-1-started) clock has expired
+        t = evaluate(rs, _ir("FATAL post-warmup"))
+        @test length(t) == 1
+    end
+
+    @testset "volume baseline uses first-line clock" begin
+        # 10 warmup lines fed instantly; baseline must come out as a
+        # rate over the (tiny) first-to-last-line elapsed, not over a
+        # construction-to-now window inflated by load time.
+        body = """
+        { "version": 1,
+          "rules": [
+            { "id": "vol", "kind": "volume_anomaly",
+              "window_s": 10, "baseline_multiplier": 1000000.0,
+              "warmup_required": true, "cooldown_s": 0 }]}
+        """
+        rs = load_rules(IOBuffer(body);
+                        warmup_lines = 10, warmup_seconds = 1e9)
+        sleep(0.25)   # load-time gap that must NOT dilute the baseline
+        for i in 1:11
+            evaluate(rs, _ir("l$i"; line_id = i))
+        end
+        st = rs.state["vol"]
+        # 10 warmup lines over a sub-100ms window → per-10s baseline
+        # far above 10; the old construction-time clock would have
+        # produced a diluted value close to (or below) 10/0.25s·10s=400.
+        @test st[:baseline_window_count] > 0
+    end
+
+    @testset "novelty survives another rule's cooldown window" begin
+        body = """
+        { "version": 1,
+          "defaults": { "warmup_required": false },
+          "rules": [
+            { "id": "novel", "kind": "novel_cluster",
+              "model": "drain", "cooldown_s": 0.2 } ]}
+        """
+        rs = load_rules(IOBuffer(body); warmup_lines = 0, warmup_seconds = 0.0)
+        # Cluster A fires and starts the cooldown.
+        t = evaluate(rs, _ir("a"; extra = Dict("drain" => Dict("cluster_id" => 1))))
+        @test length(t) == 1
+        # Cluster B first appears DURING the cooldown — suppressed now…
+        @test isempty(evaluate(rs, _ir("b";
+            extra = Dict("drain" => Dict("cluster_id" => 2)))))
+        sleep(0.25)
+        # …but NOT swallowed: it fires on the next sighting.
+        t = evaluate(rs, _ir("b again";
+            extra = Dict("drain" => Dict("cluster_id" => 2))))
+        @test length(t) == 1
+        @test t[1].fields["cluster_id"] == 2
     end
 
 end

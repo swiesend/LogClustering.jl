@@ -1420,6 +1420,7 @@ function cmd_stream(args::Vector{String})::Int
     end
 
     inferer = _build_inferer(opts, framed_mode)
+    _warn_inert_rules(rs, inferer)
 
     # Optional short-term warm state (Redis): hydrates novel-cluster
     # baselines so a restart doesn't re-fire every template the
@@ -1634,13 +1635,53 @@ using SHA: sha256
 """
     _rules_fingerprint(opts) -> String
 
-12-hex-char SHA-256 of the resolved rules path (or the literal
-`<defaults>` token) so two stream instances pointed at the same
-rules file share warm-state namespace.
+12-hex-char SHA-256 of the rules file **content** (or the literal
+`<defaults>` token), so two stream instances pointed at the same
+rules share warm-state namespace — and editing the rules in place
+gets a fresh namespace instead of inheriting stale counters.
 """
 function _rules_fingerprint(opts)
-    s = isempty(opts["rules"]) ? "<defaults>" : String(opts["rules"])
-    return bytes2hex(sha256(s))[1:12]
+    path = String(opts["rules"])
+    payload = if isempty(path)
+        Vector{UInt8}("<defaults>")
+    elseif isfile(path)
+        read(path)
+    else
+        Vector{UInt8}(path)
+    end
+    return bytes2hex(sha256(payload))[1:12]
+end
+
+"""
+    _warn_inert_rules(rs, inferer)
+
+Boot-time diagnostic: a rule whose metric / model can never be
+served by the loaded bundle silently never fires — surface that
+instead of leaving the operator to notice weeks later.
+"""
+function _warn_inert_rules(rs, inferer)
+    for r in rs.rules
+        reason = if r isa Rules.NovelClusterRule
+            inferer.bundle_kind === :drain ? nothing :
+                "requires a drain model (`--model drain.jld2`)"
+        elseif r isa Rules.ScoreThresholdRule
+            if startswith(r.metric, "transformer_decoder.") &&
+               inferer.bundle_kind !== :transformer_decoder
+                "requires a transformer_decoder model"
+            elseif startswith(r.metric, "novelty.") &&
+                   inferer.detector === nothing
+                "requires --detector"
+            else
+                nothing
+            end
+        else
+            nothing
+        end
+        reason === nothing && continue
+        StructuredLog.warn("rule can never fire with the loaded models";
+                           rule_id = r.id, reason = reason)
+    end
+    return nothing
 end
 
 # Build the WriteTrigger payload from a Rules.TriggerEvent + the
