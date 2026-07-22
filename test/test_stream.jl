@@ -206,6 +206,45 @@ end
         end
     end
 
+    @testset "redaction copies nested dicts — caller's dict untouched" begin
+        io = IOBuffer()
+        StructuredLog.set_format!(:json; stream = io)
+        try
+            headers = Dict("Authorization" => "Bearer live-secret",
+                           "Content-Type"  => "application/json")
+            StructuredLog.info("sending"; headers = headers)
+            j = JSON3.read(String(take!(io)))
+            @test String(j["headers"]["Authorization"]) == "***"
+            # The caller's live dict must NOT have been redacted.
+            @test headers["Authorization"] == "Bearer live-secret"
+        finally
+            StructuredLog.set_format!(:json; stream = _LOG_SINK)
+        end
+    end
+
+    @testset "unknown level raises the descriptive error" begin
+        err = try
+            StructuredLog.set_level!(:trace)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("unknown log level", err.msg)
+    end
+
+    @testset "logging never throws on a broken stream" begin
+        broken = IOBuffer()
+        close(broken)
+        StructuredLog.set_format!(:json; stream = broken)
+        try
+            # Must silently drop, not propagate into the caller.
+            @test StructuredLog.info("into the void") === nothing
+        finally
+            StructuredLog.set_format!(:json; stream = _LOG_SINK)
+        end
+    end
+
     @testset "level gating drops messages below threshold" begin
         io = IOBuffer()
         StructuredLog.set_format!(:json; stream = io)

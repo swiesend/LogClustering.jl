@@ -3,7 +3,9 @@ using LogClustering
 using LogClustering.Rules: SinkSpec
 using LogClustering.SinksWebhook
 using LogClustering.SinksWebhook: WebhookSink, WebhookStats,
-                                    deliver!, format_body, substitute_env
+                                    deliver!, enqueue!, format_body,
+                                    substitute_env, start_webhook_task,
+                                    _redacted_url
 using LogClustering.StructuredLog
 using JSON3
 
@@ -192,6 +194,108 @@ HTTP.header(r::_Resp, name::AbstractString, default::AbstractString = "") =
         @test !ok
         @test length(calls) == s.max_attempts
         @test s.stats.failed_total == 1
+    end
+
+    # Real HTTP.jl THROWS StatusError for non-2xx unless
+    # status_exception=false is passed; both stacks must classify the
+    # status identically. These mocks throw like the real default.
+    @testset "deliver! — thrown StatusError(401) fails without retry" begin
+        calls = []
+        s = _sink()
+        s.request = function (method, url, headers, body; kwargs...)
+            push!(calls, true)
+            throw(HTTP.StatusError(401, "POST", "/", _Resp(401)))
+        end
+        ok = deliver!(s, Dict("rule_id" => "x", "severity" => "warn",
+                              "line_id" => 1, "line" => "hi"))
+        @test !ok
+        @test length(calls) == 1          # permanent 4xx — no retries
+        @test s.stats.failed_total == 1
+        @test s.stats.retried_total == 0
+    end
+
+    @testset "deliver! — thrown StatusError(503) retries then 200 succeeds" begin
+        calls = []
+        s = _sink()
+        n = Ref(0)
+        s.request = function (method, url, headers, body; kwargs...)
+            push!(calls, true)
+            n[] += 1
+            n[] == 1 && throw(HTTP.StatusError(503, "POST", "/", _Resp(503)))
+            return _Resp(200)
+        end
+        ok = deliver!(s, Dict("rule_id" => "x", "severity" => "warn",
+                              "line_id" => 1, "line" => "hi"))
+        @test ok
+        @test length(calls) == 2
+        @test s.stats.retried_total == 1
+    end
+
+    @testset "deliver! — passes status_exception=false to the client" begin
+        seen = Ref{Any}(nothing)
+        s = _sink()
+        s.request = function (method, url, headers, body; kwargs...)
+            seen[] = Dict(kwargs)
+            return _Resp(200)
+        end
+        deliver!(s, Dict("rule_id" => "x", "severity" => "warn",
+                         "line_id" => 1, "line" => "hi"))
+        @test seen[][:status_exception] == false
+    end
+
+    @testset "enqueue! — drops on full / closed, counts, never blocks" begin
+        s = _sink()
+        ch = Channel{Dict{String, Any}}(2)
+        ev = Dict("rule_id" => "x")
+        @test enqueue!(ch, ev, s)
+        @test enqueue!(ch, ev, s)
+        t0 = time()
+        @test !enqueue!(ch, ev, s)         # full → immediate false
+        @test time() - t0 < 0.5            # and it did not block
+        @test s.stats.dropped_total == 1
+        close(ch)
+        @test !enqueue!(ch, ev, s)         # closed → false, no throw
+        @test s.stats.dropped_total == 2
+    end
+
+    @testset "start_webhook_task drains queued events on close" begin
+        delivered = []
+        s = _sink()
+        s.request = function (method, url, headers, body; kwargs...)
+            push!(delivered, body); return _Resp(200)
+        end
+        ch, task, stop = start_webhook_task(s; capacity = 8)
+        for i in 1:3
+            enqueue!(ch, Dict("rule_id" => "r$i", "severity" => "warn",
+                              "line_id" => i, "line" => "L"), s)
+        end
+        close(ch)                          # no stop flag — drain expected
+        @test timedwait(() -> istaskdone(task), 5.0) === :ok
+        @test length(delivered) == 3
+    end
+
+    @testset "_redacted_url strips path, query, and userinfo" begin
+        @test _redacted_url("https://hooks.slack.com/services/T00/B00/secret") ==
+              "https://hooks.slack.com/…"
+        @test _redacted_url("https://user:pw@host.example:8443/x?token=abc") ==
+              "https://host.example:8443/…"
+        @test _redacted_url("host.example/path") == "host.example/…"
+    end
+
+    @testset "failure logs carry only the redacted URL" begin
+        buf = IOBuffer()
+        StructuredLog.set_format!(:json; stream = buf)
+        try
+            s = _sink(url = "https://hooks.slack.com/services/T00/B00/secretpart")
+            s.request = (args...; kwargs...) -> _Resp(400)
+            deliver!(s, Dict("rule_id" => "x", "severity" => "warn",
+                             "line_id" => 1, "line" => "hi"))
+            logs = String(take!(buf))
+            @test !occursin("secretpart", logs)
+            @test occursin("hooks.slack.com", logs)
+        finally
+            StructuredLog.set_format!(:json; stream = _LOG_SINK)
+        end
     end
 
 end

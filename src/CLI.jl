@@ -1539,14 +1539,14 @@ function cmd_stream(args::Vector{String})::Int
             if !isempty(triggers) || opts["emit-all"]
                 _emit_line_records(ir, ev, triggers, opts)
                 # Forward triggers to the webhook sink (if any).
+                # enqueue! is non-blocking: a full queue drops + counts
+                # so a slow endpoint can't stall the inference loop.
                 if webhook_ch !== nothing
                     for t in triggers
                         if "webhook:cli" in t.sinks ||
                            any(startswith(s, "webhook:") for s in t.sinks)
-                            try
-                                put!(webhook_ch, _trigger_to_dict(t, ir))
-                            catch
-                            end
+                            SinksWebhook.enqueue!(webhook_ch,
+                                _trigger_to_dict(t, ir), webhook_sink)
                         end
                     end
                 end
@@ -1589,12 +1589,17 @@ function cmd_stream(args::Vector{String})::Int
         catch
         end
         if webhook_ch !== nothing
+            # Close (no stop flag) so the worker drains queued alerts,
+            # bounded by shutdown-timeout; abort only if it overruns.
             try; close(webhook_ch); catch; end
-            try; webhook_stop[] = true; catch; end
-            try
+            drained = try
                 timedwait(() -> istaskdone(webhook_task),
                           Float64(opts["shutdown-timeout"]))
             catch
+                :error
+            end
+            if drained !== :ok
+                try; webhook_stop[] = true; catch; end
             end
         end
         if mem_ch !== nothing

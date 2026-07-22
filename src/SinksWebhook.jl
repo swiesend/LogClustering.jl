@@ -34,7 +34,7 @@ using ..Rules: Rules, SinkSpec, TriggerEvent
 using ..StructuredLog: StructuredLog
 
 export WebhookSink, WebhookStats, start_webhook_task, deliver!,
-       format_body, substitute_env
+       enqueue!, format_body, substitute_env
 
 # ---------------------------------------------------------------------------
 # Types.
@@ -174,51 +174,41 @@ function deliver!(sink::WebhookSink, event::AbstractDict; env = ENV)
     end
     body = format_body(sink, event)
     headers_pairs = collect(headers)
+    # Webhook URLs are often bearer secrets themselves (Slack incoming
+    # webhooks, tokens in query strings) — log scheme+host only.
+    log_url = _redacted_url(url)
 
     backoff = sink.base_backoff_s
     for attempt in 1:sink.max_attempts
+        # `status_exception = false` makes real HTTP.request return the
+        # response for non-2xx instead of throwing; the catch arm also
+        # classifies HTTP.StatusError so an injected/legacy stack that
+        # throws still takes the right retry/no-retry branch.
+        status = 0
+        resp = nothing
+        err = nothing
         try
             resp = sink.request(method, url, headers_pairs, body;
                                 retry = false, redirect = true,
+                                status_exception = false,
                                 connect_timeout = 5.0, readtimeout = 10.0)
             status = Int(resp.status)
-            if 200 <= status < 300
-                sink.stats.sent_total += 1
-                return true
-            elseif status == 429 || (500 <= status < 600)
-                # Honour Retry-After if present.
-                ra = _retry_after_seconds(resp)
-                sleep_s = ra > 0 ? min(ra, sink.max_backoff_s) : backoff
-                if attempt < sink.max_attempts
-                    sink.stats.retried_total += 1
-                    StructuredLog.warn("webhook retrying";
-                                       url = url, status = status,
-                                       attempt = attempt,
-                                       sleep_s = sleep_s)
-                    sleep(sleep_s)
-                    backoff = min(backoff * 2, sink.max_backoff_s)
-                    continue
-                else
-                    sink.stats.failed_total += 1
-                    StructuredLog.error_event("webhook failed";
-                                               url = url, status = status,
-                                               attempt = attempt)
-                    return false
-                end
-            else
-                # Permanent client error — don't retry.
-                sink.stats.failed_total += 1
-                StructuredLog.error_event("webhook failed";
-                                           url = url, status = status,
-                                           attempt = attempt)
-                return false
-            end
         catch e
+            if e isa HTTP.StatusError
+                status = Int(e.status)
+                resp = e.response
+            else
+                err = e
+            end
+        end
+
+        if err !== nothing
+            # Connect / TLS / timeout error — retryable.
             if attempt < sink.max_attempts
                 sink.stats.retried_total += 1
                 StructuredLog.warn("webhook retrying";
-                                   url = url,
-                                   error = sprint(showerror, e),
+                                   url = log_url,
+                                   error = sprint(showerror, err),
                                    attempt = attempt,
                                    sleep_s = backoff)
                 sleep(backoff)
@@ -227,14 +217,58 @@ function deliver!(sink::WebhookSink, event::AbstractDict; env = ENV)
             else
                 sink.stats.failed_total += 1
                 StructuredLog.error_event("webhook failed";
-                                           url = url,
-                                           error = sprint(showerror, e),
+                                           url = log_url,
+                                           error = sprint(showerror, err),
                                            attempt = attempt)
                 return false
             end
+        elseif 200 <= status < 300
+            sink.stats.sent_total += 1
+            return true
+        elseif status == 429 || (500 <= status < 600)
+            # Honour Retry-After if present.
+            ra = resp === nothing ? 0.0 : _retry_after_seconds(resp)
+            sleep_s = ra > 0 ? min(ra, sink.max_backoff_s) : backoff
+            if attempt < sink.max_attempts
+                sink.stats.retried_total += 1
+                StructuredLog.warn("webhook retrying";
+                                   url = log_url, status = status,
+                                   attempt = attempt,
+                                   sleep_s = sleep_s)
+                sleep(sleep_s)
+                backoff = min(backoff * 2, sink.max_backoff_s)
+                continue
+            else
+                sink.stats.failed_total += 1
+                StructuredLog.error_event("webhook failed";
+                                           url = log_url, status = status,
+                                           attempt = attempt)
+                return false
+            end
+        else
+            # Permanent client error — don't retry.
+            sink.stats.failed_total += 1
+            StructuredLog.error_event("webhook failed";
+                                       url = log_url, status = status,
+                                       attempt = attempt)
+            return false
         end
     end
     return false
+end
+
+"""
+    _redacted_url(url) -> String
+
+Strip path, query, and userinfo from a URL for logging — Slack
+incoming-webhook URLs and `?token=` query params are secrets.
+"""
+function _redacted_url(url::AbstractString)
+    m = match(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)?(?:[^/@]*@)?([^/?#]*)", String(url))
+    m === nothing && return "<invalid-url>"
+    scheme = m.captures[1] === nothing ? "" : m.captures[1]
+    host = m.captures[2] === nothing ? "" : m.captures[2]
+    return string(scheme, host, "/…")
 end
 
 # ---------------------------------------------------------------------------
@@ -244,29 +278,30 @@ end
 """
     start_webhook_task(sink::WebhookSink;
                        capacity::Int = 1024,
-                       overflow::Symbol = :drop,
                        env = ENV)
         -> (channel, task, stop_signal)
 
 Spawn an async worker that consumes trigger events off a bounded
-channel and calls [`deliver!`] for each one. When `overflow = :drop`
-(default), a producer that finds the channel full skips delivery and
-bumps `sink.stats.dropped_total`. With `overflow = :block` the
-producer is back-pressured (use only if stdout is also blocked).
+channel and calls [`deliver!`] for each one. Producers feed it via
+[`enqueue!`], which drops (and counts) instead of blocking when the
+queue is full — stdout JSON is the durable sink, webhook delivery
+is best-effort.
 
-Returns the channel, the task, and a `Ref{Bool}` stop signal — set
-the ref to `true` and close the channel to drain + exit cleanly.
+Clean shutdown: `close(channel)` — the worker delivers everything
+already queued, then exits. Setting `stop_signal[] = true` aborts
+without draining.
 """
 function start_webhook_task(sink::WebhookSink;
                             capacity::Int = 1024,
-                            overflow::Symbol = :drop,
                             env = ENV)
-    overflow in (:drop, :block) ||
-        error("overflow must be :drop or :block, got :$overflow")
     ch::Channel{Dict{String, Any}} = Channel{Dict{String, Any}}(capacity)
     stop = Ref(false)
     task = @async begin
         try
+            # `close(ch)` ends this loop after the queue drains — queued
+            # alerts are delivered, not dropped, at clean shutdown.
+            # `stop[]` is abort-only: it short-circuits between events
+            # when the operator wants an immediate exit.
             for event in ch
                 stop[] && break
                 deliver!(sink, event; env = env)
@@ -280,42 +315,29 @@ function start_webhook_task(sink::WebhookSink;
 end
 
 """
-    enqueue!(ch::Channel, event::AbstractDict, sink::WebhookSink;
-             overflow::Symbol = :drop)
+    enqueue!(ch::Channel, event::AbstractDict, sink::WebhookSink)
 
-Try to push `event` onto `ch`. Returns `true` on success, `false`
-if the channel was full and `overflow = :drop` (bumping
-`sink.stats.dropped_total`). With `overflow = :block` the call
-blocks until space is available.
+Non-blocking push. Returns `true` on success, `false` when the
+channel is full or closed — the delivery is dropped and counted on
+`sink.stats.dropped_total` so a back-pressured endpoint can never
+stall the producer. Single-producer contract: the capacity check is
+check-then-act and only race-free because exactly one task feeds
+the channel.
 """
-function enqueue!(ch::Channel, event::AbstractDict, sink::WebhookSink;
-                  overflow::Symbol = :drop)
-    if overflow === :drop
-        # Non-blocking try-put.
-        if !isready(ch.cond_put) && length(ch.data) < ch.sz_max
-            put!(ch, Dict{String, Any}(event))
-            return true
-        end
-        # Best-effort try via trylock-style: rely on Channel's `put!`
-        # raising when closed, otherwise drop if full.
-        try
-            if length(ch.data) >= ch.sz_max
-                sink.stats.dropped_total += 1
-                StructuredLog.warn("webhook dropped — queue full";
-                                   url = sink.spec.url,
-                                   capacity = ch.sz_max)
-                return false
-            end
-            put!(ch, Dict{String, Any}(event))
-            return true
-        catch
-            sink.stats.dropped_total += 1
-            return false
-        end
-    else
-        put!(ch, Dict{String, Any}(event))
-        return true
+function enqueue!(ch::Channel, event::AbstractDict, sink::WebhookSink)
+    ok = isopen(ch) && Base.n_avail(ch) < ch.sz_max &&
+         (try
+              put!(ch, Dict{String, Any}(event)); true
+          catch
+              false
+          end)
+    if !ok
+        sink.stats.dropped_total += 1
+        StructuredLog.warn("webhook delivery dropped — queue full or closed";
+                           url = _redacted_url(sink.spec.url),
+                           capacity = ch.sz_max)
     end
+    return ok
 end
 
 # ---------------------------------------------------------------------------
