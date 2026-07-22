@@ -14,6 +14,10 @@
 !src/rules/*.json
 !examples/*.json
 
+# Tiny checked-in test fixture (the *.csv rule above is for downloaded
+# datasets, not this hand-written harness fixture).
+!benchmarks/loghub2/toy_structured.csv
+
 # Rust build artefacts
 /rust/target/
 
