@@ -47,7 +47,8 @@ using ChainRulesCore: @ignore_derivatives
 # explicit at the call site (the CLI does this).
 export RMSNorm, GQAAttention, SwiGLUFFN, TransformerBlock,
        transformer_encoder, transformer_decoder,
-       transformer_decoder_loss, transformer_encoder_loss,
+       transformer_decoder_loss, transformer_decoder_nll,
+       transformer_encoder_loss,
        embed_sequences, d_ff_swiglu
 
 # ---------------------------------------------------------------------------
@@ -532,6 +533,43 @@ function transformer_decoder_loss(model, ps, st,
         total -= lp[Int(targets[t, b]), t, b]
     end
     return total / (Tm * B), st_new
+end
+
+"""
+    transformer_decoder_nll(model, ps, st, sequence) -> Vector{Float64}
+
+Per-**sequence** (per-column) mean negative-log-likelihood — one
+scalar for each of the `B` columns of the `(seqlen, B)` batch, from a
+**single** causal forward pass. This is the quantity
+[`transformer_decoder_loss`] averages across the batch, unreduced:
+`transformer_decoder_loss(...)[1] == mean(transformer_decoder_nll(...))`.
+
+Because the decoder is causal (each column attends only within
+itself), a batched `(seqlen, B)` forward is numerically identical to
+`B` separate `(seqlen, 1)` forwards — so this is a drop-in, exact,
+batched replacement for calling the loss once per column. Used by the
+streaming worker to amortize the transformer forward over a
+micro-batch of lines.
+"""
+function transformer_decoder_nll(model, ps, st,
+                                 sequence::AbstractMatrix{<:Integer})
+    T_, B = size(sequence)
+    T_ >= 2 || throw(ArgumentError("sequence must have at least 2 time steps"))
+    inputs  = @view sequence[1:(T_ - 1), :]
+    targets = @view sequence[2:T_, :]
+    h, _ = model(inputs, ps, st)                                # (d_model, T-1, B)
+    logits = _tied_logits(h, ps.layer_1.weight)
+    lp = logsoftmax(logits; dims = 1)
+    Tm = T_ - 1
+    out = Vector{Float64}(undef, B)
+    @inbounds for b in 1:B
+        acc = zero(eltype(lp))
+        for t in 1:Tm
+            acc -= lp[Int(targets[t, b]), t, b]
+        end
+        out[b] = Float64(acc) / Tm
+    end
+    return out
 end
 
 """

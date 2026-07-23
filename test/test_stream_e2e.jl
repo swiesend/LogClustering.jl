@@ -260,10 +260,10 @@ end
         data = _write_lines(corpus)
         rules = _write_json(Dict("version" => 1, "rules" => []))
 
-        function _nlls(dedup)
+        function _nlls(; dedup = "off", batch = 1)
             r = _e2e_capture(() -> CLI.main(["stream",
                 "--model", model, "--rules", rules, "--data", data,
-                "--emit-all", "--dedup", dedup,
+                "--emit-all", "--dedup", dedup, "--batch-lines", string(batch),
                 "--warmup-lines", "0", "--warmup-seconds", "0",
                 "--status-interval", "0", "--quiet", "--log-level", "error"]))
             @test r.code == 0
@@ -272,11 +272,17 @@ end
                     for e in evs if String(e["event"]) == "line"]
         end
 
-        off    = _nlls("off")
-        masked = _nlls("masked")
-        @test length(off) == length(masked) == length(corpus)
-        # Memoization must be exact: every per-line NLL identical.
-        @test all(off .≈ masked)
+        base   = _nlls()                              # dedup off, batch 1
+        masked = _nlls(; dedup = "masked")            # P2 memo
+        batched = _nlls(; batch = 8)                  # P3 micro-batch
+        both   = _nlls(; dedup = "masked", batch = 8) # P2 + P3 composed
+        @test length(base) == length(corpus)
+        # Every variant must produce byte-identical per-line NLLs — the
+        # decoder attends only within a sequence, so batching and memoing
+        # are exact, not approximate.
+        @test all(base .≈ masked)
+        @test all(base .≈ batched)
+        @test all(base .≈ both)
     end
 
 end

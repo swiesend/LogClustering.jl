@@ -7,7 +7,8 @@ using LogClustering
 using LogClustering.Transformer:
     Transformer, RMSNorm, GQAAttention, SwiGLUFFN, TransformerBlock,
     transformer_encoder, transformer_decoder,
-    transformer_decoder_loss, transformer_encoder_loss,
+    transformer_decoder_loss, transformer_decoder_nll,
+    transformer_encoder_loss,
     embed_sequences,
     rope_cache, apply_rope, rotate_half, d_ff_swiglu
 
@@ -168,6 +169,29 @@ end
         g = Zygote.gradient(p -> first(transformer_decoder_loss(m, p, st, seq)), ps)[1]
         @test g !== nothing
         @test any(!iszero, g.layer_1.weight)                    # tied LM head
+    end
+
+    @testset "transformer_decoder_nll: per-column, batched == single, == loss-mean" begin
+        m = transformer_decoder(12; d_model = 16, n_layers = 2,
+                                n_heads = 4, n_kv_heads = 2,
+                                max_seq_len = 16, dropout = 0.0)
+        ps, st = Lux.setup(RNG_TX, m)
+        st_t = Lux.testmode(st)
+        seq = rand(RNG_TX, 1:12, 8, 5)                          # (seqlen, batch)
+        nlls = transformer_decoder_nll(m, ps, st_t, seq)
+        @test length(nlls) == 5
+        @test all(isfinite, nlls) && all(>=(0), nlls)
+        # Equals the batch-mean the scalar loss reports.
+        loss, _ = transformer_decoder_loss(m, ps, st_t, seq)
+        @test sum(nlls) / length(nlls) ≈ loss rtol=1e-6
+        # A batched forward equals B separate single-column forwards
+        # (the decoder attends only within a column) — the exactness
+        # property the streaming micro-batch relies on.
+        single = [transformer_decoder_nll(m, ps, st_t,
+                    reshape(seq[:, j], :, 1))[1] for j in 1:5]
+        @test all(isapprox.(nlls, single; rtol = 1e-6))
+        @test_throws ArgumentError transformer_decoder_nll(m, ps, st_t,
+            rand(RNG_TX, 1:12, 1, 2))
     end
 
     @testset "Encoder MLM loss is non-negative and differentiable" begin

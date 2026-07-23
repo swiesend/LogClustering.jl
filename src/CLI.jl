@@ -43,8 +43,8 @@ using ..DeepKATE: DeepKATE, deep_kate
 using ..VQVAE: vq_vae, assign_codes, VectorQuantizer
 using ..SeqLSTM: seq_lstm, seq_lstm_loss
 using ..Transformer: Transformer, transformer_encoder, transformer_decoder,
-                     transformer_decoder_loss, transformer_encoder_loss,
-                     embed_sequences
+                     transformer_decoder_loss, transformer_decoder_nll,
+                     transformer_encoder_loss, embed_sequences
 using ..Instance: ValueNoveltyDetector, update!, anomaly_score, combined_anomaly,
                   value_novelty
 using ..Sparsity: sparsity_clusters
@@ -1135,6 +1135,24 @@ function _per_line_decoder_nll(art, lines::Vector{String})::Vector{Float32}
     return nlls
 end
 
+"""
+    _decoder_nll_batch(art, lines) -> Vector{Float64}
+
+Batched per-line decoder NLL: one `sequence_matrix(lines)` + one
+`transformer_decoder_nll` forward for the whole batch. Because the
+decoder attends only within a column, this is byte-identical to
+`_per_line_decoder_nll` called once per line — it just amortizes the
+forward. Used by the streaming micro-batch path.
+"""
+function _decoder_nll_batch(art, lines::Vector{String})::Vector{Float64}
+    isempty(lines) && return Float64[]
+    vocab = _require_vocab(art, :transformer_decoder)
+    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
+    S = sequence_matrix(lines, vocab; seqlen = seqlen)
+    return transformer_decoder_nll(art.model, art.ps,
+                                   Lux.testmode(art.st), S)
+end
+
 function _print_score_help()
     println("""
     usage: logcluster score [--detector PATH] [--model PATH]
@@ -1418,6 +1436,8 @@ function cmd_stream(args::Vector{String})::Int
         ("use-patterns",       "",     :path),       # SQLite path; auto-promote pinned patterns
         ("dedup",              "off",  :string),      # off | masked
         ("dedup-window",       4096,   :int),
+        ("batch-lines",        1,      :int),         # micro-batch transformer forward
+        ("batch-ms",           0.0,    :float),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
@@ -1581,6 +1601,8 @@ function cmd_stream(args::Vector{String})::Int
     max_events = Int(opts["max-events"])
     status_interval = Float64(opts["status-interval"])
     exit_on_trigger = opts["exit-on-trigger"]
+    batch_lines = max(1, Int(opts["batch-lines"]))
+    batch_ms    = max(0.0, Float64(opts["batch-ms"]))
 
     StructuredLog.info("stream started";
                        model = String(opts["model"]),
@@ -1599,97 +1621,128 @@ function cmd_stream(args::Vector{String})::Int
     shutdown_reason = "eof"
 
     try
-        for ev in ch
-            lines_processed += 1
-            ir = _infer(inferer, ev)
-            triggers = Rules.evaluate(rs, ir)
-            # Sidecar: drain-cluster pinned patterns aren't part of the
-            # rule engine because the engine has no DrainTemplateRule
-            # kind. Match them directly and synthesise TriggerEvent
-            # rows so the downstream emit/persist paths see them.
-            # Honour each pattern's cooldown_s (per-pattern last-fired
-            # clock in `drain_last_fired`) and route by severity/rule_id
-            # so a crit drain pattern reaches webhooks — a hot template
-            # would otherwise flood one alert per matching line.
-            now_t = time()
-            for p in drain_pinned
-                Memory.PatternCatalog.match_line(p, ir) || continue
-                rid = "pattern:$(p.id):$(p.name)"
-                if (now_t - get(drain_last_fired, rid, -Inf)) < p.cooldown_s
-                    continue
-                end
-                drain_last_fired[rid] = now_t
-                push!(triggers, Rules.TriggerEvent(
-                    rid,
-                    :drain_pattern,
-                    p.severity,
-                    Int(get(ir, "line_id", ev.line_id)),
-                    String(get(ir, "line", ev.line)),
-                    Dict{String, Any}(
-                        "pattern_id" => p.id,
-                        "match_kind" => "drain",
-                        "cluster_id" => get(get(ir, "drain", Dict{String,Any}()),
-                                             "cluster_id", nothing),
-                    ),
-                    Rules.route_sinks_for(rs; severity = p.severity, rule_id = rid),
-                    Dates.now(Dates.UTC),
-                ))
+        done = false
+        while !done
+            # Block for the first event; a closed+drained channel ends
+            # the loop. InterruptException (SIGINT) propagates to the
+            # outer catch for graceful shutdown.
+            local ev0
+            try
+                ev0 = take!(ch)
+            catch e
+                e isa InvalidStateException && break   # channel closed
+                rethrow()
             end
-            if !isempty(triggers) || opts["emit-all"]
-                _emit_line_records(ir, ev, triggers, opts)
-                # Forward triggers to the webhook sink (if any).
-                # enqueue! is non-blocking: a full queue drops + counts
-                # so a slow endpoint can't stall the inference loop.
-                if webhook_ch !== nothing
-                    for t in triggers
-                        if "webhook:cli" in t.sinks ||
-                           any(startswith(s, "webhook:") for s in t.sinks)
-                            SinksWebhook.enqueue!(webhook_ch,
-                                _trigger_to_dict(t, ir), webhook_sink)
+            # Opportunistic micro-batch: drain whatever is *already*
+            # queued (a backlog under load) up to batch_lines, so the
+            # transformer forward is amortized — but never wait when the
+            # channel is empty, so light load adds zero latency. With
+            # batch_ms > 0, wait briefly for a fuller batch under bursty
+            # load. batch_lines = 1 (default) = today's behavior exactly.
+            evs = Stream.LineEvent[ev0]
+            entries = Any[_cheap_or_memo!(inferer, ev0)]
+            while length(evs) < batch_lines && isready(ch)
+                e2 = try; take!(ch); catch; break; end
+                push!(evs, e2); push!(entries, _cheap_or_memo!(inferer, e2))
+            end
+            if batch_ms > 0 && length(evs) < batch_lines
+                deadline = time() + batch_ms / 1000
+                while length(evs) < batch_lines && time() < deadline
+                    if isready(ch)
+                        e2 = try; take!(ch); catch; break; end
+                        push!(evs, e2); push!(entries, _cheap_or_memo!(inferer, e2))
+                    else
+                        sleep(0.001)
+                    end
+                end
+            end
+
+            # One batched transformer forward fills every missing NLL.
+            _fill_batch_nll!(inferer, entries)
+
+            # Process each buffered line in input order.
+            for k in eachindex(evs)
+                ev = evs[k]
+                ir = entries[k][1]::Dict{String, Any}
+                lines_processed += 1
+                triggers = Rules.evaluate(rs, ir)
+                # Sidecar: drain-cluster pinned patterns aren't part of the
+                # rule engine because the engine has no DrainTemplateRule
+                # kind. Match them directly and synthesise TriggerEvent
+                # rows so the downstream emit/persist paths see them.
+                # Honour each pattern's cooldown_s and route by
+                # severity/rule_id so a crit drain pattern reaches webhooks.
+                now_t = time()
+                for p in drain_pinned
+                    Memory.PatternCatalog.match_line(p, ir) || continue
+                    rid = "pattern:$(p.id):$(p.name)"
+                    if (now_t - get(drain_last_fired, rid, -Inf)) < p.cooldown_s
+                        continue
+                    end
+                    drain_last_fired[rid] = now_t
+                    push!(triggers, Rules.TriggerEvent(
+                        rid,
+                        :drain_pattern,
+                        p.severity,
+                        Int(get(ir, "line_id", ev.line_id)),
+                        String(get(ir, "line", ev.line)),
+                        Dict{String, Any}(
+                            "pattern_id" => p.id,
+                            "match_kind" => "drain",
+                            "cluster_id" => get(get(ir, "drain", Dict{String,Any}()),
+                                                 "cluster_id", nothing),
+                        ),
+                        Rules.route_sinks_for(rs; severity = p.severity, rule_id = rid),
+                        Dates.now(Dates.UTC),
+                    ))
+                end
+                if !isempty(triggers) || opts["emit-all"]
+                    _emit_line_records(ir, ev, triggers, opts)
+                    if webhook_ch !== nothing
+                        for t in triggers
+                            if "webhook:cli" in t.sinks ||
+                               any(startswith(s, "webhook:") for s in t.sinks)
+                                SinksWebhook.enqueue!(webhook_ch,
+                                    _trigger_to_dict(t, ir), webhook_sink)
+                            end
                         end
                     end
                 end
-            end
-            # Persist triggers + optionally the line itself. Drops on a
-            # full writer channel are counted, never blocking.
-            if mem_ch !== nothing
-                for t in triggers
-                    _enqueue_trigger_write(mem_ch, mem_session_id, t, ir) ||
-                        (mem_writes_dropped += 1)
-                    # Triggers originating from a pinned pattern (synthesised
-                    # rule or drain sidecar) also record a pattern_matches
-                    # row so `insights --pinned` / report reflect activity.
-                    pid = _pattern_id_from_rule(t.rule_id)
-                    if pid !== nothing
-                        _enqueue_pattern_match_write(mem_ch, mem_session_id,
-                                                     pid, t) ||
+                if mem_ch !== nothing
+                    for t in triggers
+                        _enqueue_trigger_write(mem_ch, mem_session_id, t, ir) ||
+                            (mem_writes_dropped += 1)
+                        pid = _pattern_id_from_rule(t.rule_id)
+                        if pid !== nothing
+                            _enqueue_pattern_match_write(mem_ch, mem_session_id,
+                                                         pid, t) ||
+                                (mem_writes_dropped += 1)
+                        end
+                    end
+                    if persist_lines_mode === :all ||
+                       (persist_lines_mode === :sampled &&
+                        (lines_processed - 1) % persist_lines_rate == 0)
+                        _enqueue_line_write(mem_ch, mem_session_id, ev, ir) ||
                             (mem_writes_dropped += 1)
                     end
                 end
-                if persist_lines_mode === :all ||
-                   (persist_lines_mode === :sampled &&
-                    (lines_processed - 1) % persist_lines_rate == 0)
-                    _enqueue_line_write(mem_ch, mem_session_id, ev, ir) ||
-                        (mem_writes_dropped += 1)
+                for t in triggers
+                    triggers_total += 1
+                    by_rule[t.rule_id] = get(by_rule, t.rule_id, 0) + 1
                 end
-            end
-            for t in triggers
-                triggers_total += 1
-                by_rule[t.rule_id] = get(by_rule, t.rule_id, 0) + 1
-            end
-            if status_interval > 0 && !opts["quiet"] &&
-               (time() - last_status) >= status_interval
-                _emit_status(started_at, lines_processed, triggers_total,
-                             by_rule, tail_stats, ch, inferer)
-                # Push auto:* baselines to the shared warm store off the
-                # hot path (never per line) so sibling shards converge.
-                Rules.persist_sketches!(rs)
-                last_status = time()
-            end
-            if max_events > 0 && lines_processed >= max_events
-                shutdown_reason = "max_events"
-                Stream.stop!(stop_signal)
-                break
+                if status_interval > 0 && !opts["quiet"] &&
+                   (time() - last_status) >= status_interval
+                    _emit_status(started_at, lines_processed, triggers_total,
+                                 by_rule, tail_stats, ch, inferer)
+                    Rules.persist_sketches!(rs)
+                    last_status = time()
+                end
+                if max_events > 0 && lines_processed >= max_events
+                    shutdown_reason = "max_events"
+                    Stream.stop!(stop_signal)
+                    done = true
+                    break
+                end
             end
         end
     catch e
@@ -1958,12 +2011,16 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
 end
 
 """
-    _infer(inf, ev) -> Dict{String, Any}
+    _infer_cheap(inf, ev) -> (ir, needs_nll::Bool, body::String)
 
-Build the InferResult dict consumed by the rule engine and emitted
-on stdout. Stable shape per plan §3.
+The per-line inference work that is *cheap*: framing, Drain template
+assignment, value-novelty. The (expensive) transformer_decoder NLL is
+NOT computed here — `needs_nll` flags that `ir["transformer_decoder"]`
+is still missing so the caller can batch the forward across a
+micro-batch of lines (see the worker loop) or fill it single-line
+(see [`_infer`]). `body` is the framed message used as the model input.
 """
-function _infer(inf::StreamInferer, ev::Stream.LineEvent)
+function _infer_cheap(inf::StreamInferer, ev::Stream.LineEvent)
     raw_line = ev.line
     body = raw_line
     frame_payload = nothing
@@ -1986,23 +2043,12 @@ function _infer(inf::StreamInferer, ev::Stream.LineEvent)
     frame_payload === nothing || (ir["frame"] = frame_payload)
     ev.partial && (ir["partial"] = true)
 
+    needs_nll = false
     if inf.bundle_kind === :drain
         cid, tpl = process!(inf.artifact, body)
         ir["drain"] = Dict{String, Any}("cluster_id" => cid, "template" => tpl)
     elseif inf.bundle_kind === :transformer_decoder
-        # Memoize the NLL by masked template when --dedup masked is on:
-        # equal templates → identical masked token sequence → identical
-        # NLL, so the transformer forward is skipped on a near-dup. The
-        # rule engine still evaluates every line (rate/keyword rules must
-        # see each occurrence) — only the model forward is elided.
-        nll = if inf.nll_memo === nothing
-            Float64(_per_line_decoder_nll(inf.artifact, [body])[1])
-        else
-            key = mask_line(body)
-            Dedup.memoize!(inf.nll_memo, key,
-                () -> Float64(_per_line_decoder_nll(inf.artifact, [body])[1]))
-        end
-        ir["transformer_decoder"] = Dict{String, Any}("nll" => nll)
+        needs_nll = true                     # filled by the batch forward
     end
 
     if inf.detector !== nothing
@@ -2012,7 +2058,95 @@ function _infer(inf::StreamInferer, ev::Stream.LineEvent)
             ir["novelty"] = Dict{String, Any}("value_novelty" => Float64(nov))
         end
     end
+    return ir, needs_nll, body
+end
+
+"""
+    _infer(inf, ev) -> Dict{String, Any}
+
+Single-line inference (framing + drain + novelty + transformer NLL),
+used by callers that don't micro-batch (e.g. `rules --dry-run`). The
+streaming worker uses [`_infer_cheap`] + a batched NLL forward
+instead. Stable shape per plan §3.
+"""
+function _infer(inf::StreamInferer, ev::Stream.LineEvent)
+    ir, needs_nll, body = _infer_cheap(inf, ev)
+    if needs_nll
+        # Memoize by masked template when --dedup masked is on: equal
+        # templates → identical masked token sequence → identical NLL.
+        nll = if inf.nll_memo === nothing
+            Float64(_per_line_decoder_nll(inf.artifact, [body])[1])
+        else
+            Dedup.memoize!(inf.nll_memo, mask_line(body),
+                () -> Float64(_per_line_decoder_nll(inf.artifact, [body])[1]))
+        end
+        ir["transformer_decoder"] = Dict{String, Any}("nll" => nll)
+    end
     return ir
+end
+
+"""
+    _fill_batch_nll!(inf, buffer)
+
+Fill `ir["transformer_decoder"]` for every buffer entry whose
+`needs_nll` is set, using ONE batched transformer forward. Entries are
+grouped by masked template (equal template ⇒ identical NLL), so each
+distinct template is computed once and the memo (if any) is populated.
+`buffer` is a Vector of mutable `[ir, needs_nll, body]` triples.
+"""
+function _fill_batch_nll!(inf::StreamInferer, buffer::Vector)
+    inf.bundle_kind === :transformer_decoder || return
+    # Group the cache-misses by masked template.
+    reps = String[]                 # one representative body per template
+    key_of = String[]               # masked key per rep (for the memo)
+    idx_by_key = Dict{String, Int}()
+    entries_by_key = Dict{String, Vector{Int}}()
+    for (i, e) in enumerate(buffer)
+        e[2] || continue            # needs_nll
+        body = e[3]::String
+        key = mask_line(body)
+        j = get(idx_by_key, key, 0)
+        if j == 0
+            push!(reps, body); push!(key_of, key)
+            idx_by_key[key] = length(reps)
+            entries_by_key[key] = Int[i]
+        else
+            push!(entries_by_key[key], i)
+        end
+    end
+    isempty(reps) && return
+    nlls = _decoder_nll_batch(inf.artifact, reps)   # one forward for the batch
+    for (r, key) in enumerate(key_of)
+        nll = nlls[r]
+        inf.nll_memo === nothing ||
+            Dedup.memoize!(inf.nll_memo, key, () -> nll)
+        for i in entries_by_key[key]
+            buffer[i][1]["transformer_decoder"] = Dict{String, Any}("nll" => nll)
+            buffer[i][2] = false
+        end
+    end
+    return
+end
+
+"""
+    _cheap_or_memo!(inf, ev) -> Vector{Any}  # [ir, needs_nll, body]
+
+Run [`_infer_cheap`]; if a memo (--dedup) is present and already holds
+this line's masked template, fill the NLL from the cache immediately
+so it isn't sent to the batch forward. Returns a mutable 3-vector the
+worker collects into a micro-batch.
+"""
+function _cheap_or_memo!(inf::StreamInferer, ev::Stream.LineEvent)
+    ir, needs_nll, body = _infer_cheap(inf, ev)
+    if needs_nll && inf.nll_memo !== nothing
+        key = mask_line(body)
+        if haskey(inf.nll_memo, key)
+            nll = Dedup.memoize!(inf.nll_memo, key, () -> 0.0)  # hit
+            ir["transformer_decoder"] = Dict{String, Any}("nll" => nll)
+            needs_nll = false
+        end
+    end
+    return Any[ir, needs_nll, body]
 end
 
 # ---------------------------------------------------------------------------
@@ -2213,6 +2347,17 @@ function _print_stream_help()
                             heartbeat. No effect without a
                             transformer_decoder --model.
       --dedup-window N      recent-window cache capacity (default 4096).
+      --batch-lines N       micro-batch the transformer forward: process
+                            up to N already-queued lines in one forward
+                            pass (default 1 = today's behavior). Only
+                            drains the backlog — never waits when the
+                            channel is empty, so light load adds no
+                            latency. Per-line NLL is byte-identical to
+                            the unbatched path (the decoder attends only
+                            within a sequence). No effect without a
+                            transformer_decoder --model.
+      --batch-ms M          under bursty load, wait up to M ms for a
+                            fuller batch (default 0 = no wait).
     """)
 end
 
