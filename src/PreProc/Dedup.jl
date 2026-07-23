@@ -166,4 +166,61 @@ function dedup(lines::AbstractVector; fpr::Real = 1e-4)
     return uniq, mask
 end
 
+# ---------------------------------------------------------------------------
+# Recent-window LRU memo — near-duplicate *result reuse* for the stream.
+# ---------------------------------------------------------------------------
+
+"""
+    LRUMemo{K, V}(capacity)
+
+Fixed-capacity recent-window cache with FIFO eviction. Used by the
+streaming worker to memoize the expensive per-line model output (e.g.
+the transformer NLL) keyed by the line's masked template: two lines
+with the same typed-slot template mask to the same key and produce an
+*identical* masked token sequence, so the cached result is exact —
+this collapses the dominant near-duplicate cost with zero risk of
+merging genuinely-different lines (unlike SimHash). `hits` / `misses`
+counters feed the status heartbeat.
+"""
+mutable struct LRUMemo{K, V}
+    cap::Int
+    store::Dict{K, V}
+    order::Vector{K}     # front = oldest inserted
+    hits::Int
+    misses::Int
+end
+
+LRUMemo{K, V}(cap::Integer) where {K, V} =
+    LRUMemo{K, V}(Int(cap), Dict{K, V}(), K[], 0, 0)
+
+Base.haskey(m::LRUMemo, k) = haskey(m.store, k)
+Base.length(m::LRUMemo)    = length(m.store)
+
+"""
+    memoize!(m::LRUMemo, key, compute) -> value
+
+Return the cached value for `key`, or call `compute()` (a
+zero-argument closure), cache, and return it. FIFO-evicts the oldest
+entry past `cap`. Bumps `hits`/`misses`.
+"""
+function memoize!(m::LRUMemo{K, V}, key, compute) where {K, V}
+    kk = convert(K, key)
+    v = get(m.store, kk, nothing)
+    if v !== nothing || haskey(m.store, kk)
+        m.hits += 1
+        return m.store[kk]
+    end
+    m.misses += 1
+    val = convert(V, compute())
+    m.store[kk] = val
+    push!(m.order, kk)
+    if length(m.order) > m.cap
+        old = popfirst!(m.order)
+        delete!(m.store, old)
+    end
+    return val
+end
+
+export LRUMemo, memoize!
+
 end # module Dedup

@@ -140,4 +140,20 @@ end
         # Allow 3× the configured rate for the finite-filter tail.
         @test measure_fpr(11, 1000, 10_000, 1e-2) < 0.03
     end
+
+    @testset "LRUMemo — memoize + FIFO eviction + counters" begin
+        m = Dedup.LRUMemo{String, Float64}(3)
+        calls = Ref(0)
+        f(k) = Dedup.memoize!(m, k, () -> (calls[] += 1; Float64(length(k))))
+        @test f("aa")  == 2.0            # miss → compute
+        @test f("aa")  == 2.0            # hit  → cached
+        @test f("bbb") == 3.0            # miss
+        @test calls[]  == 2              # only two computes
+        @test m.hits == 1 && m.misses == 2
+        # Fill past capacity 3 → oldest ("aa") evicted.
+        f("c"); f("dddd")
+        @test length(m) == 3
+        @test !haskey(m, "aa")
+        @test haskey(m, "dddd")
+    end
 end

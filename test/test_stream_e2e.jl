@@ -232,6 +232,53 @@ end
         @test "webhook:cli" in [String(s) for s in trig["sinks"]]
     end
 
+    @testset "--dedup masked memoizes NLL exactly (equals --dedup off)" begin
+        # Tiny transformer_decoder so the stream has an NLL to memoize.
+        train_data = _write_lines([
+            "connection from 10.0.0.1 ok",
+            "connection from 10.0.0.2 ok",
+            "user alice logged in",
+            "user bob logged in",
+            "disk usage 42 percent",
+        ])
+        model = tempname() * ".jld2"
+        r = _e2e_capture(() -> CLI.main(["train",
+            "--kind", "transformer_decoder", "--data", train_data,
+            "--out", model, "--epochs", "2", "--batch", "4", "--seqlen", "8",
+            "--d-model", "16", "--n-layers", "2", "--n-heads", "4",
+            "--n-kv-heads", "2", "--quiet"]))
+        @test r.code == 0
+
+        # A stream corpus with many lines that mask to the same templates
+        # (varying IPs / names / numbers) — dedup should collapse them.
+        corpus = String[]
+        for i in 1:20
+            push!(corpus, "connection from 10.0.0.$i ok")
+            push!(corpus, "user u$i logged in")
+            push!(corpus, "disk usage $i percent")
+        end
+        data = _write_lines(corpus)
+        rules = _write_json(Dict("version" => 1, "rules" => []))
+
+        function _nlls(dedup)
+            r = _e2e_capture(() -> CLI.main(["stream",
+                "--model", model, "--rules", rules, "--data", data,
+                "--emit-all", "--dedup", dedup,
+                "--warmup-lines", "0", "--warmup-seconds", "0",
+                "--status-interval", "0", "--quiet", "--log-level", "error"]))
+            @test r.code == 0
+            evs = [JSON3.read(l) for l in filter(!isempty, split(r.out, '\n'))]
+            return [Float64(e["transformer_decoder"]["nll"])
+                    for e in evs if String(e["event"]) == "line"]
+        end
+
+        off    = _nlls("off")
+        masked = _nlls("masked")
+        @test length(off) == length(masked) == length(corpus)
+        # Memoization must be exact: every per-line NLL identical.
+        @test all(off .≈ masked)
+    end
+
 end
 
 @testset "classify --json / score --json — aliases for --format json" begin

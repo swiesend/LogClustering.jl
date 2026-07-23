@@ -32,6 +32,7 @@ module CLI
 
 using ..Harness: load_loghub, run_parser, format_report, Dataset
 using ..Masking: mask_line, mask_lines, mask_lines_with_values
+using ..Dedup: Dedup
 using ..Drain3: Drain, process!, parse_all
 using ..Featurise: Featurise, Vocabulary, build_vocab, bow,
                    sequence_matrix, tokenise_ids
@@ -1382,6 +1383,7 @@ struct StreamInferer
     artifact::Any
     detector::Any              # ::Union{ValueNoveltyDetector, Nothing}
     framed::Symbol             # :raw | :auto
+    nll_memo::Any              # ::Union{Nothing, Dedup.LRUMemo} — near-dup reuse
 end
 
 function cmd_stream(args::Vector{String})::Int
@@ -1414,10 +1416,14 @@ function cmd_stream(args::Vector{String})::Int
         ("memory-warm-namespace", "",  :string),     # override the auto namespace
         ("memory-warm-flush-on-boot", false, :bool),
         ("use-patterns",       "",     :path),       # SQLite path; auto-promote pinned patterns
+        ("dedup",              "off",  :string),      # off | masked
+        ("dedup-window",       4096,   :int),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
     _apply_config!(opts, "stream")
+    Symbol(opts["dedup"]) in (:off, :masked) ||
+        throw(ArgumentError("--dedup must be off | masked"))
 
     # Configure logger before anything else so all subsequent diagnostics
     # land in the right place.
@@ -1674,7 +1680,7 @@ function cmd_stream(args::Vector{String})::Int
             if status_interval > 0 && !opts["quiet"] &&
                (time() - last_status) >= status_interval
                 _emit_status(started_at, lines_processed, triggers_total,
-                             by_rule, tail_stats, ch)
+                             by_rule, tail_stats, ch, inferer)
                 # Push auto:* baselines to the shared warm store off the
                 # hot path (never per line) so sibling shards converge.
                 Rules.persist_sketches!(rs)
@@ -1941,7 +1947,14 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
         det isa ValueNoveltyDetector ||
             throw(ArgumentError("--detector must be a ValueNoveltyDetector bundle"))
     end
-    return StreamInferer(bundle_kind, artifact, det, framed_mode)
+    # Near-duplicate NLL memo: only meaningful for the (expensive)
+    # transformer_decoder path, keyed by the masked template.
+    memo = nothing
+    if get(opts, "dedup", "off") == "masked" &&
+       bundle_kind === :transformer_decoder
+        memo = Dedup.LRUMemo{String, Float64}(Int(get(opts, "dedup-window", 4096)))
+    end
+    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo)
 end
 
 """
@@ -1977,8 +1990,19 @@ function _infer(inf::StreamInferer, ev::Stream.LineEvent)
         cid, tpl = process!(inf.artifact, body)
         ir["drain"] = Dict{String, Any}("cluster_id" => cid, "template" => tpl)
     elseif inf.bundle_kind === :transformer_decoder
-        nll = _per_line_decoder_nll(inf.artifact, [body])[1]
-        ir["transformer_decoder"] = Dict{String, Any}("nll" => Float64(nll))
+        # Memoize the NLL by masked template when --dedup masked is on:
+        # equal templates → identical masked token sequence → identical
+        # NLL, so the transformer forward is skipped on a near-dup. The
+        # rule engine still evaluates every line (rate/keyword rules must
+        # see each occurrence) — only the model forward is elided.
+        nll = if inf.nll_memo === nothing
+            Float64(_per_line_decoder_nll(inf.artifact, [body])[1])
+        else
+            key = mask_line(body)
+            Dedup.memoize!(inf.nll_memo, key,
+                () -> Float64(_per_line_decoder_nll(inf.artifact, [body])[1]))
+        end
+        ir["transformer_decoder"] = Dict{String, Any}("nll" => nll)
     end
 
     if inf.detector !== nothing
@@ -2034,7 +2058,7 @@ function _emit_line_records(ir, ev, triggers, opts)
 end
 
 function _emit_status(started_at, lines_processed, triggers_total,
-                      by_rule, tail_stats, ch)
+                      by_rule, tail_stats, ch, inferer = nothing)
     uptime = time() - started_at
     rate = uptime > 0 ? lines_processed / uptime : 0.0
     rec = Dict{String, Any}(
@@ -2055,6 +2079,16 @@ function _emit_status(started_at, lines_processed, triggers_total,
             "ingest" => length(ch.data),
         ),
     )
+    if inferer !== nothing && inferer.nll_memo !== nothing
+        m = inferer.nll_memo
+        total = m.hits + m.misses
+        rec["dedup"] = Dict{String, Any}(
+            "hits"      => m.hits,
+            "misses"    => m.misses,
+            "hit_rate"  => total > 0 ? round(m.hits / total; digits = 3) : 0.0,
+            "cache_size" => length(m),
+        )
+    end
     println(stdout, JSON3.write(rec))
     flush(stdout)
 end
@@ -2166,6 +2200,19 @@ function _print_stream_help()
                             keeps 1-in-N (--persist-lines-rate, default
                             100) full line records so `insights
                             --episodes` has a cluster-id stream to mine.
+
+    Performance:
+      --dedup MODE          off (default) | masked. `masked` memoizes
+                            the transformer_decoder NLL by the line's
+                            typed-slot template (equal templates → equal
+                            masked token sequence → identical NLL), so
+                            the transformer forward is skipped on
+                            near-duplicate lines. Rule evaluation still
+                            runs on every line — only the model forward
+                            is elided. Hit-rate is reported in the status
+                            heartbeat. No effect without a
+                            transformer_decoder --model.
+      --dedup-window N      recent-window cache capacity (default 4096).
     """)
 end
 
