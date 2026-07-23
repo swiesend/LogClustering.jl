@@ -27,13 +27,15 @@ module WarmStoreModule
 
 using ...Rules: Rules
 using ..RedisClient: RedisClient, Client, connect_redis, sadd!, sismember,
-                    smembers, ping
+                    smembers, ping, get_str, set!
+using ...TDigests: TDigests
 using SHA: sha256
 using Sockets
 
 export WarmStore, InProcWarmStore, RedisWarmStore,
        open_warm, namespace_for,
-       seen_member, add_member!, load_set, healthy, flush_rule!
+       seen_member, add_member!, load_set, healthy, flush_rule!,
+       load_sketch, merge_sketch!
 
 abstract type WarmStore end
 
@@ -151,6 +153,43 @@ end
 
 @inline _set_key(s::RedisWarmStore, rule_id) =
     "$(s.namespace):set:$rule_id"
+@inline _sketch_key(s::RedisWarmStore, rule_id) =
+    "$(s.namespace):sketch:$rule_id"
+
+# --- t-digest baseline (cross-shard, for auto:* thresholds) --------------
+
+"Load the shared serialized t-digest for `rule_id`, or nothing."
+load_sketch(::InProcWarmStore, _rule_id) = nothing
+load_sketch(s::RedisWarmStore, rule_id::AbstractString) =
+    get_str(s.client, _sketch_key(s, rule_id))
+
+"""
+    merge_sketch!(s, rule_id, blob)
+
+Fold this shard's serialized digest into the shared one (GET-merge-SET)
+so sibling streams converge on a common baseline. Racy across shards
+but the baseline adapts slowly, so an occasional lost update is
+harmless. No-op for [`InProcWarmStore`]."""
+merge_sketch!(::InProcWarmStore, _rule_id, _blob) = nothing
+
+function merge_sketch!(s::RedisWarmStore, rule_id::AbstractString,
+                       blob::AbstractString)
+    key = _sketch_key(s, rule_id)
+    existing = get_str(s.client, key)
+    combined = if existing === nothing || isempty(existing)
+        String(blob)
+    else
+        try
+            d = TDigests.deserialize(existing)
+            TDigests.merge!(d, TDigests.deserialize(String(blob)))
+            TDigests.serialize(d)
+        catch
+            String(blob)
+        end
+    end
+    set!(s.client, key, combined)
+    return nothing
+end
 
 """
     flush_rule!(s, rule_id)
@@ -172,5 +211,9 @@ Rules._warm_seen_member(s::WarmStore, rule_id, v) =
     seen_member(s, String(rule_id), String(v))
 Rules._warm_add_member!(s::WarmStore, rule_id, v) =
     add_member!(s, String(rule_id), String(v))
+Rules._warm_load_sketch(s::WarmStore, rule_id) =
+    load_sketch(s, String(rule_id))
+Rules._warm_merge_sketch!(s::WarmStore, rule_id, blob) =
+    merge_sketch!(s, String(rule_id), String(blob))
 
 end # module WarmStoreModule

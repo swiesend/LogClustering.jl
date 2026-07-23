@@ -99,6 +99,9 @@ using .AutoTune
 include("RCA.jl")
 using .RCA
 
+include("Stats/TDigest.jl")
+using .TDigests
+
 include("Rules.jl")
 using .Rules
 
@@ -132,7 +135,7 @@ export KATE, DeepKATE, DenoisingAE, SoftKATE, Framing, Masking, Dedup,
        Transformer, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
        Sparsity, Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
        AutoTune, RCA, Rules, StructuredLog, Stream, SinksWebhook, Memory,
-       Config, TUI, CLI, Purity, Typing, Merge, Rust
+       Config, TUI, CLI, Purity, Typing, Merge, Rust, TDigests
 
 # ---------------------------------------------------------------------------
 # Precompile workload

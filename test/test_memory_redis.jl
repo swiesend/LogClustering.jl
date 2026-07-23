@@ -9,9 +9,12 @@ using LogClustering.Memory.RedisClient: Client, connect_redis, call,
 using LogClustering.Memory.WarmStore
 using LogClustering.Memory.WarmStore: InProcWarmStore, RedisWarmStore,
                                        open_warm, healthy,
-                                       seen_member, add_member!, load_set
+                                       seen_member, add_member!, load_set,
+                                       load_sketch, merge_sketch!
 using LogClustering.Rules
-using LogClustering.Rules: load_rules, attach_warm_store!, evaluate
+using LogClustering.Rules: load_rules, attach_warm_store!, evaluate,
+                            persist_sketches!
+using LogClustering.TDigests: TDigests
 using LogClustering.Stream: LineEvent
 using LogClustering.StructuredLog
 using Sockets
@@ -265,6 +268,66 @@ end
 
     @testset "open_warm rejects unsupported URL schemes" begin
         @test_throws ArgumentError open_warm("memcached://x")
+    end
+
+    @testset "sketch merge — cross-shard baseline via GET-merge-SET" begin
+        fr = _fake_redis()
+        try
+            store = open_warm("redis://localhost:$(fr.port)/0";
+                              rules_fingerprint = "sketch0000000")
+            @test load_sketch(store, "score_p99") === nothing
+            # Shard A contributes low half, shard B the high half.
+            a = TDigests.TDigest(); b = TDigests.TDigest()
+            for i in 1:5000;      push!(a, Float64(i)); end
+            for i in 5001:10_000; push!(b, Float64(i)); end
+            merge_sketch!(store, "score_p99", TDigests.serialize(a))
+            merge_sketch!(store, "score_p99", TDigests.serialize(b))
+            # The combined sketch spans both halves.
+            combined = TDigests.deserialize(load_sketch(store, "score_p99"))
+            @test TDigests.count(combined) == 10_000
+            @test abs(TDigests.quantile(combined, 0.99) - 9900) < 300
+            close(store)
+        finally
+            close(fr)
+        end
+    end
+end
+
+@testset "Rules — auto:p99 baseline hydrates from + persists to warm store" begin
+    body = """
+    { "version": 1,
+      "defaults": { "warmup_required": false, "cooldown_s": 0 },
+      "rules": [
+        { "id": "p99", "kind": "score_threshold",
+          "metric": "score", "comparison": ">", "value": "auto:p99" } ] }
+    """
+    fr = _fake_redis()
+    try
+        # Session 1 seeds a baseline and persists it to Redis.
+        rs1 = load_rules(IOBuffer(body); warmup_lines = 0, warmup_seconds = 0.0)
+        store1 = open_warm("redis://localhost:$(fr.port)/0";
+                           rules_fingerprint = "hydra00000000")
+        attach_warm_store!(rs1, store1)
+        for i in 1:2000
+            evaluate(rs1, Dict{String,Any}("line"=>"x","line_id"=>i,
+                                            "score"=>Float64(i)))
+        end
+        persist_sketches!(rs1)
+        @test load_sketch(store1, "p99") !== nothing
+
+        # Session 2 (fresh rule set) hydrates that baseline at attach —
+        # so a large value fires immediately without re-warming.
+        rs2 = load_rules(IOBuffer(body); warmup_lines = 0, warmup_seconds = 0.0)
+        store2 = open_warm("redis://localhost:$(fr.port)/0";
+                           rules_fingerprint = "hydra00000000")
+        attach_warm_store!(rs2, store2)
+        # p99 of 1..2000 ≈ 1980; a spike well above must fire on the first line.
+        t = evaluate(rs2, Dict{String,Any}("line"=>"x","line_id"=>1,
+                                            "score"=>50_000.0))
+        @test length(t) == 1
+        close(store1); close(store2)
+    finally
+        close(fr)
     end
 end
 

@@ -53,10 +53,11 @@ module Rules
 
 using JSON3
 using Dates: Dates, DateTime, now, UTC
-using Statistics: mean, std
+using ..TDigests: TDigests
 
 export RuleSet, TriggerEvent, default_rules, load_rules, evaluate,
-       snapshot, route_sinks, route_sinks_for, attach_warm_store!
+       snapshot, route_sinks, route_sinks_for, attach_warm_store!,
+       persist_sketches!
 
 # ---------------------------------------------------------------------------
 # Rule structs (one per kind for type-stable dispatch).
@@ -310,13 +311,45 @@ restart doesn't replay alerts. Returns `rs` (chainable).
 function attach_warm_store!(rs::RuleSet, store)
     rs.warm_store = store
     for r in rs.rules
-        r isa NovelClusterRule || continue
-        # Cheap to call hydrator even when store == InProcWarmStore (no-op).
-        previously = _warm_load_set(store, r.id)
         st = rs.state[r.id]
         st[:warm] = store
-        for v in previously
-            push!(st[:seen], v)
+        if r isa NovelClusterRule
+            # Cheap to call hydrator even for InProcWarmStore (no-op).
+            for v in _warm_load_set(store, r.id)
+                push!(st[:seen], v)
+            end
+        elseif r isa ScoreThresholdRule
+            # Hydrate the auto:* baseline from the shared sketch so a
+            # restart / a sibling shard doesn't start cold.
+            blob = _warm_load_sketch(store, r.id)
+            if blob !== nothing && !isempty(blob)
+                try
+                    TDigests.merge!(st[:digest], TDigests.deserialize(blob))
+                catch
+                end
+            end
+        end
+    end
+    return rs
+end
+
+"""
+    persist_sketches!(rs::RuleSet)
+
+Push every `score_threshold` rule's t-digest baseline back to the
+warm store (GET-merge-SET so sharded streams combine). Called off the
+hot path — e.g. on the streaming status tick — never per line.
+No-op without a warm store.
+"""
+function persist_sketches!(rs::RuleSet)
+    rs.warm_store === nothing && return rs
+    for r in rs.rules
+        r isa ScoreThresholdRule || continue
+        st = rs.state[r.id]
+        try
+            _warm_merge_sketch!(rs.warm_store, r.id,
+                                TDigests.serialize(st[:digest]))
+        catch
         end
     end
     return rs
@@ -329,6 +362,8 @@ end
 _warm_load_set(::Nothing, _rule_id) = String[]
 _warm_seen_member(::Nothing, _rule_id, _value) = false
 _warm_add_member!(::Nothing, _rule_id, _value) = false
+_warm_load_sketch(::Nothing, _rule_id) = nothing
+_warm_merge_sketch!(::Nothing, _rule_id, _blob) = nothing
 
 # Generic fallbacks for any non-`Nothing` store that hasn't yet had
 # a method defined — keep the system safe to evaluate even before
@@ -336,6 +371,8 @@ _warm_add_member!(::Nothing, _rule_id, _value) = false
 _warm_load_set(_s, _rule_id) = String[]
 _warm_seen_member(_s, _rule_id, _value) = false
 _warm_add_member!(_s, _rule_id, _value) = false
+_warm_load_sketch(_s, _rule_id) = nothing
+_warm_merge_sketch!(_s, _rule_id, _blob) = nothing
 
 # Shared helpers for parsing the common fields.
 @inline function _common_fields(r, defaults::Dict{Symbol, Any})
@@ -486,10 +523,12 @@ end
 # evaluators can stash whatever they need (sets, sliding windows, EMAs).
 # ---------------------------------------------------------------------------
 
-const _RESERVOIR_MAX = 1024
-
+# `auto:*` thresholds are backed by a streaming t-digest rather than a
+# bounded FIFO: O(log δ) per line instead of a sort-per-fire, whole-
+# stream accuracy (no recency bias), and mergeable across shards via
+# the Redis warm store.
 _initial_state(::ScoreThresholdRule) =
-    Dict{Symbol, Any}(:last_fired => -Inf, :reservoir => Float64[])
+    Dict{Symbol, Any}(:last_fired => -Inf, :digest => TDigests.TDigest())
 
 _initial_state(::NovelClusterRule) =
     Dict{Symbol, Any}(:last_fired => -Inf, :seen => Set{Any}())
@@ -642,12 +681,8 @@ _ingest_during_cooldown(::NovelTokenRule)   = false
 
 function _ingest!(r::ScoreThresholdRule, ir, st, _t)
     v = _lookup(ir, r.metric)
-    if v isa Number
-        push!(st[:reservoir], Float64(v))
-        if length(st[:reservoir]) > _RESERVOIR_MAX
-            popfirst!(st[:reservoir])
-        end
-    end
+    v isa Number && push!(st[:digest], Float64(v))
+    return nothing
 end
 
 function _ingest!(r::NovelClusterRule, ir, st, _t)
@@ -713,13 +748,16 @@ function _fire_check(r::ScoreThresholdRule, ir, st, _t)
     v isa Number || return (false, Dict{String, Any}())
     fv = Float64(v)
 
+    dg = st[:digest]
     threshold = if r.value_kind === :fixed
         r.value_arg
     elseif r.value_kind === :p99
-        _quantile(st[:reservoir], r.value_arg)
+        q = TDigests.quantile(dg, r.value_arg)
+        isnan(q) ? Inf : q
     elseif r.value_kind === :zscore
-        if length(st[:reservoir]) >= 2
-            mean(st[:reservoir]) + r.value_arg * std(st[:reservoir])
+        if TDigests.count(dg) >= 2
+            m = TDigests.mean(dg); s = TDigests.std(dg)
+            (isnan(m) || isnan(s)) ? Inf : m + r.value_arg * s
         else
             Inf
         end
@@ -729,11 +767,8 @@ function _fire_check(r::ScoreThresholdRule, ir, st, _t)
 
     fired = _compare(r.comparison, fv, threshold)
 
-    # Update the reservoir live — `auto:*` thresholds keep adapting.
-    push!(st[:reservoir], fv)
-    if length(st[:reservoir]) > _RESERVOIR_MAX
-        popfirst!(st[:reservoir])
-    end
+    # Fold the live value in — `auto:*` thresholds keep adapting.
+    push!(dg, fv)
 
     fields = Dict{String, Any}(
         "metric"    => r.metric,
@@ -866,12 +901,6 @@ function _trim_window!(events::Vector{Float64}, now_t::Float64, window_s::Float6
     return events
 end
 
-function _quantile(v::Vector{Float64}, q::Real)
-    isempty(v) && return Inf
-    s = sort(v)
-    idx = clamp(ceil(Int, q * length(s)), 1, length(s))
-    return s[idx]
-end
 
 @inline function _compare(op::Symbol, x::Float64, y::Float64)
     op === :gt && return x > y

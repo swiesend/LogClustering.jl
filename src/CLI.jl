@@ -1675,6 +1675,9 @@ function cmd_stream(args::Vector{String})::Int
                (time() - last_status) >= status_interval
                 _emit_status(started_at, lines_processed, triggers_total,
                              by_rule, tail_stats, ch)
+                # Push auto:* baselines to the shared warm store off the
+                # hot path (never per line) so sibling shards converge.
+                Rules.persist_sketches!(rs)
                 last_status = time()
             end
             if max_events > 0 && lines_processed >= max_events

@@ -28,6 +28,7 @@ using LogClustering
     include("test_persistence.jl")
     include("test_autotune.jl")
     include("test_rca.jl")
+    include("test_tdigest.jl")
     include("test_rules.jl")
     include("test_stream.jl")
     include("test_sinks_webhook.jl")
