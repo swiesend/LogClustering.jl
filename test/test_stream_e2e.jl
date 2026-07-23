@@ -285,6 +285,59 @@ end
         @test all(base .≈ both)
     end
 
+    @testset "--rrcf populates rrcf.score; a clear outlier scores highest" begin
+        # Model-free — no --model needed. Many similar lines + one wildly
+        # different line that must land at the top of the RRCF scores.
+        corpus = String[]
+        for i in 1:200
+            push!(corpus, "normal request user u$i status ok latency low")
+        end
+        push!(corpus, "CRITICAL kernel panic segfault core dumped 0xdeadbeef xyzzy")
+        data = _write_lines(corpus)
+        rules = _write_json(Dict("version" => 1,
+            "defaults" => Dict("warmup_required" => false, "cooldown_s" => 0),
+            "rules" => [Dict("id" => "rcf", "kind" => "score_threshold",
+                             "metric" => "rrcf.score", "comparison" => ">",
+                             "value" => "auto:p99", "severity" => "warn")]))
+        r = _e2e_capture(() -> CLI.main(["stream", "--rules", rules,
+            "--data", data, "--rrcf", "--rrcf-size", "64", "--emit-all",
+            "--warmup-lines", "0", "--warmup-seconds", "0",
+            "--status-interval", "0", "--quiet", "--log-level", "error"]))
+        @test r.code == 0
+        evs = [JSON3.read(l) for l in filter(!isempty, split(r.out, '\n'))]
+        lines = [e for e in evs if String(e["event"]) == "line"]
+        @test length(lines) == length(corpus)
+        # Every line carries an rrcf.score in [0,1].
+        scores = [Float64(e["rrcf"]["score"]) for e in lines]
+        @test length(scores) == length(corpus)
+        @test all(0.0 .<= scores .<= 1.0)
+        # By the end of the stream the forest has learned the normal
+        # pattern. Restrict to POST-WARMUP lines (the reservoir-warmup
+        # prefix scores erratically high before the forest stabilizes):
+        # among those, the anomalous last line is the single highest,
+        # and well above the settled-normal band.
+        outlier = scores[end]
+        settled = scores[end-50:end-1]           # recent normal lines
+        @test outlier > 1.5 * (sum(settled) / length(settled))
+        post_warmup = scores[101:end]            # forest stable by here
+        @test argmax(post_warmup) == length(post_warmup)   # outlier is #1
+    end
+
+    @testset "score_threshold rrcf.score without --rrcf warns (inert)" begin
+        data = _write_lines(["a", "b", "c"])
+        rules = _write_json(Dict("version" => 1,
+            "rules" => [Dict("id" => "rcf", "kind" => "score_threshold",
+                             "metric" => "rrcf.score", "comparison" => ">",
+                             "value" => 0.9)]))
+        # No --rrcf → the rule can never fire; boot logs an inert warning
+        # to stderr (cmd_stream reconfigures the logger to stderr, so it
+        # lands in the captured `err`, not a pre-set buffer).
+        r = _e2e_capture(() -> CLI.main(["stream", "--rules", rules,
+            "--data", data, "--warmup-lines", "0", "--warmup-seconds", "0",
+            "--status-interval", "0", "--quiet", "--log-level", "warn"]))
+        @test occursin("rrcf", r.err) && occursin("requires --rrcf", r.err)
+    end
+
 end
 
 @testset "classify --json / score --json — aliases for --format json" begin

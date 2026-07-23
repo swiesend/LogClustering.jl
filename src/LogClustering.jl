@@ -30,6 +30,9 @@ using .Baselines
 include("Anomaly/Instance.jl")
 using .Instance
 
+include("Anomaly/RRCF.jl")
+using .RRCF
+
 include("Models/SeqLSTM.jl")
 using .SeqLSTM
 
@@ -135,7 +138,7 @@ export KATE, DeepKATE, DenoisingAE, SoftKATE, Framing, Masking, Dedup,
        Transformer, VQVAE, SimCSE, Metrics, Compression, Harness, CV,
        Sparsity, Pipeline, Drain3, Canonical, Persistence, PersistenceGlue,
        AutoTune, RCA, Rules, StructuredLog, Stream, SinksWebhook, Memory,
-       Config, TUI, CLI, Purity, Typing, Merge, Rust, TDigests
+       Config, TUI, CLI, Purity, Typing, Merge, Rust, TDigests, RRCF
 
 # ---------------------------------------------------------------------------
 # Precompile workload

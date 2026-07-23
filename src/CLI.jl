@@ -33,6 +33,7 @@ module CLI
 using ..Harness: load_loghub, run_parser, format_report, Dataset
 using ..Masking: mask_line, mask_lines, mask_lines_with_values
 using ..Dedup: Dedup
+using ..RRCF: RRCF
 using ..Drain3: Drain, process!, parse_all
 using ..Featurise: Featurise, Vocabulary, build_vocab, bow,
                    sequence_matrix, tokenise_ids
@@ -1405,6 +1406,7 @@ struct StreamInferer
     detector::Any              # ::Union{ValueNoveltyDetector, Nothing}
     framed::Symbol             # :raw | :auto
     nll_memo::Any              # ::Union{Nothing, Dedup.LRUMemo} — near-dup reuse
+    rrcf::Any                  # ::Union{Nothing, RRCF.RCForest} — model-free anomaly
 end
 
 function cmd_stream(args::Vector{String})::Int
@@ -1442,6 +1444,10 @@ function cmd_stream(args::Vector{String})::Int
         ("batch-lines",        1,      :int),         # micro-batch transformer forward
         ("batch-ms",           0.0,    :float),
         ("drain-max-clusters", 0,      :int),         # bound a loaded drain (0 = keep bundle's)
+        ("rrcf",               false,  :bool),        # model-free random-cut-forest anomaly
+        ("rrcf-trees",         40,     :int),
+        ("rrcf-size",          256,    :int),
+        ("rrcf-dims",          256,    :int),
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
@@ -1861,6 +1867,9 @@ function _warn_inert_rules(rs, inferer)
             elseif startswith(r.metric, "novelty.") &&
                    inferer.detector === nothing
                 "requires --detector"
+            elseif startswith(r.metric, "rrcf.") &&
+                   inferer.rrcf === nothing
+                "requires --rrcf"
             else
                 nothing
             end
@@ -2016,7 +2025,18 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
        bundle_kind === :transformer_decoder
         memo = Dedup.LRUMemo{String, Float64}(Int(get(opts, "dedup-window", 4096)))
     end
-    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo)
+    # Model-free RRCF anomaly detector over hashed shingles of the
+    # masked line — populates ir["rrcf"]["score"] for score_threshold
+    # rules. Off by default.
+    forest = nothing
+    if get(opts, "rrcf", false) == true
+        forest = RRCF.RCForest(;
+            dims        = Int(get(opts, "rrcf-dims", 256)),
+            n_trees     = Int(get(opts, "rrcf-trees", 40)),
+            sample_size = Int(get(opts, "rrcf-size", 256)),
+            rebuild_every = Int(get(opts, "rrcf-size", 256)))
+    end
+    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo, forest)
 end
 
 """
@@ -2067,7 +2087,38 @@ function _infer_cheap(inf::StreamInferer, ev::Stream.LineEvent)
             ir["novelty"] = Dict{String, Any}("value_novelty" => Float64(nov))
         end
     end
+
+    # Model-free random-cut-forest anomaly over the masked template's
+    # hashed shingles. Score-then-learn is inside observe!.
+    if inf.rrcf !== nothing
+        feat = _rrcf_features(mask_line(body), inf.rrcf.dims)
+        s = RRCF.observe!(inf.rrcf, feat)
+        ir["rrcf"] = Dict{String, Any}("score" => s)
+    end
     return ir, needs_nll, body
+end
+
+"""
+    _rrcf_features(masked::AbstractString, dims::Int) -> Vector{Float64}
+
+Hash the masked line's word tokens + char 3-grams into a fixed
+`dims`-vector of counts — a cheap, vocab-free feature the random-cut
+forest can score. Two lines with the same template hash identically.
+"""
+function _rrcf_features(masked::AbstractString, dims::Int)
+    v = zeros(Float64, dims)
+    @inbounds for tok in split(masked)
+        v[mod(hash(tok), dims) + 1] += 1.0
+    end
+    s = String(masked)
+    if ncodeunits(s) >= 3
+        cu = codeunits(s)
+        @inbounds for i in 1:(length(cu) - 2)
+            h = hash((cu[i], cu[i+1], cu[i+2]))
+            v[mod(h, dims) + 1] += 1.0
+        end
+    end
+    return v
 end
 
 """
@@ -2194,6 +2245,12 @@ function _emit_line_records(ir, ev, triggers, opts)
         end
         if haskey(ir, "transformer_decoder")
             rec["transformer_decoder"] = ir["transformer_decoder"]
+        end
+        if haskey(ir, "rrcf")
+            rec["rrcf"] = ir["rrcf"]
+        end
+        if haskey(ir, "novelty")
+            rec["novelty"] = ir["novelty"]
         end
         println(stdout, JSON3.write(rec))
     end
@@ -2371,6 +2428,19 @@ function _print_stream_help()
                             to N via LRU eviction (protects memory on a
                             long-running stream). 0 (default) keeps the
                             bundle's own setting.
+
+    Model-free anomaly (RRCF):
+      --rrcf                enable a streaming random-cut / isolation
+                            forest over hashed shingles of each masked
+                            line (no model needed). Populates
+                            `rrcf.score` ∈ [0,1] per line — reference it
+                            from a score_threshold rule, e.g.
+                            metric "rrcf.score" comparison ">" value
+                            "auto:p99". Higher = more anomalous.
+      --rrcf-trees N        forest size (default 40).
+      --rrcf-size N         reservoir / subsample size + rebuild period
+                            (default 256).
+      --rrcf-dims N         feature vector dimension (default 256).
     """)
 end
 
