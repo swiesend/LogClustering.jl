@@ -83,6 +83,16 @@ mutable struct Drain
     root::TreeNode
     clusters::Vector{LogCluster}
     next_id::Int
+    # --- LRU eviction bookkeeping (NOT persisted; rebuilt on load) ---
+    # Parallel to `clusters`: `last_seen[i]` is the access tick when
+    # `clusters[i]` was last touched; `owner[i]` is the leaf node whose
+    # `clusters` index list references slot `i`. When `max_clusters` is
+    # reached, the globally coldest cluster is evicted and its slot
+    # reused — so `clusters` stays fixed-size (bounded memory) and no
+    # index shifting is needed.
+    access_tick::Int
+    last_seen::Vector{Int}
+    owner::Vector{TreeNode}
 end
 
 function Drain(; depth::Integer = 4,
@@ -95,8 +105,33 @@ function Drain(; depth::Integer = 4,
     0 <= sim_th <= 1 || throw(ArgumentError("sim_th must be in [0, 1]"))
     return Drain(Int(depth), Float64(sim_th), Int(max_children),
                  Int(max_clusters), String(wildcard),
-                 parametrize, TreeNode(), LogCluster[], 1)
+                 parametrize, TreeNode(), LogCluster[], 1,
+                 0, Int[], TreeNode[])
 end
+
+# Rebuild the parallel LRU arrays after a bundle load (the tree +
+# clusters are deserialized, but the bookkeeping isn't persisted).
+function rebuild_lru!(d::Drain)
+    n = length(d.clusters)
+    d.last_seen = zeros(Int, n)
+    d.owner = Vector{TreeNode}(undef, n)
+    d.access_tick = 0
+    _index_nodes!(d, d.root)
+    return d
+end
+
+function _index_nodes!(d::Drain, node::TreeNode)
+    @inbounds for idx in node.clusters
+        1 <= idx <= length(d.owner) && (d.owner[idx] = node)
+    end
+    for child in values(node.children)
+        _index_nodes!(d, child)
+    end
+    return nothing
+end
+
+@inline _touch!(d::Drain, idx::Int) =
+    (d.last_seen[idx] = (d.access_tick += 1); nothing)
 
 "Any token with an ASCII digit is a parameter candidate."
 function default_parametrize(t::AbstractString)
@@ -125,25 +160,61 @@ function process!(d::Drain, line::AbstractString)
     best_idx, best_sim = _best_match(d, node, tokens)
 
     if best_idx != 0 && best_sim >= d.sim_th
-        cl = d.clusters[node.clusters[best_idx]]
+        slot = node.clusters[best_idx]
+        cl = d.clusters[slot]
         _merge_into_template!(cl, tokens, d.wildcard)
         cl.size += 1
+        _touch!(d, slot)
         return (cl.id, template_of(cl))
     end
 
-    # New cluster.
+    # New cluster. At the cap, evict the globally least-recently-used
+    # cluster and reuse its slot (bounded memory, no index shifting) —
+    # this replaces the old "stuff into the first leaf cluster" stub,
+    # which both grew imprecise over time and threw when the current
+    # leaf had no clusters yet.
     if d.max_clusters > 0 && length(d.clusters) >= d.max_clusters
-        # Max clusters reached — stuff into the first existing leaf cluster.
-        cl = d.clusters[first(node.clusters)]
-        _merge_into_template!(cl, tokens, d.wildcard)
-        cl.size += 1
-        return (cl.id, template_of(cl))
+        victim = _lru_victim(d)
+        if victim != 0
+            vnode = d.owner[victim]
+            pos = findfirst(==(victim), vnode.clusters)
+            pos === nothing || deleteat!(vnode.clusters, pos)
+            cl = LogCluster(d.next_id, copy(tokens), 1)
+            d.clusters[victim] = cl
+            d.owner[victim] = node
+            push!(node.clusters, victim)
+            _touch!(d, victim)
+            d.next_id += 1
+            return (cl.id, template_of(cl))
+        end
     end
+
     cl = LogCluster(d.next_id, copy(tokens), 1)
     push!(d.clusters, cl)
     push!(node.clusters, length(d.clusters))
+    push!(d.last_seen, 0)
+    push!(d.owner, node)
+    _touch!(d, length(d.clusters))
     d.next_id += 1
     return (cl.id, template_of(cl))
+end
+
+# Index of the globally coldest cluster (min last_seen). O(n) scan —
+# only runs when creating a new cluster past the cap, which is rare in
+# steady state. Returns 0 when bookkeeping is empty (never at cap).
+function _lru_victim(d::Drain)
+    n = length(d.last_seen)
+    n == 0 && return 0
+    victim = 0
+    best = typemax(Int)
+    @inbounds for i in 1:n
+        isassigned(d.owner, i) || continue
+        if d.last_seen[i] < best
+            best = d.last_seen[i]
+            victim = i
+        end
+    end
+    return victim
 end
 
 """

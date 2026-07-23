@@ -151,6 +151,36 @@ end
         end
     end
 
+    @testset "train --kind drain --max-clusters bounds the model" begin
+        # A corpus with many clearly-distinct templates, capped at 2.
+        data = tempname() * ".log"
+        open(data, "w") do io
+            for i in 1:12
+                println(io, "template alpha $i unique aa bb cc")
+                println(io, "wholly different beta $i xx yy zz")
+                println(io, "third gamma $i pp qq rr")
+            end
+        end
+        model = tempname() * ".jld2"
+        try
+            r = _with_captured_stdio(() -> CLI.main(["train",
+                "--kind", "drain", "--data", data, "--out", model,
+                "--max-clusters", "2"]))
+            @test r.code == 0
+            # stderr reports "drain: N templates …"; N must be ≤ 2.
+            m = match(r"drain:\s+(\d+)\s+templates", r.err)
+            @test m !== nothing
+            @test parse(Int, m.captures[1]) <= 2
+            # The bundle reloads and the LRU bookkeeping is rebuilt.
+            art = LogClustering.Persistence.load_and_rehydrate(model)
+            @test length(art.clusters) == length(art.last_seen)
+        finally
+            for p in (data, model)
+                isfile(p) && rm(p)
+            end
+        end
+    end
+
     @testset "classify --format json" begin
         data = _toy_file()
         model = tempname() * ".jld2"

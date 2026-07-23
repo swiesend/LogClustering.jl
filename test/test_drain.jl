@@ -110,4 +110,64 @@ using LogClustering.Drain3: Drain, template_of, process!, parse_all
         cid, t = process!(d, "   ")
         @test cid == 0 && t == ""
     end
+
+    @testset "max_clusters — LRU eviction bounds the cluster set" begin
+        d = Drain(; max_clusters = 3, sim_th = 0.95)
+        # Five clearly-distinct templates; only 3 may survive.
+        for s in ("alpha aa bb", "beta cc dd", "gamma ee ff",
+                  "delta gg hh", "epsilon ii jj")
+            process!(d, s)
+        end
+        @test length(d.clusters) == 3            # bounded, not 5
+        # last_seen / owner stay parallel to clusters.
+        @test length(d.last_seen) == 3
+        @test length(d.owner) == 3
+    end
+
+    @testset "max_clusters — recently-seen clusters survive eviction" begin
+        d = Drain(; max_clusters = 2, sim_th = 0.95)
+        process!(d, "keep me alpha")             # slot A
+        process!(d, "other beta gamma")          # slot B (cap reached)
+        process!(d, "keep me alpha")             # bump A's recency
+        process!(d, "brand new delta")           # new → evict LRU (B, not A)
+        templates = [template_of(c) for c in d.clusters]
+        @test length(d.clusters) == 2
+        @test any(t -> occursin("keep", t), templates)   # A survived
+        @test any(t -> occursin("delta", t), templates)  # new one present
+        @test !any(t -> occursin("beta", t), templates)  # B evicted
+    end
+
+    @testset "max_clusters — cap with an empty current leaf doesn't throw" begin
+        # The old `first(node.clusters)` stub threw when the routing leaf
+        # for a new line had no clusters yet. Eviction must handle it.
+        d = Drain(; max_clusters = 1, sim_th = 0.99, depth = 2)
+        process!(d, "aaa bbb ccc")
+        # A line routing to a different leaf while at the cap.
+        @test_nowarn process!(d, "zzz yyy xxx www vvv")
+        @test length(d.clusters) == 1
+    end
+
+    @testset "max_clusters = 0 (default) leaves growth unbounded" begin
+        d = Drain(; sim_th = 0.99)
+        for i in 1:20
+            process!(d, "template number $i alpha beta")
+        end
+        @test length(d.clusters) >= 15           # no eviction
+    end
+
+    @testset "rebuild_lru! restores parallel arrays after a load" begin
+        d = Drain(; max_clusters = 5)
+        for s in ("one aa", "two bb", "three cc")
+            process!(d, s)
+        end
+        # Simulate a fresh-load state: wipe the non-persisted bookkeeping.
+        d.last_seen = Int[]
+        d.owner = Drain3.TreeNode[]
+        d.access_tick = 0
+        Drain3.rebuild_lru!(d)
+        @test length(d.last_seen) == length(d.clusters)
+        @test length(d.owner) == length(d.clusters)
+        # And the parser keeps working (eviction path reachable).
+        @test process!(d, "four dd")[1] > 0
+    end
 end

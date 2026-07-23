@@ -330,6 +330,7 @@ function cmd_train(args::Vector{String})::Int
         ("seqlen",    16,       :int),
         ("max-vocab", 5000,     :int),
         ("min-count", 1,        :int),
+        ("max-clusters", 0,     :int),      # drain only; 0 = unlimited
         ("reuse",     false,    :bool),
         ("registry",  _default_registry_path(), :path),
         ("quiet",     false,    :bool),
@@ -360,7 +361,7 @@ function cmd_train(args::Vector{String})::Int
     end
 
     if kind === :drain
-        d = Drain()
+        d = Drain(; max_clusters = Int(opts["max-clusters"]))
         parse_all(d, lines)
         PersistenceGlue.save(opts["out"], d;
                              metadata = _train_metadata(opts, lines, "drain"))
@@ -802,6 +803,8 @@ function _print_train_help()
     --seqlen N    sequence length for seq_lstm (default 16).
     --max-vocab N cap the vocabulary (default 5000).
     --min-count N minimum token frequency to keep (default 1).
+    --max-clusters N  (drain only) cap the template set at N via LRU
+                  eviction; 0 (default) = unlimited.
     --reuse       skip training if --registry holds a bundle whose
                   `corpus_fingerprint` matches this corpus's vocab;
                   the bundle is then copied to --out. Ignored for
@@ -1438,6 +1441,7 @@ function cmd_stream(args::Vector{String})::Int
         ("dedup-window",       4096,   :int),
         ("batch-lines",        1,      :int),         # micro-batch transformer forward
         ("batch-ms",           0.0,    :float),
+        ("drain-max-clusters", 0,      :int),         # bound a loaded drain (0 = keep bundle's)
     ]
     opts = parse_flags(args, specs)
     get(opts, "help", false) && (_print_stream_help(); return 0)
@@ -1993,6 +1997,11 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
         bundle = Persistence.load(String(opts["model"]))
         bundle_kind = bundle.kind
         artifact    = Persistence.rehydrate(bundle)
+        # Bound a loaded Drain's growth for a long-running stream
+        # (protects the systemd MemoryMax). 0 keeps the bundle's setting.
+        if bundle_kind === :drain && Int(get(opts, "drain-max-clusters", 0)) > 0
+            artifact.max_clusters = Int(opts["drain-max-clusters"])
+        end
     end
     det = nothing
     if !isempty(opts["detector"])
@@ -2358,6 +2367,10 @@ function _print_stream_help()
                             transformer_decoder --model.
       --batch-ms M          under bursty load, wait up to M ms for a
                             fuller batch (default 0 = no wait).
+      --drain-max-clusters N  bound a loaded Drain model's template set
+                            to N via LRU eviction (protects memory on a
+                            long-running stream). 0 (default) keeps the
+                            bundle's own setting.
     """)
 end
 

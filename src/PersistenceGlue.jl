@@ -340,6 +340,7 @@ function _rehydrate_drain(bundle)
     d.root = bundle.payload.root
     d.clusters = bundle.payload.clusters
     d.next_id = bundle.payload.next_id
+    Drain3.rebuild_lru!(d)          # LRU bookkeeping isn't persisted
     return d
 end
 
