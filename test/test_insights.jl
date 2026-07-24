@@ -8,7 +8,7 @@ using LogClustering.Memory.SQLite: open_db, migrate!, insert_session!,
 using LogClustering.Memory.Insights
 using LogClustering.Memory.Insights: top_rules_window, novel_clusters_window,
                                       burstiness, cluster_view, transitions,
-                                      episodes, pinned_summary
+                                      episodes, pinned_summary, embedding_scatter
 using LogClustering.Memory.PatternCatalog: pin_manual
 using LogClustering.StructuredLog
 using SQLite: SQLite
@@ -132,6 +132,50 @@ end
             @test length(rows) == 1
             @test String(rows[1].name) == "p1"
             @test Int(rows[1].n) == 0   # no pattern_matches inserted
+        end
+    end
+
+    @testset "embedding_scatter — few rows short-circuit, UMAP lazy" begin
+        mktempdir() do dir
+            db = open_db(joinpath(dir, "t.sqlite"))
+            migrate!(db)
+            sid = insert_session!(db; host = "h")
+            base = DateTime("2026-04-27T14:00:00")
+            since = epoch_ms_since("2026-01-01T00:00:00")
+
+            # Fewer than n_neighbors embedded rows → empty, no Python.
+            for i in 1:5
+                insert_line!(db; session_id = sid, line_id = i,
+                    line = "L$i", ts = base + Dates.Second(i),
+                    drain_cluster_id = (i % 3) + 1,
+                    embedding = Float32[sin(i), cos(i), Float32(i)])
+            end
+            @test isempty(embedding_scatter(db; since = since, n_neighbors = 15))
+
+            # Enough rows: UMAP loads PythonCall lazily. Without the uv
+            # venv it must raise the clear py/uv bootstrap error (never a
+            # cold-start import); with it present, it returns a row per
+            # line tagged (line_id, x, y, cluster).
+            for i in 6:40
+                insert_line!(db; session_id = sid, line_id = i,
+                    line = "L$i", ts = base + Dates.Second(i),
+                    drain_cluster_id = (i % 3) + 1,
+                    embedding = Float32[sin(i), cos(i), Float32(i % 5)])
+            end
+            err = try
+                rows = embedding_scatter(db; since = since,
+                                         n_neighbors = 10, random_state = 42)
+                @test length(rows) == 40
+                @test all(r -> r.cluster in (1, 2, 3), rows)
+                @test all(r -> isfinite(r.x) && isfinite(r.y), rows)
+                nothing
+            catch e
+                sprint(showerror, e)
+            end
+            if err !== nothing
+                @test occursin("py/", err) || occursin("PythonCall", err) ||
+                      occursin("uv", err)
+            end
         end
     end
 

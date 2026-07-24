@@ -53,8 +53,23 @@ export open_db, migrate!, schema_version, spawn_writer, try_put!,
        insert_session!, finalize_session!, insert_trigger!,
        insert_line!, insert_pattern_match!,
        triggers, top_rules, novel_clusters, cluster_timeline,
-       cluster_id_sequence,
+       cluster_id_sequence, lines_with_embeddings,
+       embedding_to_blob, blob_to_embedding,
        WriteOp, WriteSession, WriteTrigger, WriteLine, WritePatternMatch
+
+# ---------------------------------------------------------------------------
+# Embedding BLOB codec — a per-line vector is stored as raw
+# little-endian Float32 bytes (schema v3 `lines.embedding`).
+# ---------------------------------------------------------------------------
+
+"Serialise an embedding vector to a raw Float32 byte blob."
+embedding_to_blob(v::AbstractVector{<:Real}) =
+    collect(reinterpret(UInt8, Vector{Float32}(v)))
+
+"Decode a Float32 byte blob back to a `Vector{Float32}` (empty on `nothing`)."
+blob_to_embedding(b::AbstractVector{UInt8}) =
+    collect(reinterpret(Float32, Vector{UInt8}(b)))
+blob_to_embedding(::Nothing) = Float32[]
 
 # ---------------------------------------------------------------------------
 # Connection setup.
@@ -203,17 +218,55 @@ function insert_line!(db::DB;
                       line::AbstractString,
                       ts::Union{DateTime, AbstractString} = _now_utc(),
                       drain_cluster_id::Union{Nothing, Integer} = nothing,
-                      model_signals = nothing)
+                      model_signals = nothing,
+                      embedding::Union{Nothing, AbstractVector{<:Real}} = nothing)
     dt = ts isa DateTime ? ts : _parse_dt(ts)
-    _exec!(db,
-        "INSERT INTO lines (line_id, session_id, ts, ts_epoch_ms, line, " *
-        "drain_cluster_id, model_signals_json) " *
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (Int(line_id), Int(session_id), _iso(dt), _epoch_ms(dt),
-         String(line),
-         drain_cluster_id === nothing ? nothing : Int(drain_cluster_id),
-         model_signals === nothing ? nothing : JSON3.write(model_signals)))
+    dcid = drain_cluster_id === nothing ? nothing : Int(drain_cluster_id)
+    sig  = model_signals === nothing ? nothing : JSON3.write(model_signals)
+    if embedding === nothing
+        # Omit the embedding column entirely so this insert works against
+        # any schema ≥ v1 (the column only exists from v3). The store
+        # always migrates to HEAD in production, but tests exercise the
+        # pre-migration schemas directly.
+        _exec!(db,
+            "INSERT INTO lines (line_id, session_id, ts, ts_epoch_ms, line, " *
+            "drain_cluster_id, model_signals_json) " *
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (Int(line_id), Int(session_id), _iso(dt), _epoch_ms(dt),
+             String(line), dcid, sig))
+    else
+        _exec!(db,
+            "INSERT INTO lines (line_id, session_id, ts, ts_epoch_ms, line, " *
+            "drain_cluster_id, model_signals_json, embedding) " *
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (Int(line_id), Int(session_id), _iso(dt), _epoch_ms(dt),
+             String(line), dcid, sig, embedding_to_blob(embedding)))
+    end
     return Int(line_id)
+end
+
+"""
+    lines_with_embeddings(db; since, until = nothing, limit = 5000) -> Vector{NT}
+
+Persisted line rows in `[since, until]` that carry an embedding blob.
+Each row: `(line_id, ts_epoch_ms, drain_cluster_id, embedding::Vector{Float32})`.
+"""
+function lines_with_embeddings(db::DB;
+                               since::Integer,
+                               until::Union{Nothing, Integer} = nothing,
+                               limit::Integer = 5000)
+    until_ms = until === nothing ? typemax(Int) : Int(until)
+    raw = _rows(db,
+        "SELECT line_id, ts_epoch_ms, drain_cluster_id, embedding " *
+        "FROM lines " *
+        "WHERE embedding IS NOT NULL AND ts_epoch_ms >= ? AND ts_epoch_ms <= ? " *
+        "ORDER BY ts_epoch_ms ASC LIMIT ?",
+        (Int(since), until_ms, Int(limit)))
+    return [(line_id = Int(r.line_id),
+             ts_epoch_ms = Int(r.ts_epoch_ms),
+             drain_cluster_id = r.drain_cluster_id === missing ? nothing :
+                                r.drain_cluster_id,
+             embedding = blob_to_embedding(r.embedding)) for r in raw]
 end
 
 """

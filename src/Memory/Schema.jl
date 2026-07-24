@@ -21,7 +21,7 @@ using SQLite: SQLite, DB
 @inline _exec!(db::DB, sql::AbstractString, params) =
     (foreach(identity, SQLite.DBInterface.execute(db, sql, params)); nothing)
 
-const HEAD = 2
+const HEAD = 3
 
 """
     MIGRATIONS
@@ -153,6 +153,14 @@ const MIGRATIONS = [
     CREATE INDEX idx_lines_ts           ON lines(ts_epoch_ms);
     CREATE INDEX idx_lines_cluster      ON lines(drain_cluster_id, ts_epoch_ms);
     CREATE INDEX idx_lines_session_line ON lines(session_id, line_id);
+    """),
+
+    # v3 — persisted per-line embedding (transformer-encoder vector),
+    # stored as a raw little-endian Float32 BLOB. Nullable: only the
+    # `stream --persist-embeddings` path fills it, so old rows and runs
+    # without it stay NULL. Feeds `Insights.embedding_scatter`.
+    (3, raw"""
+    ALTER TABLE lines ADD COLUMN embedding BLOB;
     """),
 ]
 

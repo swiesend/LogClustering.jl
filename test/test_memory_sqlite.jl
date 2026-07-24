@@ -7,6 +7,8 @@ using LogClustering.Memory.SQLite: open_db, migrate!, schema_version,
                                     insert_line!, insert_pattern_match!,
                                     triggers, top_rules, novel_clusters,
                                     cluster_timeline, cluster_id_sequence,
+                                    lines_with_embeddings,
+                                    embedding_to_blob, blob_to_embedding,
                                     WriteTrigger, WriteLine,
                                     WritePatternMatch
 using LogClustering.Memory.SQLite: epoch_ms_since, try_put!, WriterStats
@@ -176,6 +178,65 @@ StructuredLog.set_format!(:json; stream = _SQLITE_TEST_LOG)
                 "SELECT line_id, line FROM lines")
             @test length(rows) == 1
             @test String(rows[1].line) == "keep me"
+        end
+    end
+
+    @testset "embedding BLOB codec round-trips a Float32 vector" begin
+        v = Float32[1.5, -2.25, 0.0, 3.14159, 1e-7]
+        blob = embedding_to_blob(v)
+        @test blob isa Vector{UInt8}
+        @test length(blob) == 4 * length(v)
+        @test blob_to_embedding(blob) == v
+        @test blob_to_embedding(nothing) == Float32[]
+        # Accepts a Float64 vector, stores it as Float32.
+        @test blob_to_embedding(embedding_to_blob([1.0, 2.0])) == Float32[1.0, 2.0]
+    end
+
+    @testset "v2 → v3 migration adds embedding, keeps rows" begin
+        mktempdir() do dir
+            path = joinpath(dir, "t.sqlite")
+            db = open_db(path)
+            # Hand-build a v2 database: replay the v1 + v2 migrations.
+            SQLite.execute(db, "BEGIN")
+            for mig in (MIGRATIONS[1], MIGRATIONS[2])
+                for stmt in split(mig[2], ';')
+                    isempty(strip(stmt)) && continue
+                    SQLite.execute(db, stmt)
+                end
+            end
+            SQLite.execute(db, "INSERT INTO schema_version (version) VALUES (2)")
+            SQLite.execute(db, "COMMIT")
+            @test schema_version(db) == 2
+            sid = insert_session!(db; host = "h")
+            insert_line!(db; session_id = sid, line_id = 1, line = "old row")
+
+            @test migrate!(db) == HEAD              # now v3
+            # The pre-existing row survives, with a NULL embedding.
+            rows = LogClustering.Memory.SQLite._rows(db,
+                "SELECT line, embedding FROM lines")
+            @test length(rows) == 1
+            @test String(rows[1].line) == "old row"
+            @test rows[1].embedding === missing
+        end
+    end
+
+    @testset "insert_line! stores embedding; lines_with_embeddings reads it" begin
+        mktempdir() do dir
+            db = open_db(joinpath(dir, "t.sqlite"))
+            migrate!(db)
+            sid = insert_session!(db; host = "h")
+            base = DateTime(2026, 1, 1)
+            insert_line!(db; session_id = sid, line_id = 1, line = "no-emb",
+                         ts = base)
+            insert_line!(db; session_id = sid, line_id = 2, line = "with-emb",
+                         ts = base, drain_cluster_id = 7,
+                         embedding = Float32[0.1, 0.2, 0.3])
+            since = LogClustering.Memory.SQLite._epoch_ms(base) - 1000
+            got = lines_with_embeddings(db; since = since)
+            @test length(got) == 1                  # only the embedded row
+            @test got[1].line_id == 2
+            @test got[1].drain_cluster_id == 7
+            @test got[1].embedding == Float32[0.1, 0.2, 0.3]
         end
     end
 

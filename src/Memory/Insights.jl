@@ -23,12 +23,14 @@ pipeline.
 """
 module Insights
 
-using ..SQLiteStore: SQLiteStore, epoch_ms_since, _rows
+using ..SQLiteStore: SQLiteStore, epoch_ms_since, _rows, lines_with_embeddings
 using ...Episodes: Episodes, mv_span
+using ...Pipeline: umap_reduce
 using SQLite: DB
 
 export top_rules_window, novel_clusters_window, burstiness,
-       cluster_view, transitions, episodes, pinned_summary
+       cluster_view, transitions, episodes, pinned_summary,
+       embedding_scatter
 
 # ---------------------------------------------------------------------------
 # Top rules.
@@ -217,6 +219,52 @@ function pinned_summary(db::DB;
         ORDER BY n DESC
         """,
         (Int(since), until_ms))
+end
+
+# ---------------------------------------------------------------------------
+# Embedding scatter (2-D UMAP projection of persisted per-line vectors).
+# ---------------------------------------------------------------------------
+
+"""
+    embedding_scatter(db; since, until = nothing, limit = 5000,
+                      n_neighbors = 15, min_dist = 0.1,
+                      random_state = nothing) -> Vector{NT}
+
+Project the persisted per-line embeddings (`stream --persist-embeddings`)
+inside `[since, until]` down to 2-D with UMAP. Returns one row per line:
+`(line_id, x, y, cluster)`, where `cluster` is the line's
+`drain_cluster_id` (or `0` when none was recorded) — ready to plot.
+
+Returns `[]` when the window holds too few embedded lines to run UMAP
+(it needs at least `n_neighbors` samples). Loads PythonCall lazily via
+`Pipeline.umap_reduce`, so this stays an offline-analytics call — the
+streaming hot path never touches it.
+"""
+function embedding_scatter(db::DB;
+                           since::Integer,
+                           until::Union{Nothing, Integer} = nothing,
+                           limit::Integer = 5000,
+                           n_neighbors::Integer = 15,
+                           min_dist::Real = 0.1,
+                           random_state = nothing)
+    rows = lines_with_embeddings(db; since = since, until = until, limit = limit)
+    length(rows) < max(2, n_neighbors) && return NamedTuple[]
+    dims = length(rows[1].embedding)
+    (dims > 0 && all(r -> length(r.embedding) == dims, rows)) ||
+        throw(ArgumentError("persisted embeddings have inconsistent dimensions"))
+    # (features × samples) as the rest of the pipeline expects.
+    X = Matrix{Float64}(undef, dims, length(rows))
+    @inbounds for (j, r) in enumerate(rows)
+        X[:, j] = r.embedding
+    end
+    Y = umap_reduce(X; n_neighbors = Int(n_neighbors),
+                    min_dist = Float64(min_dist), n_components = 2,
+                    random_state = random_state)      # (2 × samples)
+    return [(line_id = rows[j].line_id,
+             x = Y[1, j], y = Y[2, j],
+             cluster = rows[j].drain_cluster_id === nothing ? 0 :
+                       Int(rows[j].drain_cluster_id))
+            for j in eachindex(rows)]
 end
 
 end # module Insights

@@ -1476,6 +1476,7 @@ struct StreamInferer
     nll_memo::Any              # ::Union{Nothing, Dedup.LRUMemo} — near-dup reuse
     rrcf::Any                  # ::Union{Nothing, RRCF.RCForest} — model-free anomaly
     seq_hist::Vector{Int}      # rolling template-id window (template-id decoder only)
+    embed_lines::Bool          # persist per-line transformer-encoder embeddings
 end
 
 # A template-id decoder's per-line NLL depends on the *preceding*
@@ -1542,6 +1543,7 @@ function cmd_stream(args::Vector{String})::Int
         ("memory",             "",     :path),       # SQLite filename for triggers
         ("persist-lines",      "none", :string),     # none | sampled | all
         ("persist-lines-rate", 100,    :int),        # 1-in-N sampling rate
+        ("persist-embeddings", false,  :bool),       # store encoder vectors on lines
         ("memory-warm",        "",     :string),     # redis://... | inproc | ""
         ("memory-warm-namespace", "",  :string),     # override the auto namespace
         ("memory-warm-flush-on-boot", false, :bool),
@@ -1660,6 +1662,11 @@ function cmd_stream(args::Vector{String})::Int
     persist_lines_mode in (:none, :sampled, :all) ||
         throw(ArgumentError("--persist-lines must be none | sampled | all"))
     persist_lines_rate = max(1, Int(opts["persist-lines-rate"]))
+    # Embeddings ride on line rows, so they need line persistence on.
+    if get(opts, "persist-embeddings", false) == true && persist_lines_mode === :none
+        StructuredLog.warn("persist-embeddings has no effect";
+            reason = "requires --persist-lines sampled|all")
+    end
     mem_db = nothing
     mem_ch = nothing
     mem_task = nothing
@@ -2028,6 +2035,8 @@ function _enqueue_line_write(ch, session_id::Int, ev, ir::AbstractDict)
         :drain_cluster_id  => dcid,
         :model_signals     => sig,
     )
+    emb = get(ir, "embedding", nothing)
+    emb === nothing || (payload[:embedding] = emb)
     return Memory.SQLite.try_put!(ch, Memory.SQLite.WriteLine(payload))
 end
 
@@ -2148,7 +2157,18 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
             sample_size = Int(get(opts, "rrcf-size", 256)),
             rebuild_every = Int(get(opts, "rrcf-size", 256)))
     end
-    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo, forest, Int[])
+    # Persist per-line transformer-encoder embeddings for offline
+    # `insights embedding_scatter`. Only a transformer_encoder bundle
+    # produces the vector; warn (and stay inert) otherwise.
+    embed_lines = get(opts, "persist-embeddings", false) == true
+    if embed_lines && bundle_kind !== :transformer_encoder
+        StructuredLog.warn("persist-embeddings ignored";
+            reason = "requires a transformer_encoder --model",
+            model_kind = bundle_kind === nothing ? "none" : String(bundle_kind))
+        embed_lines = false
+    end
+    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo,
+                         forest, Int[], embed_lines)
 end
 
 """
@@ -2213,6 +2233,15 @@ function _infer_cheap(inf::StreamInferer, ev::Stream.LineEvent)
         feat = _rrcf_features(mask_line(body), inf.rrcf.dims)
         s = RRCF.observe!(inf.rrcf, feat)
         ir["rrcf"] = Dict{String, Any}("score" => s)
+    end
+
+    # Per-line transformer-encoder embedding for offline scatter plots
+    # (persisted on the line row when --persist-lines is on).
+    if inf.embed_lines
+        S, _ = _featurize(inf.artifact, [body], EMPTY_OPTS, 64)
+        Z = embed_sequences(inf.artifact.model, inf.artifact.ps,
+                            inf.artifact.st, S)         # (d_model, 1)
+        ir["embedding"] = Float32.(vec(Z))
     end
     return ir, needs_nll, body
 end
@@ -2519,6 +2548,11 @@ function _print_stream_help()
                             keeps 1-in-N (--persist-lines-rate, default
                             100) full line records so `insights
                             --episodes` has a cluster-id stream to mine.
+      --persist-embeddings  store each persisted line's transformer-
+                            encoder vector (needs a transformer_encoder
+                            --model + --persist-lines). Feeds the offline
+                            `Insights.embedding_scatter` UMAP view. Off
+                            by default; inert with any other model kind.
 
     Performance:
       --dedup MODE          off (default) | masked. `masked` memoizes
