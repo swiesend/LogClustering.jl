@@ -83,6 +83,85 @@ end
         end
     end
 
+    @testset "selection marker + key hints render" begin
+        mktempdir() do dir
+            db = _seeded_db(joinpath(dir, "t.sqlite"))
+            s = TUI.render(db; since = "1000d", colour = false, sel = 1)
+            @test occursin("> ", s)                  # the selected row marker
+            @test occursin("[p]in", s) && occursin("[a]nnotate", s)
+        end
+    end
+
+end
+
+@testset "TUI interactive actions (DB-backed)" begin
+    PC = LogClustering.Memory.PatternCatalog
+
+    @testset "pin a trigger with a drain cluster → :drain pattern" begin
+        mktempdir() do dir
+            db = _seeded_db(joinpath(dir, "t.sqlite"))
+            pid = LogClustering.TUI._tui_pin_trigger!(db, 1)
+            @test pid > 0
+            p = only(filter(x -> x.id == pid, PC.list(db)))
+            @test p.match_kind === :drain
+            @test p.match_drain_template_id == 1
+        end
+    end
+
+    @testset "pin a trigger without a drain cluster → :keyword pattern" begin
+        mktempdir() do dir
+            db = open_db(joinpath(dir, "t.sqlite")); migrate!(db)
+            sid = insert_session!(db; host = "h")
+            insert_trigger!(db; session_id = sid, rule_id = "kw",
+                rule_kind = "keyword", severity = "warn", line_id = 1,
+                line = "disk almost full on node7",
+                fields = Dict("matched" => ["full"]))   # no drain_cluster_id
+            pid = LogClustering.TUI._tui_pin_trigger!(db, 1)
+            p = only(filter(x -> x.id == pid, PC.list(db)))
+            @test p.match_kind === :keyword
+            @test !isempty(p.match_keywords)
+        end
+    end
+
+    @testset "annotate writes to the annotations table; empty note errors" begin
+        mktempdir() do dir
+            db = _seeded_db(joinpath(dir, "t.sqlite"))
+            aid = LogClustering.TUI._tui_annotate!(db, 2, "root cause: OOM")
+            @test aid > 0
+            rows = LogClustering.Memory.SQLite._rows(db,
+                "SELECT target_kind, target_id, note FROM annotations WHERE id = ?",
+                (aid,))
+            @test length(rows) == 1
+            @test String(rows[1].target_kind) == "trigger"
+            @test Int(rows[1].target_id) == 2
+            @test occursin("OOM", String(rows[1].note))
+            @test_throws ArgumentError LogClustering.TUI._tui_annotate!(db, 2, "   ")
+        end
+    end
+
+    @testset "disable-cluster switches off every drain pattern on that cluster" begin
+        mktempdir() do dir
+            db = _seeded_db(joinpath(dir, "t.sqlite"))
+            pid = LogClustering.TUI._tui_pin_trigger!(db, 1)   # :drain on cluster 1
+            @test only(filter(x -> x.id == pid, PC.list(db; enabled_only = true))).enabled
+            n = LogClustering.TUI._tui_disable_cluster!(db, 1)
+            @test n == 1
+            @test isempty(filter(x -> x.id == pid, PC.list(db; enabled_only = true)))
+            # A cluster with no patterns disables nothing.
+            @test LogClustering.TUI._tui_disable_cluster!(db, 999) == 0
+        end
+    end
+
+    @testset "_read_line_from accumulates chars until Enter" begin
+        ch = Channel{Char}(16)
+        for c in "hello\r"; put!(ch, c); end
+        # Reading echoes to stdout; capture so the test stays quiet.
+        note = redirect_stdout(devnull) do
+            LogClustering.TUI._read_line_from(ch)
+        end
+        @test note == "hello"
+    end
+
 end
 
 @testset "CLI — top --once renders one frame and exits" begin
