@@ -1857,7 +1857,12 @@ function cmd_stream(args::Vector{String})::Int
                 if status_interval > 0 && !opts["quiet"] &&
                    (time() - last_status) >= status_interval
                     _emit_status(started_at, lines_processed, triggers_total,
-                                 by_rule, tail_stats, ch, inferer)
+                                 by_rule, tail_stats, ch, inferer;
+                                 health = (mem_ch = mem_ch, mem_stats = mem_stats,
+                                           mem_writes_dropped = mem_writes_dropped,
+                                           webhook_ch = webhook_ch,
+                                           webhook_dropped = webhook_sink === nothing ?
+                                               0 : webhook_sink.stats.dropped_total))
                     Rules.persist_sketches!(rs)
                     last_status = time()
                 end
@@ -2406,9 +2411,16 @@ function _emit_line_records(ir, ev, triggers, opts)
 end
 
 function _emit_status(started_at, lines_processed, triggers_total,
-                      by_rule, tail_stats, ch, inferer = nothing)
+                      by_rule, tail_stats, ch, inferer = nothing;
+                      health = nothing)
     uptime = time() - started_at
     rate = uptime > 0 ? lines_processed / uptime : 0.0
+    queue = Dict{String, Any}("ingest" => length(ch.data))
+    if health !== nothing
+        health.mem_ch === nothing || (queue["memory"] = Base.n_avail(health.mem_ch))
+        health.webhook_ch === nothing ||
+            (queue["webhook"] = Base.n_avail(health.webhook_ch))
+    end
     rec = Dict{String, Any}(
         "event"   => "status",
         "ts"      => _iso_now(),
@@ -2423,9 +2435,7 @@ function _emit_status(started_at, lines_processed, triggers_total,
             "by_rule" => by_rule,
         ),
         "rotations" => tail_stats.rotations,
-        "queue"     => Dict{String, Any}(
-            "ingest" => length(ch.data),
-        ),
+        "queue"     => queue,
     )
     if inferer !== nothing && inferer.nll_memo !== nothing
         m = inferer.nll_memo
@@ -2436,6 +2446,18 @@ function _emit_status(started_at, lines_processed, triggers_total,
             "hit_rate"  => total > 0 ? round(m.hits / total; digits = 3) : 0.0,
             "cache_size" => length(m),
         )
+    end
+    # Backpressure / dropped-write visibility, so silent drops surface.
+    if health !== nothing
+        drops = Dict{String, Any}(
+            "memory_enqueue" => health.mem_writes_dropped,
+            "memory_ops"     => health.mem_stats === nothing ? 0 :
+                                health.mem_stats.dropped_ops,
+            "memory_flush_errors" => health.mem_stats === nothing ? 0 :
+                                     health.mem_stats.flush_errors,
+            "webhook"        => health.webhook_dropped,
+        )
+        rec["dropped"] = drops
     end
     println(stdout, JSON3.write(rec))
     flush(stdout)
@@ -3693,6 +3715,29 @@ function cmd_doctor(args::Vector{String})::Int
             db = Memory.SQLite.open_db(db_path; create = false)
             v = Memory.SQLite.migrate!(db)
             add!("memory", :ok, "$db_path (schema v$v)")
+            # Store liveness: row counts + the last session's exit code,
+            # so an operator can see the writer is actually accumulating
+            # data (and spot a session that ended on a non-zero exit).
+            try
+                cnt(t) = Int(Memory.SQLite._rows(db, "SELECT COUNT(*) AS n FROM $t")[1].n)
+                ns, ntr, nln = cnt("sessions"), cnt("triggers"), cnt("lines")
+                last = Memory.SQLite._rows(db,
+                    "SELECT exit_code, ended_at FROM sessions ORDER BY id DESC LIMIT 1")
+                last_txt = if isempty(last)
+                    "no sessions yet"
+                else
+                    ec = last[1].exit_code
+                    ended = last[1].ended_at
+                    ended === missing ? "last session still open" :
+                        "last session exit=$(ec === missing ? "?" : ec)"
+                end
+                st = (!isempty(last) && !ismissing(last[1].exit_code) &&
+                      last[1].exit_code != 0) ? :warn : :ok
+                add!("memory-store", st,
+                     "$ns sessions, $ntr triggers, $nln lines; $last_txt")
+            catch e
+                add!("memory-store", :warn, "counts unavailable: $(sprint(showerror, e))")
+            end
         catch e
             add!("memory", :fail, sprint(showerror, e))
         end

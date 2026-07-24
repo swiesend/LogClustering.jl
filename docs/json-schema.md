@@ -79,10 +79,24 @@ empty when `--emit-all` is set without any matching rule).
   "lines":     { "total": 31200, "rate_per_s": 99.8, "dropped_oversize": 2 },
   "triggers":  { "total": 14, "by_rule": { "fatal_keywords": 9, "high_nll": 5 } },
   "rotations": 1,
-  "queue":     { "ingest": 12 } }
+  "queue":     { "ingest": 12, "memory": 3, "webhook": 0 },
+  "dropped":   { "memory_enqueue": 0, "memory_ops": 0,
+                 "memory_flush_errors": 0, "webhook": 0 } }
 ```
 
 Emitted every `--status-interval` seconds (default 10; set 0 to disable).
+
+`queue` reports current backpressure — the ingest channel depth, plus
+`memory` / `webhook` writer-queue depths when those sinks are attached.
+`dropped` makes silent drops observable: `memory_enqueue` (line/trigger
+puts refused because the writer queue was full), `memory_ops` (ops that
+failed inside a flush transaction — e.g. a constraint violation — and
+were discarded so the rest of the batch commits), `memory_flush_errors`
+(whole-batch flush failures the writer recovered from), and `webhook`
+(alerts dropped because the delivery queue was full or closed). The
+`dropped` block is present only when a memory or webhook sink is
+attached. `doctor` surfaces the same store's liveness — row counts and
+the last session's exit code — under the `memory-store` check.
 
 ### `event: "shutdown"` — final line of the run
 

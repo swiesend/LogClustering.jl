@@ -338,6 +338,57 @@ end
         @test occursin("rrcf", r.err) && occursin("requires --rrcf", r.err)
     end
 
+    @testset "status heartbeat carries queue depths + dropped counters" begin
+        # Drive _emit_status directly with a health snapshot so the
+        # backpressure block is deterministic (a live stream's interval
+        # timing is racy). Mirrors the cmd_stream call site.
+        ch = Channel{Any}(8); put!(ch, 1); put!(ch, 2)          # ingest depth 2
+        mem_ch = Channel{Any}(8); put!(mem_ch, :op)             # memory depth 1
+        stats = LogClustering.Memory.SQLite.WriterStats()
+        stats.dropped_ops = 3; stats.flush_errors = 1
+        tail_stats = (dropped_oversize = 4, rotations = 2)
+        health = (mem_ch = mem_ch, mem_stats = stats,
+                  mem_writes_dropped = 5, webhook_ch = nothing,
+                  webhook_dropped = 7)
+        r = _e2e_capture(() -> begin
+            CLI._emit_status(time() - 10.0, 100, 9,
+                Dict("a" => 9), tail_stats, ch, nothing; health = health)
+            0
+        end)
+        ev = JSON3.read(strip(r.out))
+        @test String(ev["event"]) == "status"
+        @test Int(ev["queue"]["ingest"]) == 2
+        @test Int(ev["queue"]["memory"]) == 1
+        @test !haskey(ev["queue"], "webhook")           # no webhook sink attached
+        @test Int(ev["dropped"]["memory_enqueue"]) == 5
+        @test Int(ev["dropped"]["memory_ops"]) == 3
+        @test Int(ev["dropped"]["memory_flush_errors"]) == 1
+        @test Int(ev["dropped"]["webhook"]) == 7
+    end
+
+    @testset "doctor surfaces memory-store liveness (counts + last exit)" begin
+        mktempdir() do dir
+            db_path = joinpath(dir, "m.sqlite")
+            db = LogClustering.Memory.SQLite.open_db(db_path)
+            LogClustering.Memory.SQLite.migrate!(db)
+            sid = LogClustering.Memory.SQLite.insert_session!(db; host = "h")
+            LogClustering.Memory.SQLite.insert_trigger!(db; session_id = sid,
+                rule_id = "a", rule_kind = "keyword", severity = "warn",
+                line_id = 1, line = "x", fields = Dict())
+            LogClustering.Memory.SQLite.finalize_session!(db, sid; exit_code = 0)
+            r = _e2e_capture(() ->
+                CLI.main(["doctor", "--memory", db_path, "--json"]))
+            @test r.code == 0
+            findings = JSON3.read(r.out)
+            store = findall(f -> String(f["label"]) == "memory-store", findings)
+            @test !isempty(store)
+            detail = String(findings[store[1]]["detail"])
+            @test occursin("1 sessions", detail)
+            @test occursin("1 triggers", detail)
+            @test occursin("exit=0", detail)
+        end
+    end
+
 end
 
 @testset "classify --json / score --json — aliases for --format json" begin
