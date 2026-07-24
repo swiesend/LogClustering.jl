@@ -34,7 +34,7 @@ using ..Harness: load_loghub, run_parser, format_report, Dataset
 using ..Masking: mask_line, mask_lines, mask_lines_with_values
 using ..Dedup: Dedup
 using ..RRCF: RRCF
-using ..Drain3: Drain, process!, parse_all
+using ..Drain3: Drain3, Drain, process!, parse_all
 using ..Featurise: Featurise, Vocabulary, build_vocab, bow,
                    sequence_matrix, tokenise_ids
 using ..Persistence
@@ -332,6 +332,7 @@ function cmd_train(args::Vector{String})::Int
         ("max-vocab", 5000,     :int),
         ("min-count", 1,        :int),
         ("max-clusters", 0,     :int),      # drain only; 0 = unlimited
+        ("tokens",    "words",  :string),   # words | template-ids (seq/transformer)
         ("reuse",     false,    :bool),
         ("registry",  _default_registry_path(), :path),
         ("quiet",     false,    :bool),
@@ -490,22 +491,47 @@ function _train_vq_vae(lines::Vector{String}, opts::Dict, rng)::Int
     return 0
 end
 
+# --- Sequence featurisation source (--tokens words | template-ids) ----------
+
+"""
+    _train_seq_features(lines, opts, seqlen)
+        -> (S, vocab, drain, tokens_sym, vocab_size)
+
+Build the `(seqlen, n_lines)` training matrix from either word-token
+sequences (`--tokens words`, the default) or Drain template-id
+sequences (`--tokens template-ids`, DeepLog-style). For template-ids a
+fresh Drain is trained on the corpus and returned so it can be
+embedded in the model bundle (inference must featurize the same way).
+"""
+function _train_seq_features(lines::Vector{String}, opts::Dict, seqlen::Int)
+    toks = replace(String(get(opts, "tokens", "words")), "-" => "_")
+    toks in ("words", "template_ids") ||
+        throw(ArgumentError("--tokens must be words | template-ids"))
+    if toks == "template_ids"
+        d = Drain3.Drain(; max_clusters = Int(get(opts, "max-clusters", 0)))
+        S = Drain3.id_sequence_matrix(d, lines; seqlen = seqlen, learn = true)
+        return S, nothing, d, :template_ids, Int(maximum(S))
+    else
+        vocab = build_vocab(lines; mask = true,
+                            min_count = Int(opts["min-count"]),
+                            max_vocab = Int(opts["max-vocab"]))
+        S = sequence_matrix(lines, vocab; seqlen = seqlen)
+        return S, vocab, nothing, :words, max(Int(maximum(S)), length(vocab))
+    end
+end
+
 # --- SeqLSTM ----------------------------------------------------------------
 
 function _train_seq_lstm(lines::Vector{String}, opts::Dict, rng)::Int
-    vocab = build_vocab(lines; mask = true,
-                        min_count = Int(opts["min-count"]),
-                        max_vocab = Int(opts["max-vocab"]))
     seqlen = Int(opts["seqlen"])
     seqlen >= 2 || throw(ArgumentError("--seqlen must be ≥ 2"))
-    S = sequence_matrix(lines, vocab; seqlen = seqlen)
+    S, vocab, drain, tokens_sym, vs_hint = _train_seq_features(lines, opts, seqlen)
     cfg = AutoTune.fit_hyperparams(:seq_lstm, S;
                   budget = opts["auto"] ? Int(opts["budget"]) : 0,
                   rng = rng)
     # Respect the actual vocab size — AutoTune's `vocab_size` comes
-    # from `maximum(corpus)`, which can undershoot when a line didn't
-    # use every token.
-    vs = max(Int(cfg.vocab_size), length(vocab))
+    # from `maximum(corpus)`, which can undershoot.
+    vs = max(Int(cfg.vocab_size), vs_hint)
     cfg = merge(cfg, (vocab_size = vs,))
     model = seq_lstm(cfg.vocab_size; embed = cfg.embed, hidden = cfg.hidden)
     ps, st = Lux.setup(rng, model)
@@ -515,10 +541,12 @@ function _train_seq_lstm(lines::Vector{String}, opts::Dict, rng)::Int
     PersistenceGlue.save(opts["out"], model, ps, st;
         kind = :seq_lstm,
         vocab_size = cfg.vocab_size, embed = cfg.embed, hidden = cfg.hidden,
-        vocab = vocab, seqlen = seqlen,
+        vocab = vocab, seqlen = seqlen, tokens = tokens_sym, drain = drain,
         metadata = _train_metadata(opts, lines, "seq_lstm"))
     opts["quiet"] || println(stderr,
-        "seq_lstm: ", length(vocab), "-tok vocab, embed=", cfg.embed,
+        "seq_lstm: ", tokens_sym === :template_ids ?
+            "$(length(drain.clusters)) templates" : "$(length(vocab))-tok vocab",
+        ", embed=", cfg.embed,
         ", hidden=", cfg.hidden, ", seqlen=", seqlen, " → ", opts["out"])
     return 0
 end
@@ -559,15 +587,12 @@ end
 
 function _train_transformer(lines::Vector{String}, opts::Dict, rng,
                             flavour::Symbol)::Int
-    vocab = build_vocab(lines; mask = true,
-                        min_count = Int(opts["min-count"]),
-                        max_vocab = Int(opts["max-vocab"]))
     seqlen = Int(opts["seqlen"])
     seqlen >= 2 ||
         throw(ArgumentError("--seqlen must be ≥ 2 for transformers"))
-    S = sequence_matrix(lines, vocab; seqlen = seqlen)
+    S, vocab, drain, tokens_sym, vocab_size =
+        _train_seq_features(lines, opts, seqlen)
     dims = _resolve_transformer_dims(opts)
-    vocab_size = max(Int(maximum(S)), length(vocab))
 
     # `max_seq_len` rounds up to the next power of 2 (cheap RoPE cache,
     # leaves headroom for slightly longer inference inputs).
@@ -603,13 +628,16 @@ function _train_transformer(lines::Vector{String}, opts::Dict, rng,
         n_kv_heads = dims.n_kv_heads,
         ffn_mult = Float32(opts["ffn-mult"]),
         max_seq_len = max_seq_len, dropout = Float32(opts["dropout"]),
-        vocab = vocab, seqlen = seqlen,
+        vocab = vocab, seqlen = seqlen, tokens = tokens_sym, drain = drain,
         n_lines = length(lines),
         metadata = _train_metadata(opts, lines, String(label)),
     )
     PersistenceGlue.save(opts["out"], model, ps, st; save_kwargs...)
     opts["quiet"] || println(stderr,
-        rpad(label, 9), length(vocab), "-tok vocab, d_model=", dims.d_model,
+        rpad(label, 9),
+        tokens_sym === :template_ids ? "$(length(drain.clusters)) templates" :
+            "$(length(vocab))-tok vocab",
+        ", d_model=", dims.d_model,
         ", layers=", Int(opts["n-layers"]),
         ", heads=", dims.n_heads, "/", dims.n_kv_heads,
         ", seqlen=", seqlen, " → ", opts["out"])
@@ -777,6 +805,7 @@ function _print_train_help()
                             [--auto] [--budget N] [--epochs N] [--batch N]
                             [--lr F] [--seed N]
                             [--seqlen N] [--max-vocab N] [--min-count N]
+                            [--tokens words|template-ids]
                             [--reuse] [--registry DIR]
                             [--quiet]
 
@@ -804,6 +833,13 @@ function _print_train_help()
     --seqlen N    sequence length for seq_lstm (default 16).
     --max-vocab N cap the vocabulary (default 5000).
     --min-count N minimum token frequency to keep (default 1).
+    --tokens T    sequence source for seq_lstm / transformer kinds:
+                  `words` (default) = masked word-token sequences;
+                  `template-ids` = DeepLog-style Drain log-key
+                  sequences. A fresh Drain is trained on the corpus and
+                  embedded in the bundle, so classify / score / stream
+                  featurise identically with no extra flag. `--max-clusters`
+                  caps that Drain's template set.
     --max-clusters N  (drain only) cap the template set at N via LRU
                   eviction; 0 (default) = unlimited.
     --reuse       skip training if --registry holds a bundle whose
@@ -933,22 +969,56 @@ function _classify_vq_vae(art, bundle, bodies, opts)
     return 0
 end
 
+# Callers that featurise outside the flag-driven commands (score, stream
+# NLL) pass this so `_featurize`'s `get(opts, …)` fallbacks supply the
+# oov defaults those commands don't expose as flags.
+const EMPTY_OPTS = Dict{String, Any}()
+
+# Featurise `bodies` for a rehydrated sequence-model bundle, dispatching
+# on how it was trained: `--tokens words` → the masked word-token
+# sequence (today); `--tokens template-ids` → the Drain template-id
+# sequence (DeepLog), using the embedded frozen Drain (read-only). The
+# per-line/batch windows are correct because `bodies` is featurised as
+# a whole (column j = the window ending at line j).
+function _featurize(art, bodies, opts, default_seqlen::Int)
+    seqlen = (hasproperty(art, :seqlen) && art.seqlen !== nothing) ?
+             Int(art.seqlen) : default_seqlen
+    tokens = hasproperty(art, :tokens) ? art.tokens : :words
+    if tokens === :template_ids
+        (hasproperty(art, :drain) && art.drain !== nothing) ||
+            throw(ArgumentError("template-id model has no embedded Drain"))
+        return Drain3.id_sequence_matrix(art.drain, bodies;
+                                          seqlen = seqlen, learn = false), :template_ids
+    else
+        vocab = art.vocab
+        vocab === nothing &&
+            throw(ArgumentError("word-token model bundle has no vocabulary"))
+        oov = Symbol(get(opts, "oov", "unk"))
+        oov === :distribute &&
+            throw(ArgumentError(":distribute is BoW-only; sequence models " *
+                                "need :unk or :nearest"))
+        return sequence_matrix(bodies, vocab;
+                               seqlen = seqlen, oov_policy = oov,
+                               oov_min_sim = Float64(get(opts, "oov-min-sim", 0.0))), :words
+    end
+end
+
+# Human labels for a predicted next-token id: the token string for word
+# models, `template-<id>` for template-id models.
+function _seq_label(art, tokens_sym, id::Integer)
+    tokens_sym === :template_ids && return "template-$(Int(id) - 1)"
+    art.vocab === nothing && return string(id)
+    return get(art.vocab.tokens, Int(id), "<UNK>")
+end
+
 function _classify_seq_lstm(art, bundle, bodies, opts)
-    vocab = _require_vocab(art, :seq_lstm)
-    seqlen = art.seqlen === nothing ? 16 : Int(art.seqlen)
-    oov_policy = Symbol(opts["oov"])
-    oov_policy === :distribute &&
-        throw(ArgumentError(":distribute is BoW-only; seq_lstm needs :unk or :nearest"))
-    S = sequence_matrix(bodies, vocab;
-                        seqlen = seqlen,
-                        oov_policy = oov_policy,
-                        oov_min_sim = Float64(opts["oov-min-sim"]))
+    S, tk = _featurize(art, bodies, opts, 16)
     # seq_lstm output is (vocab_size, batch) logits — argmax = predicted
-    # next token's id. We emit that as the "cluster id"; the template
-    # is the predicted token string.
+    # next token's id. We emit that as the "cluster id"; the label is the
+    # predicted token / template.
     logits, _ = art.model(S, art.ps, Lux.testmode(art.st))
     ids = Int[argmax(@view logits[:, j]) for j in axes(logits, 2)]
-    labels = [get(vocab.tokens, id, "<UNK>") for id in ids]
+    labels = [_seq_label(art, tk, id) for id in ids]
     _emit_classify(opts["out"], opts["format"], bodies, ids, labels)
     return 0
 end
@@ -957,15 +1027,7 @@ end
 # `(d_model, batch)` embedding. Cluster count defaults to a √N rule
 # bounded to the same band the rest of the pipeline uses.
 function _classify_transformer_encoder(art, bundle, bodies, opts)
-    vocab = _require_vocab(art, :transformer_encoder)
-    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
-    oov_policy = Symbol(opts["oov"])
-    oov_policy === :distribute &&
-        throw(ArgumentError(":distribute is BoW-only; transformer_encoder needs :unk or :nearest"))
-    S = sequence_matrix(bodies, vocab;
-                        seqlen = seqlen,
-                        oov_policy = oov_policy,
-                        oov_min_sim = Float64(opts["oov-min-sim"]))
+    S, _ = _featurize(art, bodies, opts, 64)
     Z = embed_sequences(art.model, art.ps, art.st, S)            # (d_model, batch)
     n_lines = size(Z, 2)
     k = min(n_lines, max(2, ceil(Int, sqrt(n_lines))))
@@ -980,17 +1042,9 @@ end
 # Decoder: greedy next-token prediction (mirrors seq_lstm's path so
 # the output schema matches downstream consumers).
 function _classify_transformer_decoder(art, bundle, bodies, opts)
-    vocab = _require_vocab(art, :transformer_decoder)
-    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
-    oov_policy = Symbol(opts["oov"])
-    oov_policy === :distribute &&
-        throw(ArgumentError(":distribute is BoW-only; transformer_decoder needs :unk or :nearest"))
-    S = sequence_matrix(bodies, vocab;
-                        seqlen = seqlen,
-                        oov_policy = oov_policy,
-                        oov_min_sim = Float64(opts["oov-min-sim"]))
+    S, tk = _featurize(art, bodies, opts, 64)
     ids = Transformer.predict_next(art.model, art.ps, art.st, S)
-    labels = [get(vocab.tokens, id, "<UNK>") for id in ids]
+    labels = [_seq_label(art, tk, id) for id in ids]
     _emit_classify(opts["out"], opts["format"], bodies, ids, labels)
     return 0
 end
@@ -1123,20 +1177,19 @@ end
 
 Compute per-line negative log-likelihood from a `:transformer_decoder`
 bundle. Higher = the model finds the line less typical (the standard
-perplexity-style anomaly signal). Each line is scored independently so
-batch ordering doesn't bleed across lines.
+perplexity-style anomaly signal).
+
+The whole `lines` vector is featurised together (via [`_featurize`]) so
+a template-id model gets its correct cross-line log-key windows; for a
+word-token model the columns are self-contained, so this equals scoring
+each line alone. A single batched `transformer_decoder_nll` forward
+returns the per-column NLL.
 """
 function _per_line_decoder_nll(art, lines::Vector{String})::Vector{Float32}
-    vocab = _require_vocab(art, :transformer_decoder)
-    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
-    nlls = Vector{Float32}(undef, length(lines))
-    for (i, l) in enumerate(lines)
-        S = sequence_matrix([l], vocab; seqlen = seqlen)
-        loss, _ = transformer_decoder_loss(art.model, art.ps,
-                                            Lux.testmode(art.st), S)
-        nlls[i] = Float32(loss)
-    end
-    return nlls
+    isempty(lines) && return Float32[]
+    S, _ = _featurize(art, lines, EMPTY_OPTS, 64)
+    nll = transformer_decoder_nll(art.model, art.ps, Lux.testmode(art.st), S)
+    return Float32.(nll)
 end
 
 """
@@ -1150,9 +1203,7 @@ forward. Used by the streaming micro-batch path.
 """
 function _decoder_nll_batch(art, lines::Vector{String})::Vector{Float64}
     isempty(lines) && return Float64[]
-    vocab = _require_vocab(art, :transformer_decoder)
-    seqlen = art.seqlen === nothing ? 64 : Int(art.seqlen)
-    S = sequence_matrix(lines, vocab; seqlen = seqlen)
+    S, _ = _featurize(art, lines, EMPTY_OPTS, 64)
     return transformer_decoder_nll(art.model, art.ps,
                                    Lux.testmode(art.st), S)
 end
@@ -1407,6 +1458,45 @@ struct StreamInferer
     framed::Symbol             # :raw | :auto
     nll_memo::Any              # ::Union{Nothing, Dedup.LRUMemo} — near-dup reuse
     rrcf::Any                  # ::Union{Nothing, RRCF.RCForest} — model-free anomaly
+    seq_hist::Vector{Int}      # rolling template-id window (template-id decoder only)
+end
+
+# A template-id decoder's per-line NLL depends on the *preceding*
+# template ids (DeepLog log-key history), unlike a word-token decoder
+# whose per-line NLL is self-contained. So the near-dup memo and the
+# by-template micro-batch — both of which assume per-line independence —
+# are bypassed for template-id decoders (see `_infer_cheap`).
+_is_template_id_decoder(inf::StreamInferer) =
+    inf.bundle_kind === :transformer_decoder &&
+    hasproperty(inf.artifact, :tokens) && inf.artifact.tokens === :template_ids
+
+"""
+    _template_id_stream_nll!(inf, body) -> Float64
+
+Streaming per-line NLL for a template-id decoder. Assign `body` a
+template id via the embedded frozen Drain (read-only, ids never exceed
+the trained vocabulary), append it to the rolling `seq_hist` window,
+and score the left-padded `(seqlen, 1)` column of recent log keys. This
+preserves the cross-line history the batch/memo paths would destroy.
+"""
+function _template_id_stream_nll!(inf::StreamInferer, body::AbstractString)::Float64
+    art    = inf.artifact
+    seqlen = (hasproperty(art, :seqlen) && art.seqlen !== nothing) ?
+             Int(art.seqlen) : 16
+    cid = Drain3.assign(art.drain, body)        # frozen, read-only
+    id  = cid <= 0 ? 1 : cid + 1                 # pad_id = 1; +1 shift matches id_sequence_matrix
+    hist = inf.seq_hist
+    push!(hist, id)
+    while length(hist) > seqlen
+        popfirst!(hist)
+    end
+    col = fill(1, seqlen, 1)                     # left-pad with pad_id = 1
+    k = length(hist)
+    @inbounds for i in 1:k
+        col[seqlen - k + i, 1] = hist[i]
+    end
+    nll = transformer_decoder_nll(art.model, art.ps, Lux.testmode(art.st), col)
+    return Float64(nll[1])
 end
 
 function cmd_stream(args::Vector{String})::Int
@@ -2020,9 +2110,14 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
     end
     # Near-duplicate NLL memo: only meaningful for the (expensive)
     # transformer_decoder path, keyed by the masked template.
+    # A template-id decoder's NLL is history-dependent, so the
+    # by-template memo would return wrong values — never build it there.
+    is_tid_decoder = bundle_kind === :transformer_decoder &&
+                     artifact !== nothing && hasproperty(artifact, :tokens) &&
+                     artifact.tokens === :template_ids
     memo = nothing
     if get(opts, "dedup", "off") == "masked" &&
-       bundle_kind === :transformer_decoder
+       bundle_kind === :transformer_decoder && !is_tid_decoder
         memo = Dedup.LRUMemo{String, Float64}(Int(get(opts, "dedup-window", 4096)))
     end
     # Model-free RRCF anomaly detector over hashed shingles of the
@@ -2036,7 +2131,7 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
             sample_size = Int(get(opts, "rrcf-size", 256)),
             rebuild_every = Int(get(opts, "rrcf-size", 256)))
     end
-    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo, forest)
+    return StreamInferer(bundle_kind, artifact, det, framed_mode, memo, forest, Int[])
 end
 
 """
@@ -2077,7 +2172,14 @@ function _infer_cheap(inf::StreamInferer, ev::Stream.LineEvent)
         cid, tpl = process!(inf.artifact, body)
         ir["drain"] = Dict{String, Any}("cluster_id" => cid, "template" => tpl)
     elseif inf.bundle_kind === :transformer_decoder
-        needs_nll = true                     # filled by the batch forward
+        if _is_template_id_decoder(inf)
+            # History-dependent: score inline with the rolling id window,
+            # bypassing the batch/memo paths (which assume independence).
+            nll = _template_id_stream_nll!(inf, body)
+            ir["transformer_decoder"] = Dict{String, Any}("nll" => nll)
+        else
+            needs_nll = true                 # filled by the batch forward
+        end
     end
 
     if inf.detector !== nothing

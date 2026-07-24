@@ -39,7 +39,8 @@ per-line template vector, suitable for
 """
 module Drain3
 
-export Drain, LogCluster, process!, parse_all, template_of
+export Drain, LogCluster, process!, parse_all, template_of,
+       assign, id_sequence_matrix
 
 # ---------------------------------------------------------------------------
 # Types
@@ -242,6 +243,88 @@ function parse_all(d::Drain, lines::AbstractVector{<:AbstractString})
         out[i] = get(by_id, cid, "")
     end
     return out
+end
+
+# ---------------------------------------------------------------------------
+# Read-only classification + template-id sequence featurisation (DeepLog).
+# ---------------------------------------------------------------------------
+
+"""
+    assign(d::Drain, line) -> Int
+
+Read-only classification: route `line` through the *existing* parse
+tree and return the id of the best-matching cluster (similarity ≥
+`sim_th`), or `0` when the line reaches no leaf or matches nothing.
+Unlike [`process!`], this never creates clusters, generalises a
+template, or touches recency — for scoring new lines against a frozen
+model (e.g. a template-id sequence model at inference).
+"""
+function assign(d::Drain, line::AbstractString)
+    tokens = String.(split(line))
+    isempty(tokens) && return 0
+    node = _walk_down(d, tokens)
+    node === nothing && return 0
+    best_idx, best_sim = _best_match(d, node, tokens)
+    (best_idx != 0 && best_sim >= d.sim_th) || return 0
+    return d.clusters[node.clusters[best_idx]].id
+end
+
+# Read-only tree walk: follow existing children only, falling back to
+# the wildcard sibling; return the deepest reachable node or `nothing`.
+function _walk_down(d::Drain, tokens::Vector{String})
+    node = get(d.root.children, string(length(tokens)), nothing)
+    node === nothing && return nothing
+    max_token_layers = max(0, d.depth - 2)
+    @inbounds for i in 1:min(max_token_layers, length(tokens))
+        tok = tokens[i]
+        key = d.parametrize(tok) ? d.wildcard : tok
+        nxt = get(node.children, key, nothing)
+        if nxt === nothing
+            nxt = get(node.children, d.wildcard, nothing)
+            nxt === nothing && return node
+        end
+        node = nxt
+    end
+    return node
+end
+
+"""
+    id_sequence_matrix(d::Drain, lines; seqlen = 16, pad_id = 1,
+                       learn = false) -> Matrix{Int}
+
+DeepLog-style featurisation: map each line to its Drain template id,
+then window the *sequence of template ids across consecutive lines*
+into a `(seqlen, n_lines)` matrix. Column `j` holds the `seqlen`
+template ids ending at line `j` (left-padded with `pad_id`), so the
+model sees the recent log-key history predicting the next key.
+
+Template ids are shifted by `+1` so cluster id 1 doesn't collide with
+`pad_id = 1`; an empty line or an unmatched line (`learn = false`)
+maps to `pad_id`. With `learn = true` the Drain is *grown* (via
+[`process!`]) — used at training; with `learn = false` it is read
+only (via [`assign`]) — used at inference so ids never exceed the
+trained vocabulary.
+"""
+function id_sequence_matrix(d::Drain,
+                            lines::AbstractVector{<:AbstractString};
+                            seqlen::Integer = 16,
+                            pad_id::Integer = 1,
+                            learn::Bool = false)
+    seqlen >= 1 || throw(ArgumentError("seqlen must be ≥ 1"))
+    n = length(lines)
+    ids = Vector{Int}(undef, n)
+    @inbounds for i in 1:n
+        cid = learn ? process!(d, String(lines[i]))[1] : assign(d, String(lines[i]))
+        ids[i] = cid <= 0 ? Int(pad_id) : cid + 1
+    end
+    X = fill(Int(pad_id), Int(seqlen), n)
+    @inbounds for j in 1:n
+        k = min(j, Int(seqlen))
+        for i in 1:k
+            X[Int(seqlen) - k + i, j] = ids[j - k + i]
+        end
+    end
+    return X
 end
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ using LogClustering
     include("test_cv.jl")
     include("test_cluster.jl")
     include("test_drain.jl")
+    include("test_template_ids.jl")
     include("test_canonical.jl")
     include("test_postproc.jl")
     include("test_persistence.jl")

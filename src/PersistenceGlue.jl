@@ -137,6 +137,8 @@ function save_seq_lstm(path, model::Chain, ps, st;
                        bidirectional::Bool = false, peephole::Bool = false,
                        vocab::Union{Nothing, Vocabulary} = nothing,
                        seqlen::Union{Nothing, Integer} = nothing,
+                       tokens::Symbol = :words,
+                       drain::Union{Nothing, Drain} = nothing,
                        metadata::AbstractDict = Dict{String, Any}())
     spec = (
         vocab_size   = Int(vocab_size),
@@ -146,6 +148,8 @@ function save_seq_lstm(path, model::Chain, ps, st;
         peephole     = peephole,
         vocab        = vocab,
         seqlen       = seqlen === nothing ? nothing : Int(seqlen),
+        tokens       = tokens,
+        drain        = drain === nothing ? nothing : _drain_embed(drain),
     )
     Persistence.save_lux(path; kind = :seq_lstm, spec = spec,
                          ps = ps, st = st, metadata = metadata)
@@ -160,11 +164,16 @@ function _rehydrate_seq_lstm(bundle)
                      peephole = sp.peephole)
     vocab  = hasproperty(sp, :vocab)  ? sp.vocab  : nothing
     seqlen = hasproperty(sp, :seqlen) ? sp.seqlen : nothing
+    tokens = hasproperty(sp, :tokens) ? sp.tokens : :words
+    drain  = (hasproperty(sp, :drain) && sp.drain !== nothing) ?
+             _drain_from_embed(sp.drain) : nothing
     return (; model = model,
               ps = bundle.payload.ps,
               st = bundle.payload.st,
               vocab = vocab,
-              seqlen = seqlen)
+              seqlen = seqlen,
+              tokens = tokens,
+              drain = drain)
 end
 
 # ---------------------------------------------------------------------------
@@ -208,7 +217,7 @@ end
 
 function _transformer_spec(; vocab_size, d_model, n_layers, n_heads,
                             n_kv_heads, ffn_mult, max_seq_len, dropout,
-                            vocab, seqlen)
+                            vocab, seqlen, tokens = :words, drain = nothing)
     return (
         vocab_size  = Int(vocab_size),
         d_model     = Int(d_model),
@@ -220,6 +229,8 @@ function _transformer_spec(; vocab_size, d_model, n_layers, n_heads,
         dropout     = Float32(dropout),
         vocab       = vocab,
         seqlen      = seqlen === nothing ? nothing : Int(seqlen),
+        tokens      = tokens,
+        drain       = drain === nothing ? nothing : _drain_embed(drain),
     )
 end
 
@@ -230,13 +241,16 @@ function _save_transformer(path, kind::Symbol, model::Chain, ps, st;
                            max_seq_len::Integer, dropout::Real,
                            vocab::Union{Nothing, Vocabulary} = nothing,
                            seqlen::Union{Nothing, Integer} = nothing,
+                           tokens::Symbol = :words,
+                           drain::Union{Nothing, Drain} = nothing,
                            metadata::AbstractDict = Dict{String, Any}(),
                            n_lines::Integer = 0)
     spec = _transformer_spec(; vocab_size = vocab_size, d_model = d_model,
                              n_layers = n_layers, n_heads = n_heads,
                              n_kv_heads = n_kv_heads, ffn_mult = ffn_mult,
                              max_seq_len = max_seq_len, dropout = dropout,
-                             vocab = vocab, seqlen = seqlen)
+                             vocab = vocab, seqlen = seqlen,
+                             tokens = tokens, drain = drain)
     md = Dict{String, Any}(string(k) => v for (k, v) in metadata)
     if vocab !== nothing && !haskey(md, "corpus_fingerprint")
         md["corpus_fingerprint"] =
@@ -279,11 +293,16 @@ function _rehydrate_transformer_encoder(bundle)
         dropout     = sp.dropout)
     vocab  = hasproperty(sp, :vocab)  ? sp.vocab  : nothing
     seqlen = hasproperty(sp, :seqlen) ? sp.seqlen : nothing
+    tokens = hasproperty(sp, :tokens) ? sp.tokens : :words
+    drain  = (hasproperty(sp, :drain) && sp.drain !== nothing) ?
+             _drain_from_embed(sp.drain) : nothing
     return (; model = model,
               ps = bundle.payload.ps,
               st = bundle.payload.st,
               vocab = vocab,
-              seqlen = seqlen)
+              seqlen = seqlen,
+              tokens = tokens,
+              drain = drain)
 end
 
 function _rehydrate_transformer_decoder(bundle)
@@ -298,11 +317,16 @@ function _rehydrate_transformer_decoder(bundle)
         dropout     = sp.dropout)
     vocab  = hasproperty(sp, :vocab)  ? sp.vocab  : nothing
     seqlen = hasproperty(sp, :seqlen) ? sp.seqlen : nothing
+    tokens = hasproperty(sp, :tokens) ? sp.tokens : :words
+    drain  = (hasproperty(sp, :drain) && sp.drain !== nothing) ?
+             _drain_from_embed(sp.drain) : nothing
     return (; model = model,
               ps = bundle.payload.ps,
               st = bundle.payload.st,
               vocab = vocab,
-              seqlen = seqlen)
+              seqlen = seqlen,
+              tokens = tokens,
+              drain = drain)
 end
 
 # ---------------------------------------------------------------------------
@@ -341,6 +365,39 @@ function _rehydrate_drain(bundle)
     d.clusters = bundle.payload.clusters
     d.next_id = bundle.payload.next_id
     Drain3.rebuild_lru!(d)          # LRU bookkeeping isn't persisted
+    return d
+end
+
+# Embed / rebuild a Drain inside another bundle's spec (used by
+# template-id sequence models). The parametrize callable can't
+# serialise, so store its registry name + the tree/cluster payload —
+# the same shape `save_drain` / `_rehydrate_drain` use.
+function _drain_embed(d::Drain)
+    return (
+        depth            = d.depth,
+        sim_th           = d.sim_th,
+        max_children     = d.max_children,
+        max_clusters     = d.max_clusters,
+        wildcard         = d.wildcard,
+        parametrize_name = Persistence.name_of_callable(d.parametrize),
+        root             = d.root,
+        clusters         = d.clusters,
+        next_id          = d.next_id,
+    )
+end
+
+function _drain_from_embed(e)
+    fn = get(Persistence.CALLABLE_REGISTRY, e.parametrize_name, nothing)
+    fn === nothing && error(
+        "embedded Drain references parametrize `$(e.parametrize_name)` " *
+        "not in Persistence.CALLABLE_REGISTRY")
+    d = Drain(; depth = e.depth, sim_th = e.sim_th,
+               max_children = e.max_children, max_clusters = e.max_clusters,
+               wildcard = e.wildcard, parametrize = fn)
+    d.root = e.root
+    d.clusters = e.clusters
+    d.next_id = e.next_id
+    Drain3.rebuild_lru!(d)
     return d
 end
 
