@@ -35,7 +35,7 @@ using Lux
 using ..Masking: mask_lines_with_values
 using ..Featurise: bow, Vocabulary, build_vocab
 using ..DeepKATE: latent_layer
-using ..Pipeline: l2_normalise, kmeans_cluster
+using ..Pipeline: l2_normalise, kmeans_cluster, umap_hdbscan
 using ..Sparsity: sparsity_clusters
 using ..Instance: Instance, ValueNoveltyDetector, anomaly_score,
                   combined_anomaly, reconstruction_error_abs, value_novelty
@@ -90,15 +90,21 @@ from a rehydrated DeepKATE bundle; `detector` is an optional
 `ValueNoveltyDetector` from a separate bundle. `lines` is the
 raw log corpus (vector of strings).
 
-`k_clusters` defaults to `max(4, ceil(sqrt(length(lines))))` — a
-standard rule of thumb. `top_percentile` controls the anomaly
-cut-off; `min_sup` + `max_gap` + `max_time_duration` flow into
-`Episodes.mv_span`.
+`cluster` selects how the latent is grouped: `:kmeans` (default;
+`k_clusters` defaults to `max(4, ceil(sqrt(length(lines))))`) or
+`:hdbscan` (UMAP pre-reduction → density-based HDBSCAN, no `k`;
+`min_cluster_size` tunes it, noise lands in cluster `0`). The HDBSCAN
+path loads PythonCall lazily — it stays off the cold-start path.
+
+`top_percentile` controls the anomaly cut-off; `min_sup` + `max_gap`
++ `max_time_duration` flow into `Episodes.mv_span`.
 """
 function root_cause(model, ps, st, vocab,
                     lines::AbstractVector{<:AbstractString};
                     detector::Union{Nothing, ValueNoveltyDetector} = nothing,
                     k_clusters::Union{Nothing, Integer} = nothing,
+                    cluster::Symbol = :kmeans,
+                    min_cluster_size::Integer = 10,
                     top_percentile::Real = 0.10,
                     min_sup::Integer = 3,
                     max_gap::Integer = 20,
@@ -127,13 +133,26 @@ function root_cause(model, ps, st, vocab,
     end
     Zn = l2_normalise(Z)
 
-    # --- k-means clustering on the L2-normalised latent -----------------
+    # --- Cluster the L2-normalised latent -------------------------------
     n_lines = length(lines)
-    k = k_clusters === nothing ?
-        max(4, ceil(Int, sqrt(n_lines))) : Int(k_clusters)
-    k = min(k, n_lines)
-    assignments, _, _ = kmeans_cluster(Zn, k)
-    cluster_ids = Vector{Int}(assignments)
+    cluster_ids, k = if cluster === :hdbscan
+        # UMAP pre-reduction + density-based HDBSCAN: no `k`, and it
+        # handles the wild class imbalance k-means struggles with. Zn is
+        # already L2-normalised, so skip the pipeline's own normalise.
+        # Offline only — PythonCall loads lazily inside umap_hdbscan.
+        r = umap_hdbscan(Zn; l2 = false,
+                         min_cluster_size = Int(min_cluster_size))
+        cids = Vector{Int}(r.assignments)          # noise stays 0
+        (cids, length(unique(cids)))
+    elseif cluster === :kmeans
+        k0 = k_clusters === nothing ?
+             max(4, ceil(Int, sqrt(n_lines))) : Int(k_clusters)
+        k0 = min(k0, n_lines)
+        assignments, _, _ = kmeans_cluster(Zn, k0)
+        (Vector{Int}(assignments), k0)
+    else
+        throw(ArgumentError("cluster must be :kmeans or :hdbscan; got :$cluster"))
+    end
 
     # --- Per-line anomaly score -----------------------------------------
     score = if detector === nothing
@@ -146,6 +165,7 @@ function root_cause(model, ps, st, vocab,
 
     meta_seed = Dict{String, Any}(
         "embedder" => "model",
+        "clustering" => String(cluster),
         "n_clusters" => k,
         "with_detector" => detector !== nothing,
     )

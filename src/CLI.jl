@@ -1324,6 +1324,8 @@ function cmd_rca(args::Vector{String})::Int
         ("max-dur",     50,       :int),
         ("k-clusters",  0,        :int),          # 0 = auto
         ("embedder",    "model",  :string),       # model | sparsity
+        ("cluster",     "kmeans", :string),       # kmeans | hdbscan (model embedder)
+        ("min-cluster-size", 10,  :int),          # hdbscan only
         ("sparsity-k",  5,        :int),
         ("max-vocab",   5000,     :int),
         ("min-count",   1,        :int),
@@ -1366,9 +1368,14 @@ function cmd_rca(args::Vector{String})::Int
         hasproperty(art, :model) && hasproperty(art, :vocab) ||
             throw(ArgumentError("--model must be a DeepKATE / VQ-VAE bundle"))
         kk = Int(opts["k-clusters"])
+        cluster_alg = Symbol(opts["cluster"])
+        cluster_alg in (:kmeans, :hdbscan) ||
+            throw(ArgumentError("--cluster must be kmeans | hdbscan; got `$(opts["cluster"])`"))
         root_cause(art.model, art.ps, art.st, art.vocab, lines;
             detector = detector,
             k_clusters = kk > 0 ? kk : nothing,
+            cluster = cluster_alg,
+            min_cluster_size = Int(opts["min-cluster-size"]),
             top_percentile = Float64(opts["percentile"]),
             min_sup = Int(opts["min-sup"]),
             max_gap = Int(opts["max-gap"]),
@@ -1414,6 +1421,7 @@ function _print_rca_help()
                           [--topk N] [--percentile F]
                           [--min-sup N] [--max-gap N] [--max-dur N]
                           [--k-clusters K] [--sparsity-k K]
+                          [--cluster kmeans|hdbscan] [--min-cluster-size N]
                           [--max-vocab N] [--min-count N]
 
     Root-cause-analysis report: cluster → anomaly-score → episode
@@ -1422,12 +1430,21 @@ function _print_rca_help()
 
     Embedders:
       model     (default) run a saved DeepKATE / VQ-VAE bundle's
-                encoder, k-means on the latent. Requires --model.
+                encoder, cluster the latent (see --cluster). Requires
+                --model.
       sparsity  no training: cluster via top-k active BoW tokens
                 per line (`Cluster.Sparsity.sparsity_clusters` on
                 L2-normalised raw BoW). Tune with --sparsity-k
                 (default 5). Empirically matches or beats the
                 model path on dense-vocabulary corpora.
+
+    --cluster (model embedder only):
+      kmeans    (default) k-means on the latent (--k-clusters, 0 = auto).
+      hdbscan   UMAP pre-reduction → density-based HDBSCAN: no k, and it
+                handles class imbalance k-means struggles with (noise
+                lands in cluster 0). --min-cluster-size tunes it
+                (default 10). Offline only; needs the uv venv under py/
+                (PythonCall loads lazily — cold start is untouched).
 
     --detector is optional; it fuses a saved ValueNoveltyDetector's
     signal with the per-line anomaly score. Without a detector the

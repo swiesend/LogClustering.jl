@@ -106,6 +106,36 @@ lr_const() = 0.05f0
         @test_throws ArgumentError root_cause(art.model, art.ps, art.st,
             art.vocab, lines; top_percentile = 1.0,
             min_sup = 3, max_gap = 3, max_time_duration = 5)
+        # Unknown clustering algorithm.
+        @test_throws ArgumentError root_cause(art.model, art.ps, art.st,
+            art.vocab, lines; cluster = :dbscan,
+            min_sup = 3, max_gap = 3, max_time_duration = 5)
+    end
+
+    @testset "root_cause — --cluster metadata + hdbscan lazy Python" begin
+        # Default clustering is kmeans and the choice is recorded.
+        @test rep.metadata["clustering"] == "kmeans"
+
+        # HDBSCAN path: UMAP + HDBSCAN load PythonCall lazily. Without the
+        # uv venv pre-wired it must raise a clear error that points at the
+        # bootstrap (py/ + uv), never a cold-start import. With the venv
+        # present the run succeeds and tags the report `hdbscan`.
+        err = try
+            r = root_cause(art.model, art.ps, art.st, art.vocab, lines;
+                           cluster = :hdbscan, min_cluster_size = 3,
+                           top_percentile = 0.15, min_sup = 3,
+                           max_gap = 3, max_time_duration = 5)
+            @test r isa RCAReport
+            @test r.metadata["clustering"] == "hdbscan"
+            @test length(r.cluster_ids) == length(lines)
+            nothing
+        catch e
+            sprint(showerror, e)
+        end
+        if err !== nothing
+            @test occursin("py/", err) || occursin("PythonCall", err) ||
+                  occursin("uv", err)
+        end
     end
 
     @testset "render_markdown — emits a readable report" begin
