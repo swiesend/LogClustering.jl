@@ -366,6 +366,64 @@ end
         @test Int(ev["dropped"]["webhook"]) == 7
     end
 
+    @testset "rules --tune freezes an auto:p99 threshold to a number" begin
+        mktempdir() do dir
+            data = _write_lines(vcat(["INFO request $i ok" for i in 1:80],
+                                     ["ERROR boom $i weird" for i in 1:20]))
+            model = joinpath(dir, "dec.jld2")
+            @test CLI.cmd_train(String["--kind", "transformer_decoder",
+                "--data", data, "--out", model, "--seqlen", "8",
+                "--d-model", "32", "--n-layers", "2", "--n-heads", "4",
+                "--epochs", "2", "--batch", "32", "--quiet"]) == 0
+            rules = _write_json(Dict("version" => 1,
+                "rules" => [Dict("id" => "high_nll", "kind" => "score_threshold",
+                                 "metric" => "transformer_decoder.nll",
+                                 "comparison" => ">", "value" => "auto:p99")]))
+            out = joinpath(dir, "tuned.json")
+            r = _e2e_capture(() -> CLI.main(["rules", "--tune",
+                "--rules", rules, "--data", data, "--model", model,
+                "--out", out]))
+            @test r.code == 0
+            tuned = JSON3.read(read(out, String))
+            v = tuned["rules"][1]["value"]
+            @test v isa Number                       # frozen, not "auto:p99"
+            @test isfinite(Float64(v))
+        end
+    end
+
+    @testset "rules --explain-trigger prints why a stored trigger fired" begin
+        mktempdir() do dir
+            db_path = joinpath(dir, "m.sqlite")
+            db = LogClustering.Memory.SQLite.open_db(db_path)
+            LogClustering.Memory.SQLite.migrate!(db)
+            sid = LogClustering.Memory.SQLite.insert_session!(db; host = "h")
+            LogClustering.Memory.SQLite.insert_trigger!(db; session_id = sid,
+                rule_id = "kw", rule_kind = "keyword", severity = "crit",
+                line_id = 5, line = "kernel OOM killed",
+                fields = Dict("matched" => ["OOM"]), drain_cluster_id = 3)
+            r = _e2e_capture(() -> CLI.main(["rules", "--explain-trigger", "1",
+                "--memory", db_path]))
+            @test r.code == 0
+            @test occursin("trigger #1", r.out)
+            @test occursin("kw", r.out) && occursin("keyword", r.out)
+            @test occursin("OOM", r.out)             # matched keyword surfaced
+            @test occursin("cluster", r.out)         # drain history line
+        end
+    end
+
+    @testset "rules --explain-trigger errors on a missing id / no --memory" begin
+        mktempdir() do dir
+            db_path = joinpath(dir, "m.sqlite")
+            db = LogClustering.Memory.SQLite.open_db(db_path)
+            LogClustering.Memory.SQLite.migrate!(db)
+            r = _e2e_capture(() -> CLI.main(["rules", "--explain-trigger", "999",
+                "--memory", db_path]))
+            @test r.code == 2                        # ArgumentError → exit 2
+            r2 = _e2e_capture(() -> CLI.main(["rules", "--explain-trigger", "1"]))
+            @test r2.code == 2                       # missing --memory
+        end
+    end
+
     @testset "doctor surfaces memory-store liveness (counts + last exit)" begin
         mktempdir() do dir
             db_path = joinpath(dir, "m.sqlite")

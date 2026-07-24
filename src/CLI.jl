@@ -64,7 +64,7 @@ using Zygote
 using JSON3
 using Dates: Dates, DateTime, now, UTC
 using Random: MersenneTwister
-using Statistics: mean
+using Statistics: mean, std, quantile
 
 export main
 
@@ -2628,10 +2628,14 @@ function cmd_rules(args::Vector{String})::Int
         ("print-defaults", false, :bool),
         ("validate",       "",    :path),
         ("explain",        "",    :path),
+        ("explain-trigger", 0,    :int),      # trigger id to explain (needs --memory)
         ("dry-run",        false, :bool),
+        ("tune",           false, :bool),     # fit auto:* thresholds → suggested bundle
         ("rules",          "",    :path),
         ("data",           "-",   :path),
         ("model",          "",    :path),
+        ("memory",         "",    :path),
+        ("out",            "-",   :path),
         ("warmup-lines",   0,     :int),
         ("warmup-seconds", 0.0,   :float),
     ]
@@ -2666,6 +2670,14 @@ function cmd_rules(args::Vector{String})::Int
         return 0
     end
 
+    if Int(opts["explain-trigger"]) > 0
+        return _rules_explain_trigger(opts)
+    end
+
+    if opts["tune"]
+        return _rules_tune(opts)
+    end
+
     if opts["dry-run"]
         isempty(opts["rules"]) &&
             throw(ArgumentError("--dry-run needs --rules FILE"))
@@ -2693,12 +2705,180 @@ function cmd_rules(args::Vector{String})::Int
     return 0
 end
 
+"""
+    _rules_tune(opts) -> Int
+
+Replay `--data` through `--model` (like `--dry-run`) collecting the
+per-rule metric distribution for every `score_threshold` rule whose
+value is `auto:*`, then emit a copy of the `--rules` bundle with each
+such rule's `value` frozen to the fitted number (`auto:p99`/`p995` →
+that empirical quantile; `auto:zscore:K` → mean + K·std). Rules with
+too few observations are left as-is with a stderr note. Written to
+`--out` (default stdout).
+"""
+function _rules_tune(opts)::Int
+    isempty(opts["rules"]) &&
+        throw(ArgumentError("--tune needs --rules FILE"))
+    rs = Rules.load_rules(String(opts["rules"]);
+                          warmup_lines   = Int(opts["warmup-lines"]),
+                          warmup_seconds = Float64(opts["warmup-seconds"]))
+    inferer = _build_inferer(Dict("model"    => opts["model"],
+                                   "detector" => "",
+                                   "framed"   => "raw"), :raw)
+    lines = read_lines(opts["data"])
+
+    # Collect each auto:* score_threshold rule's metric values.
+    auto = Dict{String, Vector{Float64}}()   # rule_id → observed metric values
+    tuned_rule = Dict{String, Any}()          # rule_id → the rule struct
+    for r in rs.rules
+        r isa Rules.ScoreThresholdRule || continue
+        r.value_kind === :fixed && continue
+        auto[r.id] = Float64[]
+        tuned_rule[r.id] = r
+    end
+    if isempty(auto)
+        println(stderr, "rules --tune: no auto:* score_threshold rules to fit")
+    end
+
+    for (i, l) in enumerate(lines)
+        isempty(auto) && break
+        ev = Stream.LineEvent(String(l), Int(i), now(UTC); partial = false)
+        ir = _infer(inferer, ev)
+        for (rid, r) in tuned_rule
+            v = Rules._lookup(ir, r.metric)
+            v isa Real && push!(auto[rid], Float64(v))
+        end
+    end
+
+    # Fit a fixed threshold per rule from its collected distribution.
+    fitted = Dict{String, Float64}()
+    for (rid, vals) in auto
+        r = tuned_rule[rid]
+        if length(vals) < 20
+            println(stderr, "rules --tune: `$rid` — only $(length(vals)) ",
+                    "observations of `$(r.metric)`; leaving auto:* in place")
+            continue
+        end
+        thr = if r.value_kind === :zscore
+            mean(vals) + r.value_arg * std(vals)
+        else                                   # :p99 / :p995 — value_arg is the quantile
+            quantile(vals, r.value_arg)
+        end
+        fitted[rid] = thr
+    end
+
+    # Rewrite the source bundle's JSON, replacing tuned rules' `value`.
+    bundle = JSON3.read(read(String(opts["rules"]), String), Dict{String, Any})
+    rules_arr = get(bundle, "rules", Any[])
+    for rule in rules_arr
+        rule isa AbstractDict || continue
+        rid = get(rule, "id", nothing)
+        rid !== nothing && haskey(fitted, String(rid)) || continue
+        rule["value"] = round(fitted[String(rid)]; digits = 6)
+    end
+    write_out(String(opts["out"]), JSON3.write(bundle) * "\n")
+    if !isempty(fitted)
+        println(stderr, "rules --tune: fitted ", length(fitted), " of ",
+                length(auto), " auto:* rule(s) from ", length(lines), " lines")
+    end
+    return 0
+end
+
+"""
+    _rules_explain_trigger(opts) -> Int
+
+Read trigger `--explain-trigger ID` from the `--memory` store and print
+why it fired: the rule + severity, the line, the per-kind `fields` (the
+matched keyword / crossed threshold / novel cluster), the drain
+cluster's history (prior sightings, first-seen), and the triggers that
+bracket it in time.
+"""
+function _rules_explain_trigger(opts)::Int
+    isempty(opts["memory"]) &&
+        throw(ArgumentError("--explain-trigger needs --memory FILE"))
+    tid = Int(opts["explain-trigger"])
+    db = Memory.SQLite.open_db(String(opts["memory"]); create = false)
+    Memory.SQLite.migrate!(db)
+    rows = Memory.SQLite._rows(db,
+        "SELECT id, ts, ts_epoch_ms, rule_id, rule_kind, severity, line_id, " *
+        "line, fields_json, drain_cluster_id FROM triggers WHERE id = ?", (tid,))
+    isempty(rows) && throw(ArgumentError("no trigger with id $tid in $(opts["memory"])"))
+    t = rows[1]
+
+    io = IOBuffer()
+    println(io, "trigger #", t.id, "  (", t.ts, ")")
+    println(io, "  rule      : ", t.rule_id, "  [", t.rule_kind, ", ",
+            t.severity, "]")
+    println(io, "  line #", t.line_id, ": ", t.line)
+    if t.fields_json !== missing && t.fields_json !== nothing
+        fields = try; JSON3.read(String(t.fields_json)); catch; nothing; end
+        fields === nothing || println(io, "  why       : ",
+            _explain_fields(String(t.rule_kind), fields))
+    end
+
+    # Drain cluster history: how established was this template?
+    if t.drain_cluster_id !== missing && t.drain_cluster_id !== nothing
+        cid = Int(t.drain_cluster_id)
+        hist = Memory.SQLite._rows(db,
+            "SELECT COUNT(*) AS n, MIN(ts_epoch_ms) AS first_ms " *
+            "FROM triggers WHERE drain_cluster_id = ? AND ts_epoch_ms <= ?",
+            (cid, Int(t.ts_epoch_ms)))
+        n = Int(hist[1].n)
+        println(io, "  cluster   : #", cid, " — ", n,
+                n == 1 ? " (first sighting)" : " prior sightings up to here")
+    end
+
+    # Neighbouring triggers in time (3 before, 3 after).
+    before = Memory.SQLite._rows(db,
+        "SELECT id, rule_id, ts FROM triggers WHERE ts_epoch_ms < ? " *
+        "ORDER BY ts_epoch_ms DESC LIMIT 3", (Int(t.ts_epoch_ms),))
+    after = Memory.SQLite._rows(db,
+        "SELECT id, rule_id, ts FROM triggers WHERE ts_epoch_ms > ? " *
+        "ORDER BY ts_epoch_ms ASC LIMIT 3", (Int(t.ts_epoch_ms),))
+    if !isempty(before) || !isempty(after)
+        println(io, "  neighbours:")
+        for r in reverse(before)
+            println(io, "    - #", r.id, "  ", r.rule_id, "  (", r.ts, ")")
+        end
+        println(io, "    > #", t.id, "  ", t.rule_id, "  (", t.ts, ")  ← this")
+        for r in after
+            println(io, "    - #", r.id, "  ", r.rule_id, "  (", r.ts, ")")
+        end
+    end
+    write_out(String(opts["out"]), String(take!(io)))
+    return 0
+end
+
+# One-line human summary of a trigger's `fields` payload, per rule kind.
+function _explain_fields(kind::AbstractString, f)
+    g(k) = haskey(f, k) ? f[k] : (haskey(f, Symbol(k)) ? f[Symbol(k)] : nothing)
+    if kind == "keyword"
+        m = g("matched"); return "matched keyword(s): $(m === nothing ? "?" : join(m, ", "))"
+    elseif kind == "regex"
+        return "regex matched: $(something(g("match"), "?"))"
+    elseif kind == "score_threshold"
+        return "metric $(something(g("metric"), "?")) = $(something(g("value"), "?")) " *
+               "crossed threshold $(something(g("threshold"), "?"))"
+    elseif kind == "novel_cluster"
+        return "first sighting of $(something(g("model"), "?")) cluster $(something(g("cluster_id"), "?"))"
+    elseif kind == "novel_token"
+        nt = g("novel_tokens"); return "novel token(s): $(nt === nothing ? "?" : join(nt, ", "))"
+    elseif kind == "rate_spike" || kind == "volume_anomaly"
+        return "count $(something(g("count_in_window"), "?")) in " *
+               "$(something(g("window_s"), "?"))s vs baseline $(something(g("baseline"), "?"))"
+    else
+        return JSON3.write(f)
+    end
+end
+
 function _print_rules_help()
     println("""
     usage: logcluster rules --print-defaults
            logcluster rules --validate FILE
            logcluster rules --explain  FILE
            logcluster rules --dry-run --rules FILE --data FILE [--model M]
+           logcluster rules --tune --rules FILE --data FILE [--model M] [--out F]
+           logcluster rules --explain-trigger ID --memory DB [--out F]
 
     Introspect / author rules bundles.
 
@@ -2714,6 +2894,17 @@ function _print_rules_help()
                         --model adds drain / transformer signals so
                         score_threshold + novel_cluster rules see real
                         data.
+    --tune              like --dry-run, but *fit* each `auto:*`
+                        score_threshold rule's value from the observed
+                        metric distribution (auto:p99/p995 → that
+                        empirical quantile; auto:zscore:K → mean+K·std)
+                        and emit the bundle with those numbers frozen in.
+                        Written to --out (default stdout).
+    --explain-trigger ID
+                        read trigger ID from --memory and print why it
+                        fired: rule + severity, the line, the crossed
+                        threshold / matched keyword, the drain cluster's
+                        history, and the triggers bracketing it in time.
     """)
 end
 
