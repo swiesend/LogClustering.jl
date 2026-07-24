@@ -199,6 +199,42 @@ end
         @test t[1].fields["min_count"]       == 3
     end
 
+    @testset "baseline auto:changepoint — parsing" begin
+        rs = _no_warmup("""[
+            {"id": "cp", "kind": "rate_spike",
+             "window_s": 3600, "baseline": "auto:changepoint"}]""")
+        @test rs.rules[1].baseline_mode === :changepoint
+        # A numeric baseline (or absent) stays fixed.
+        rs2 = _no_warmup("""[
+            {"id": "fx", "kind": "volume_anomaly",
+             "window_s": 60, "baseline_multiplier": 5.0}]""")
+        @test rs2.rules[1].baseline_mode === :fixed
+        @test_throws ArgumentError _no_warmup("""[
+            {"id": "bad", "kind": "rate_spike", "baseline": "auto:nope"}]""")
+    end
+
+    @testset "rate_spike auto:changepoint fires on an upward regime shift" begin
+        # A huge window (no trimming in a fast test) so `count` is the
+        # cumulative matched-line count — deterministic, no wall-clock
+        # dependence. Phase A: non-matching lines (count stays 0, stable).
+        # Phase B: matching lines (count ramps 1,2,3,… — an upward shift
+        # ADWIN detects).
+        rs = _no_warmup("""[
+            {"id": "cp", "kind": "rate_spike",
+             "match": {"kind": "regex", "field": "line", "pattern": "ERR"},
+             "window_s": 3600, "baseline": "auto:changepoint"}]""")
+        fires_a = 0
+        for i in 1:150
+            fires_a += length(evaluate(rs, _ir("ok line $i"; line_id = i)))
+        end
+        @test fires_a == 0                       # stable low → no fire
+        fires_b = 0
+        for i in 1:150
+            fires_b += length(evaluate(rs, _ir("ERR boom $i"; line_id = 150 + i)))
+        end
+        @test fires_b >= 1                       # the ramp is detected
+    end
+
     @testset "cooldown suppresses repeated firings" begin
         body = """
         { "version": 1,

@@ -54,6 +54,7 @@ module Rules
 using JSON3
 using Dates: Dates, DateTime, now, UTC
 using ..TDigests: TDigests
+using ..ADWINs: ADWINs
 
 export RuleSet, TriggerEvent, default_rules, load_rules, evaluate,
        snapshot, route_sinks, route_sinks_for, attach_warm_store!,
@@ -109,6 +110,7 @@ struct RateSpikeRule <: AbstractRule
     window_s::Float64
     min_count::Int
     baseline_multiplier::Float64
+    baseline_mode::Symbol         # :fixed (multiplier) | :changepoint (ADWIN)
 end
 
 struct VolumeAnomalyRule <: AbstractRule
@@ -118,6 +120,7 @@ struct VolumeAnomalyRule <: AbstractRule
     warmup_required::Bool
     window_s::Float64
     baseline_multiplier::Float64
+    baseline_mode::Symbol         # :fixed (multiplier) | :changepoint (ADWIN)
 end
 
 struct KeywordRule <: AbstractRule
@@ -386,6 +389,19 @@ _warm_merge_sketch!(_s, _rule_id, _blob) = nothing
     return id, sev, cd, wr
 end
 
+# rate_spike / volume_anomaly `"baseline"` field: absent or a number →
+# the fixed-multiplier baseline (`:fixed`); `"auto:changepoint"` → an
+# adaptive ADWIN change detector (`:changepoint`).
+function _parse_baseline_mode(r, id)
+    haskey(r, :baseline) || return :fixed
+    b = r.baseline
+    b isa Number && return :fixed
+    s = String(b)
+    s == "auto:changepoint" && return :changepoint
+    throw(ArgumentError("rule $id: invalid baseline `$s` " *
+                        "(expected a number or \"auto:changepoint\")"))
+end
+
 function _parse_rule(r, defaults::Dict{Symbol, Any})
     kind = Symbol(r.kind)
     id, sev, cd, wr = _common_fields(r, defaults)
@@ -453,12 +469,14 @@ function _parse_rule(r, defaults::Dict{Symbol, Any})
                               match_regex, match_keywords, case_sens,
                               Float64(get(r, :window_s, 60.0)),
                               Int(get(r, :min_count, 0)),
-                              Float64(get(r, :baseline_multiplier, 0.0)))
+                              Float64(get(r, :baseline_multiplier, 0.0)),
+                              _parse_baseline_mode(r, id))
 
     elseif kind === :volume_anomaly
         return VolumeAnomalyRule(id, sev, cd, wr,
                                   Float64(get(r, :window_s, 60.0)),
-                                  Float64(get(r, :baseline_multiplier, 5.0)))
+                                  Float64(get(r, :baseline_multiplier, 5.0)),
+                                  _parse_baseline_mode(r, id))
 
     elseif kind === :keyword
         return KeywordRule(id, sev, cd, wr,
@@ -538,19 +556,23 @@ _initial_state(::NovelTokenRule) =
                        :seen  => Set{String}(),
                        :order => String[])
 
-_initial_state(::RateSpikeRule) =
+_initial_state(r::RateSpikeRule) =
     Dict{Symbol, Any}(:last_fired => -Inf,
                        :events => Float64[],
                        :baseline_count => 0,
                        :baseline_n => 0,
-                       :baseline_window_count => 0.0)
+                       :baseline_window_count => 0.0,
+                       :adwin => r.baseline_mode === :changepoint ?
+                                 ADWINs.ADWIN() : nothing)
 
-_initial_state(::VolumeAnomalyRule) =
+_initial_state(r::VolumeAnomalyRule) =
     Dict{Symbol, Any}(:last_fired => -Inf,
                        :events => Float64[],
                        :baseline_count => 0,
                        :baseline_n => 0,
-                       :baseline_window_count => 0.0)
+                       :baseline_window_count => 0.0,
+                       :adwin => r.baseline_mode === :changepoint ?
+                                 ADWINs.ADWIN() : nothing)
 
 _initial_state(::KeywordRule) =
     Dict{Symbol, Any}(:last_fired => -Inf)
@@ -726,6 +748,7 @@ function _ingest!(r::RateSpikeRule, ir, st, t)
         push!(st[:events], t)
     end
     _trim_window!(st[:events], t, r.window_s)
+    _changepoint_observe!(st, length(st[:events]))   # learn baseline
 end
 
 function _ingest!(r::VolumeAnomalyRule, ir, st, t)
@@ -733,6 +756,28 @@ function _ingest!(r::VolumeAnomalyRule, ir, st, t)
     st[:baseline_n] += 1
     push!(st[:events], t)
     _trim_window!(st[:events], t, r.window_s)
+    _changepoint_observe!(st, length(st[:events]))
+end
+
+# Feed the window count to the rule's ADWIN (changepoint mode only;
+# no-op otherwise). Exactly one feed per line — _ingest! and
+# _fire_check are mutually exclusive per line.
+function _changepoint_observe!(st, count::Int)
+    a = get(st, :adwin, nothing)
+    a === nothing || ADWINs.update!(a, Float64(count))
+    return nothing
+end
+
+# Feed the count and report whether an *upward* regime shift was just
+# detected (the retained window's mean now exceeds the dropped one's).
+function _changepoint_fire!(st, count::Int)
+    a = get(st, :adwin, nothing)
+    a === nothing && return (false, NaN)
+    changed = ADWINs.update!(a, Float64(count))
+    m = ADWINs.mean(a)
+    up = changed && !isnan(ADWINs.last_drop_mean(a)) &&
+         m > ADWINs.last_drop_mean(a)
+    return (up, m)
 end
 
 _ingest!(::KeywordRule, _ir, _st, _t) = nothing
@@ -823,33 +868,46 @@ function _fire_check(r::RateSpikeRule, ir, st, t)
     _matches_rate(r, ir) && push!(st[:events], t)
     _trim_window!(st[:events], t, r.window_s)
     count = length(st[:events])
-    baseline = Float64(st[:baseline_window_count])
-
     fired_min = r.min_count > 0 && count >= r.min_count
-    fired_mult = r.baseline_multiplier > 0 && baseline > 0 &&
-                  count >= r.baseline_multiplier * baseline
 
     fields = Dict{String, Any}(
         "count_in_window" => count,
         "window_s"        => r.window_s,
-        "baseline"        => baseline,
         "min_count"       => r.min_count,
     )
-    return ((fired_min || fired_mult), fields)
+    if r.baseline_mode === :changepoint
+        up, adaptive = _changepoint_fire!(st, count)
+        fields["baseline"] = adaptive
+        fields["mode"]     = "changepoint"
+        return ((fired_min || up), fields)
+    else
+        baseline = Float64(st[:baseline_window_count])
+        fired_mult = r.baseline_multiplier > 0 && baseline > 0 &&
+                      count >= r.baseline_multiplier * baseline
+        fields["baseline"] = baseline
+        return ((fired_min || fired_mult), fields)
+    end
 end
 
 function _fire_check(r::VolumeAnomalyRule, ir, st, t)
     push!(st[:events], t)
     _trim_window!(st[:events], t, r.window_s)
     count = length(st[:events])
-    baseline = Float64(st[:baseline_window_count])
-    fired = baseline > 0 && count >= r.baseline_multiplier * baseline
     fields = Dict{String, Any}(
         "count_in_window" => count,
         "window_s"        => r.window_s,
-        "baseline"        => baseline,
     )
-    return (fired, fields)
+    if r.baseline_mode === :changepoint
+        up, adaptive = _changepoint_fire!(st, count)
+        fields["baseline"] = adaptive
+        fields["mode"]     = "changepoint"
+        return (up, fields)
+    else
+        baseline = Float64(st[:baseline_window_count])
+        fired = baseline > 0 && count >= r.baseline_multiplier * baseline
+        fields["baseline"] = baseline
+        return (fired, fields)
+    end
 end
 
 function _fire_check(r::KeywordRule, ir, _st, _t)

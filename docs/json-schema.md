@@ -151,9 +151,14 @@ logcluster stream --log-format text --log-level debug ...
     { "id": "rate", "kind": "rate_spike",
       "match": { "kind": "regex", "field": "line", "pattern": "..." },
       "window_s": 60, "min_count": 10, "baseline_multiplier": 3.0 },
+    // rate_spike / volume_anomaly may set "baseline": "auto:changepoint"
+    // instead of a fixed multiplier — an adaptive ADWIN detector that
+    // fires on an upward regime shift in the windowed count (catches
+    // bursts a static threshold misses; won't cry wolf when the
+    // baseline drifts up slowly). min_count still applies as a floor.
 
     { "id": "vol", "kind": "volume_anomaly",
-      "window_s": 60, "baseline_multiplier": 5.0 },
+      "window_s": 60, "baseline": "auto:changepoint" },
 
     { "id": "kw", "kind": "keyword",
       "field": "line", "keywords": ["FATAL", "OOM"],
