@@ -288,4 +288,45 @@ end
         end
     end
 
+    @testset "report --format html is self-contained with every section" begin
+        mktempdir() do dir
+            db_path = joinpath(dir, "t.sqlite")
+            _fill_fixture(db_path)
+            out = joinpath(dir, "report.html")
+            r = _capture(() -> CLI.main(["report",
+                "--memory", db_path, "--since", "1000d",
+                "--format", "html", "--out", out, "--topk", "5"]))
+            @test r.code == 0
+            html = read(out, String)
+            # Well-formed, self-contained page.
+            @test occursin("<!doctype html>", html)
+            @test occursin("<style>", html) && occursin("</html>", html)
+            # No external requests: no src=/href= to a network resource.
+            @test !occursin("http://", html) && !occursin("https://", html)
+            # Every section header renders.
+            for h in ("Trigger timeline", "Top rules", "Novel templates",
+                      "Top cluster transitions", "Episodes",
+                      "Pinned-pattern activity", "Embedding scatter")
+                @test occursin(h, html)
+            end
+            # The timeline bar chart and a data row from the fixture.
+            @test occursin("class=\"timeline\"", html)
+            @test occursin("<td>a</td>", html)          # rule "a" from fixture
+            # No embeddings persisted → scatter degrades to a note, not an SVG.
+            @test occursin("no embeddings persisted", html)
+            @test !occursin("<svg", html)
+        end
+    end
+
+    @testset "report rejects an unknown --format" begin
+        mktempdir() do dir
+            db_path = joinpath(dir, "t.sqlite")
+            _fill_fixture(db_path)
+            r = _capture(() -> CLI.main(["report",
+                "--memory", db_path, "--since", "1000d", "--format", "pdf"]))
+            @test r.code == 2                       # ArgumentError → exit 2
+            @test occursin("unknown --format", r.err)
+        end
+    end
+
 end

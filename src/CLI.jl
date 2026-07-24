@@ -3178,8 +3178,9 @@ function cmd_report(args::Vector{String})::Int
         ("memory",  "",    :path),
         ("since",   "24h", :string),
         ("until",   "",    :string),
-        ("format",  "md",  :string),     # md | json
+        ("format",  "md",  :string),     # md | json | html
         ("topk",    10,    :int),
+        ("out",     "-",   :path),       # sink for --format html (default stdout)
         ("min-sup", 3,     :int),
         ("max-gap", 20,    :int),
         ("max-dur", 50,    :int),
@@ -3214,8 +3215,23 @@ function cmd_report(args::Vector{String})::Int
 
     if opts["format"] == "json"
         println(stdout, JSON3.write(_jsonable(bundle)))
-    else
+    elseif opts["format"] == "html"
+        # Extra sections only the HTML view renders: an all-rules
+        # timeline and (best-effort) the UMAP embedding scatter. The
+        # scatter needs the Python venv + persisted embeddings; if
+        # either is missing we degrade gracefully to a note.
+        bundle["timeline"] = Memory.Insights.trigger_timeline(db;
+            since = since, until = until)
+        bundle["scatter"] = try
+            Memory.Insights.embedding_scatter(db; since = since, until = until)
+        catch
+            NamedTuple[]
+        end
+        write_out(String(opts["out"]), _render_report_html(bundle))
+    elseif opts["format"] == "md"
         print(stdout, _render_report_md(bundle))
+    else
+        throw(ArgumentError("unknown --format `$(opts["format"])`; use md | json | html"))
     end
     return 0
 end
@@ -3293,15 +3309,196 @@ function _render_report_md(b::AbstractDict)
     return String(take!(io))
 end
 
+# --- HTML report ------------------------------------------------------------
+
+# Minimal HTML-escape for text interpolated into the page.
+function _h(x)
+    s = x isa AbstractString ? x : string(x)
+    s = replace(s, '&' => "&amp;", '<' => "&lt;", '>' => "&gt;",
+                '"' => "&quot;", '\'' => "&#39;")
+    return s
+end
+
+# One `<table>` from a header + rows; `cells(r)` returns a row's cell values.
+function _html_table(io, headers, rows, cells; empty_msg = "none")
+    if isempty(rows)
+        println(io, "<p class=\"empty\">", _h(empty_msg), "</p>")
+        return
+    end
+    println(io, "<table><thead><tr>")
+    for hd in headers
+        print(io, "<th>", _h(hd), "</th>")
+    end
+    println(io, "</tr></thead><tbody>")
+    for r in rows
+        print(io, "<tr>")
+        for c in cells(r)
+            print(io, "<td>", _h(c), "</td>")
+        end
+        println(io, "</tr>")
+    end
+    println(io, "</tbody></table>")
+end
+
+# A CSS-only horizontal bar chart for the trigger timeline.
+function _html_timeline(io, timeline)
+    if isempty(timeline)
+        println(io, "<p class=\"empty\">no triggers in window</p>")
+        return
+    end
+    maxn = maximum(r.n for r in timeline)
+    maxn = maxn == 0 ? 1 : maxn
+    println(io, "<div class=\"timeline\">")
+    for r in timeline
+        pct = round(100 * r.n / maxn; digits = 1)
+        ts  = _iso_from_epoch(Int(r.bucket_start_ms))
+        println(io, "<div class=\"bar-row\">",
+                "<span class=\"bar-label\">", _h(ts), "</span>",
+                "<span class=\"bar\" style=\"width:", pct, "%\"></span>",
+                "<span class=\"bar-n\">", r.n, "</span></div>")
+    end
+    println(io, "</div>")
+end
+
+# Inline SVG scatter of the 2-D UMAP embedding, coloured by cluster.
+function _html_scatter(io, scatter)
+    if isempty(scatter)
+        println(io, "<p class=\"empty\">no embeddings persisted, or UMAP ",
+                "unavailable (run <code>stream --persist-embeddings</code> ",
+                "with the <code>py/</code> venv)</p>")
+        return
+    end
+    W, H, pad = 640, 420, 24
+    xs = [p.x for p in scatter]; ys = [p.y for p in scatter]
+    xmin, xmax = extrema(xs); ymin, ymax = extrema(ys)
+    sx(x) = xmax > xmin ? pad + (W - 2pad) * (x - xmin) / (xmax - xmin) : W / 2
+    sy(y) = ymax > ymin ? H - pad - (H - 2pad) * (y - ymin) / (ymax - ymin) : H / 2
+    palette = ["#4e79a7","#f28e2b","#e15759","#76b7b2","#59a14f",
+               "#edc948","#b07aa1","#ff9da7","#9c755f","#bab0ac"]
+    println(io, "<svg viewBox=\"0 0 ", W, " ", H,
+            "\" class=\"scatter\" role=\"img\" aria-label=\"embedding scatter\">")
+    for p in scatter
+        col = palette[mod(p.cluster, length(palette)) + 1]
+        println(io, "<circle cx=\"", round(sx(p.x); digits = 1),
+                "\" cy=\"", round(sy(p.y); digits = 1),
+                "\" r=\"3\" fill=\"", col, "\">",
+                "<title>line ", p.line_id, " · cluster ", p.cluster,
+                "</title></circle>")
+    end
+    println(io, "</svg>")
+end
+
+# ISO string from epoch-ms (best-effort; falls back to the raw number).
+function _iso_from_epoch(ms::Integer)
+    try
+        return string(Dates.format(Dates.unix2datetime(ms / 1000),
+                                    Dates.dateformat"yyyy-mm-dd HH:MM"))
+    catch
+        return string(ms)
+    end
+end
+
+const _REPORT_CSS = """
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { font: 15px/1.5 -apple-system, Segoe UI, Roboto, sans-serif;
+       margin: 0; padding: 2rem; max-width: 60rem; margin: 0 auto;
+       color: #1a1a1a; background: #fff; }
+@media (prefers-color-scheme: dark) {
+  body { color: #e6e6e6; background: #16181c; }
+  th { background: #23262d !important; }
+  tr:nth-child(even) td { background: #1c1f25; }
+  .bar { background: #5a8dd6 !important; }
+  code { background: #23262d; }
+}
+h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+h2 { font-size: 1.15rem; margin: 2rem 0 .5rem;
+     border-bottom: 2px solid currentColor; padding-bottom: .2rem; }
+.window { opacity: .7; margin: 0 0 1rem; }
+table { border-collapse: collapse; width: 100%; margin: .25rem 0 1rem; }
+th, td { text-align: left; padding: .4rem .6rem;
+         border-bottom: 1px solid #d0d0d0; }
+th { background: #f2f4f7; font-weight: 600; }
+td { font-variant-numeric: tabular-nums; }
+.empty { opacity: .55; font-style: italic; }
+code { background: #f2f4f7; padding: 0 .3em; border-radius: 3px; }
+.timeline { display: flex; flex-direction: column; gap: 3px; }
+.bar-row { display: grid; grid-template-columns: 8.5rem 1fr 3rem;
+           align-items: center; gap: .5rem; }
+.bar-label { font-size: .8rem; opacity: .7; font-variant-numeric: tabular-nums; }
+.bar { background: #4e79a7; height: 1rem; border-radius: 2px; min-width: 1px; }
+.bar-n { text-align: right; font-variant-numeric: tabular-nums; }
+.scatter { width: 100%; height: auto; border: 1px solid #d0d0d0;
+           border-radius: 6px; background: rgba(127,127,127,.04); }
+footer { margin-top: 2.5rem; opacity: .5; font-size: .8rem; }
+"""
+
+"""
+    _render_report_html(bundle) -> String
+
+Self-contained HTML report (inline CSS, inline SVG scatter — no external
+requests). Mirrors the Markdown sections and adds an all-rules trigger
+timeline and the UMAP embedding scatter (when embeddings were persisted).
+"""
+function _render_report_html(b::AbstractDict)
+    io = IOBuffer()
+    println(io, "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
+    println(io, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+    println(io, "<title>LogClustering report</title>")
+    println(io, "<style>", _REPORT_CSS, "</style></head><body>")
+    println(io, "<h1>LogClustering insights report</h1>")
+    println(io, "<p class=\"window\">Window: ", _h(b["since"]), " &rarr; ",
+            _h(b["until"]), "</p>")
+
+    println(io, "<h2>Trigger timeline</h2>")
+    _html_timeline(io, get(b, "timeline", NamedTuple[]))
+
+    println(io, "<h2>Top rules</h2>")
+    _html_table(io, ["rule_id", "severity", "count"], b["top_rules"],
+        r -> (r.rule_id, r.severity, r.n); empty_msg = "no triggers in window")
+
+    println(io, "<h2>Novel templates</h2>")
+    _html_table(io, ["cluster_id", "first_seen"], b["novel"],
+        r -> (r.cluster_id, _iso_from_epoch(Int(r.first_seen_ms)));
+        empty_msg = "none")
+
+    println(io, "<h2>Top cluster transitions</h2>")
+    _html_table(io, ["from", "to", "count"], b["transitions"],
+        r -> (r.from, r.to, r.n); empty_msg = "none")
+
+    println(io, "<h2>Episodes</h2>")
+    _html_table(io, ["pattern", "support"], b["episodes"],
+        r -> (join(r.pattern, ", "), r.support); empty_msg = "no episodes mined")
+
+    println(io, "<h2>Pinned-pattern activity</h2>")
+    _html_table(io, ["pattern", "severity", "matches"], b["pinned"],
+        r -> (r.name, r.severity, r.n); empty_msg = "no patterns pinned")
+
+    println(io, "<h2>Embedding scatter (UMAP)</h2>")
+    _html_scatter(io, get(b, "scatter", NamedTuple[]))
+
+    println(io, "<footer>Generated by <code>logcluster report --format html</code></footer>")
+    println(io, "</body></html>")
+    return String(take!(io))
+end
+
 function _print_report_help()
     println("""
     usage: logcluster report --memory PATH [--since 24h] [--until ISO]
-                             [--format md|json] [--topk 10]
+                             [--format md|json|html] [--out FILE] [--topk 10]
                              [--min-sup 3] [--max-gap 20] [--max-dur 50]
 
-    Bundled report (Markdown by default, JSON with --format json)
-    over the past window. Sections: top rules, novel templates, top
-    cluster transitions, mined episodes, pinned-pattern activity.
+    Bundled report over the past window. Sections: top rules, novel
+    templates, top cluster transitions, mined episodes, pinned-pattern
+    activity.
+
+      --format md    (default) Markdown to stdout.
+      --format json  the raw insight bundle as one JSON object.
+      --format html  a self-contained HTML page (inline CSS + SVG, no
+                     external requests) adding an all-rules trigger
+                     timeline and the UMAP embedding scatter (when
+                     `stream --persist-embeddings` fed it). Written to
+                     --out (default stdout).
 
     Drop into a runbook with:
       logcluster report --since 24h --memory /var/lib/logcluster/triggers.sqlite \\

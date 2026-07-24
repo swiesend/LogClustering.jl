@@ -30,7 +30,7 @@ using SQLite: DB
 
 export top_rules_window, novel_clusters_window, burstiness,
        cluster_view, transitions, episodes, pinned_summary,
-       embedding_scatter
+       embedding_scatter, trigger_timeline
 
 # ---------------------------------------------------------------------------
 # Top rules.
@@ -219,6 +219,32 @@ function pinned_summary(db::DB;
         ORDER BY n DESC
         """,
         (Int(since), until_ms))
+end
+
+# ---------------------------------------------------------------------------
+# Overall trigger timeline (all rules), bucketed.
+# ---------------------------------------------------------------------------
+
+"""
+    trigger_timeline(db; since, until = nothing, bucket_s = 3600) -> Vector{NT}
+
+Bucketed count of *all* triggers over `[since, until]`. Each row:
+`(bucket_start_ms, n)`. Feeds the HTML report's timeline bar chart.
+"""
+function trigger_timeline(db::DB;
+                          since::Integer,
+                          until::Union{Nothing, Integer} = nothing,
+                          bucket_s::Real = 3600)
+    until_ms = until === nothing ? typemax(Int) : Int(until)
+    bucket_ms = max(1, Int(round(bucket_s * 1000)))
+    return _rows(db, """
+        SELECT (ts_epoch_ms / ?) * ? AS bucket_start_ms, COUNT(*) AS n
+        FROM triggers
+        WHERE ts_epoch_ms >= ? AND ts_epoch_ms <= ?
+        GROUP BY bucket_start_ms
+        ORDER BY bucket_start_ms ASC
+        """,
+        (bucket_ms, bucket_ms, Int(since), until_ms))
 end
 
 # ---------------------------------------------------------------------------
