@@ -5,11 +5,19 @@ using LogClustering.Rust: Span
 
 # Skip the entire file gracefully when the Rust library was not built
 # (e.g. `cargo` missing at `Pkg.build` time on the developer's machine).
+# When a library IS present but its ABI doesn't match, fail loudly and
+# DON'T run the layout-dependent FFI tests below — a stale .so with a
+# different struct layout would risk a segfault, not a clean failure.
 if Rust.abi_version() == 0
     @warn "logclustering_rs not built; skipping Rust tests. \
            Install Rust and `Pkg.build(\"LogClustering\")` to enable."
     @testset "Rust (skipped — library not built)" begin
         @test_skip Rust.abi_version() == Rust.ABI_VERSION
+    end
+elseif Rust.abi_version() != Rust.ABI_VERSION
+    @error "logclustering_rs ABI mismatch (got $(Rust.abi_version()), expected $(Rust.ABI_VERSION)) — rebuild with Pkg.build; skipping FFI tests to avoid a stale-layout crash."
+    @testset "Rust FFI (skipped — ABI mismatch)" begin
+        @test Rust.abi_version() == Rust.ABI_VERSION   # fails loudly, no ccalls
     end
 else
 

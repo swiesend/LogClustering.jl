@@ -50,6 +50,7 @@ function _find_library()
 end
 
 const LIB_REF = Ref{String}("")
+const _ABI_OK = Ref{Bool}(false)
 
 function _lib()
     isempty(LIB_REF[]) && (LIB_REF[] = _find_library())
@@ -58,6 +59,20 @@ function _lib()
         "logclustering_rs is not built. Install Rust (https://rustup.rs) and " *
         "run `using Pkg; Pkg.build(\"LogClustering\")`.",
     )
+    # Guard every FFI entry against a stale / mismatched library: the
+    # struct layouts below are hardcoded per ABI, so calling into a .so
+    # built from a different `rust/src` risks memory corruption. Verify
+    # once (cached) and fail loudly with a rebuild hint instead.
+    if !_ABI_OK[]
+        got = abi_version()
+        got == EXPECTED_ABI_VERSION || error(
+            "logclustering_rs ABI mismatch: the built library advertises " *
+            "$(got) but this code expects $(EXPECTED_ABI_VERSION). The " *
+            "`rust/` crate changed without a rebuild — run " *
+            "`using Pkg; Pkg.build(\"LogClustering\")` to refresh the " *
+            "library before using the FFI.")
+        _ABI_OK[] = true
+    end
     return path
 end
 
