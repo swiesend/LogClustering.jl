@@ -87,4 +87,23 @@ _exact_q(v, q) = (s = sort(v); s[clamp(ceil(Int, q * length(s)), 1, length(s))])
         @test length(d.centroids) <= 300
     end
 
+    @testset "warm quantile is allocation-free (no sort-per-fire)" begin
+        # The P1 point: auto:* thresholds used to `sort` the whole
+        # reservoir on every rule fire (O(n) allocation). A t-digest
+        # quantile is a scalar walk over the bounded centroid list — once
+        # the buffer is flushed, it allocates nothing.
+        d = TDigest(; compression = 100.0)
+        reservoir = Float64[]
+        for i in 1:20_000
+            x = Float64(i % 1000)
+            push!(d, x); Base.push!(reservoir, x)
+        end
+        quantile(d, 0.99)                       # warm: flush the buffer once
+        a_digest = @allocated quantile(d, 0.99)
+        a_sort   = @allocated sort(reservoir)   # the old per-fire cost
+        @test a_digest < 512                    # scalar walk — no O(n) copy
+        @test a_sort > 50_000                   # 20k Float64 sort copies ~160 KB
+        @test a_digest < a_sort ÷ 50            # orders of magnitude cheaper
+    end
+
 end
