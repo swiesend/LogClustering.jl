@@ -1,0 +1,20 @@
+# Avoid shipping build artifacts, caches, and large test fixtures
+# into the Docker build context.
+.git
+.git*
+.github
+.julia
+.CondaPkg
+.idea
+.vscode
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+benchmarks/loghub2/data
+docs/build
+docs/Manifest.toml
+py/.venv
+rust/target
+test/.coverage
+**/.DS_Store
+node_modules

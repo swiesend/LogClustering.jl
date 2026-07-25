@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+#
+# Shell shim for LogClustering.CLI.main(ARGS). Invokes julia with the
+# repo's project; see `logcluster --help` for subcommands.
+#
+# Resolves the project root from this script's location so the shim
+# works whether you call it via an absolute path, `./bin/logcluster`,
+# or a PATH-linked symlink. Honours $JULIA_SYSIMAGE_PATH so the
+# Dockerfile / systemd unit use the baked LogClustering.so image
+# automatically.
+
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PROJECT="${LOGCLUSTERING_PROJECT:-$HERE/..}"
+
+SYSIMG_FLAG=""
+if [ -n "${JULIA_SYSIMAGE_PATH:-}" ] && [ -f "$JULIA_SYSIMAGE_PATH" ]; then
+    SYSIMG_FLAG="--sysimage=$JULIA_SYSIMAGE_PATH"
+fi
+
+exec julia --startup-file=no --project="$PROJECT" $SYSIMG_FLAG -e '
+using LogClustering
+exit(LogClustering.CLI.main(ARGS))
+' -- "$@"

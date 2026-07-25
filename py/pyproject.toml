@@ -1,0 +1,28 @@
+[project]
+name = "logclustering-py"
+version = "0.1.0"
+description = "Python companion for LogClustering.jl: locally-loaded HuggingFace pieces (embedders, UMAP-learn, HDBSCAN, LogPPT). No cloud-API dependency."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "torch>=2.2",
+    "transformers>=4.40",
+    "sentence-transformers>=3.0",
+    "umap-learn>=0.5.5",
+    "hdbscan>=0.8.33",
+    "scikit-learn>=1.4",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["logclustering_py"]

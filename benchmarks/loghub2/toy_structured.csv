@@ -1,0 +1,7 @@
+LineId,Content,EventId,EventTemplate
+1,INFO started pid 1001,E1,INFO started pid <*>
+2,INFO started pid 1002,E1,INFO started pid <*>
+3,ERROR connection refused from 10.0.0.1,E2,ERROR connection refused from <*>
+4,ERROR connection refused from 10.0.0.2,E2,ERROR connection refused from <*>
+5,INFO service ready on port 8080,E3,INFO service ready on port <*>
+6,INFO service ready on port 9090,E3,INFO service ready on port <*>

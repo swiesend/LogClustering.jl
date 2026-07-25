@@ -1,0 +1,97 @@
+{
+  "version": 1,
+  "defaults": {
+    "severity": "warn",
+    "cooldown_s": 60,
+    "warmup_required": true
+  },
+  "rules": [
+    {
+      "id": "novel_template",
+      "kind": "novel_cluster",
+      "model": "drain",
+      "severity": "warn",
+      "cooldown_s": 120
+    },
+    {
+      "id": "high_nll",
+      "kind": "score_threshold",
+      "metric": "transformer_decoder.nll",
+      "comparison": ">",
+      "value": "auto:p995",
+      "severity": "warn",
+      "cooldown_s": 30
+    },
+    {
+      "id": "error_rate_spike",
+      "kind": "rate_spike",
+      "match": {
+        "kind": "regex",
+        "field": "line",
+        "pattern": "(?i)\\b(error|fail|failed|panic|exception|denied|refused|timeout)\\b"
+      },
+      "window_s": 60,
+      "min_count": 20,
+      "baseline_multiplier": 4.0,
+      "severity": "crit",
+      "cooldown_s": 120
+    },
+    {
+      "id": "volume_anomaly",
+      "kind": "volume_anomaly",
+      "window_s": 60,
+      "baseline_multiplier": 5.0,
+      "severity": "warn",
+      "cooldown_s": 120
+    },
+    {
+      "id": "fatal_keywords",
+      "kind": "keyword",
+      "field": "line",
+      "keywords": ["FATAL", "PANIC", "OOM", "segfault", "kernel panic", "core dumped"],
+      "case_sensitive": false,
+      "severity": "crit",
+      "cooldown_s": 10,
+      "warmup_required": false
+    },
+    {
+      "id": "oom_killer",
+      "kind": "regex",
+      "field": "line",
+      "pattern": "kernel:.*Out of memory.*Killed process",
+      "severity": "crit",
+      "cooldown_s": 10,
+      "warmup_required": false
+    },
+    {
+      "id": "value_novelty",
+      "kind": "score_threshold",
+      "metric": "novelty.value_novelty",
+      "comparison": ">",
+      "value": "auto:zscore:3",
+      "severity": "warn",
+      "cooldown_s": 60
+    }
+  ],
+  "routes": [
+    { "match": { "severity": ["warn", "crit"] }, "sinks": ["stdout"] },
+    { "match": { "severity": ["crit"] },         "sinks": ["webhook:alertmanager", "webhook:slack"] }
+  ],
+  "sinks": {
+    "webhook:alertmanager": {
+      "url": "${env:ALERTMANAGER_URL}",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer ${env:ALERTMANAGER_TOKEN}"
+      },
+      "format": "alertmanager"
+    },
+    "webhook:slack": {
+      "url": "${env:SLACK_WEBHOOK_URL}",
+      "method": "POST",
+      "headers": { "Content-Type": "application/json" },
+      "format": "slack"
+    }
+  }
+}

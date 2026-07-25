@@ -1,0 +1,18 @@
+[package]
+name = "logclustering_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Performance-critical kernels for LogClustering.jl (parsers, log-key regex inference)"
+publish = false
+
+[lib]
+name = "logclustering_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

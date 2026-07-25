@@ -1,0 +1,47 @@
+# LogClustering — example compose file.
+#
+# Tails a bind-mounted log file, applies the production rule bundle,
+# and ships JSON-line triggers to stdout (which Docker forwards to
+# whatever logging driver is configured). Replace the bind mounts with
+# your own paths.
+
+services:
+  logcluster:
+    image: ghcr.io/swiesend/logclustering:0.2.0
+    # build:
+    #   context: ..
+    #   dockerfile: deploy/Dockerfile
+    container_name: logcluster
+    restart: unless-stopped
+    # --tail is a boolean flag; the file goes to --data. (Passing the
+    # path to --tail would coerce the bool to false and read stdin.)
+    command:
+      - stream
+      - --model=/etc/logcluster/models/transformer-decoder.jld2
+      - --detector=/etc/logcluster/models/value-novelty.jld2
+      - --rules=/etc/logcluster/rules.json
+      - --data=/var/log/host/syslog
+      - --tail
+      - --framed=auto
+      - --status-interval=30
+      - --log-format=json
+    # Send SIGINT on `docker stop` so the stream subcommand drains its
+    # channels and finalizes the session before exiting.
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+    environment:
+      ALERTMANAGER_URL: "http://alertmanager:9093/api/v2/alerts"
+      ALERTMANAGER_TOKEN: "${ALERTMANAGER_TOKEN:-}"
+      SLACK_WEBHOOK_URL:  "${SLACK_WEBHOOK_URL:-}"
+    volumes:
+      - /var/log:/var/log/host:ro
+      - ./models:/etc/logcluster/models:ro
+      - ./rules.json:/etc/logcluster/rules.json:ro
+    # The container writes JSON-line triggers on stdout; configure your
+    # log driver / collector (vector / fluent-bit / Loki promtail) to
+    # consume the container's stdout.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
