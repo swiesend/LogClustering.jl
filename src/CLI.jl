@@ -1477,6 +1477,7 @@ struct StreamInferer
     rrcf::Any                  # ::Union{Nothing, RRCF.RCForest} — model-free anomaly
     seq_hist::Vector{Int}      # rolling template-id window (template-id decoder only)
     embed_lines::Bool          # persist per-line transformer-encoder embeddings
+    embed_artifact::Any        # encoder bundle used for embeddings (main model or --embed-model)
 end
 
 # A template-id decoder's per-line NLL depends on the *preceding*
@@ -1544,6 +1545,7 @@ function cmd_stream(args::Vector{String})::Int
         ("persist-lines",      "none", :string),     # none | sampled | all
         ("persist-lines-rate", 100,    :int),        # 1-in-N sampling rate
         ("persist-embeddings", false,  :bool),       # store encoder vectors on lines
+        ("embed-model",        "",     :path),       # dedicated encoder for embeddings
         ("memory-warm",        "",     :string),     # redis://... | inproc | ""
         ("memory-warm-namespace", "",  :string),     # override the auto namespace
         ("memory-warm-flush-on-boot", false, :bool),
@@ -2163,17 +2165,29 @@ function _build_inferer(opts, framed_mode::Symbol)::StreamInferer
             rebuild_every = Int(get(opts, "rrcf-size", 256)))
     end
     # Persist per-line transformer-encoder embeddings for offline
-    # `insights embedding_scatter`. Only a transformer_encoder bundle
-    # produces the vector; warn (and stay inert) otherwise.
-    embed_lines = get(opts, "persist-embeddings", false) == true
-    if embed_lines && bundle_kind !== :transformer_encoder
-        StructuredLog.warn("persist-embeddings ignored";
-            reason = "requires a transformer_encoder --model",
-            model_kind = bundle_kind === nothing ? "none" : String(bundle_kind))
-        embed_lines = false
+    # `insights embedding_scatter`. The vector comes from a dedicated
+    # `--embed-model` encoder when supplied (so a drain/decoder stream can
+    # still persist embeddings), else from the main `--model` when it is
+    # itself an encoder. Warn + stay inert when neither is available.
+    embed_artifact = nothing
+    if get(opts, "persist-embeddings", false) == true
+        em = String(get(opts, "embed-model", ""))
+        if !isempty(em)
+            eb = Persistence.load(em)
+            eb.kind === :transformer_encoder ||
+                throw(ArgumentError(
+                    "--embed-model must be a transformer_encoder bundle; got $(eb.kind)"))
+            embed_artifact = Persistence.rehydrate(eb)
+        elseif bundle_kind === :transformer_encoder
+            embed_artifact = artifact
+        else
+            StructuredLog.warn("persist-embeddings ignored";
+                reason = "needs a transformer_encoder --model or --embed-model",
+                model_kind = bundle_kind === nothing ? "none" : String(bundle_kind))
+        end
     end
     return StreamInferer(bundle_kind, artifact, det, framed_mode, memo,
-                         forest, Int[], embed_lines)
+                         forest, Int[], embed_artifact !== nothing, embed_artifact)
 end
 
 """
@@ -2241,11 +2255,12 @@ function _infer_cheap(inf::StreamInferer, ev::Stream.LineEvent)
     end
 
     # Per-line transformer-encoder embedding for offline scatter plots
-    # (persisted on the line row when --persist-lines is on).
+    # (persisted on the line row when --persist-lines is on). Sourced from
+    # inf.embed_artifact — the main model or a dedicated --embed-model.
     if inf.embed_lines
-        S, _ = _featurize(inf.artifact, [body], EMPTY_OPTS, 64)
-        Z = embed_sequences(inf.artifact.model, inf.artifact.ps,
-                            inf.artifact.st, S)         # (d_model, 1)
+        ea = inf.embed_artifact
+        S, _ = _featurize(ea, [body], EMPTY_OPTS, 64)
+        Z = embed_sequences(ea.model, ea.ps, ea.st, S)  # (d_model, 1)
         ir["embedding"] = Float32.(vec(Z))
     end
     return ir, needs_nll, body
@@ -2571,10 +2586,15 @@ function _print_stream_help()
                             100) full line records so `insights
                             --episodes` has a cluster-id stream to mine.
       --persist-embeddings  store each persisted line's transformer-
-                            encoder vector (needs a transformer_encoder
-                            --model + --persist-lines). Feeds the offline
+                            encoder vector (needs --persist-lines + an
+                            encoder source: either the --model, or a
+                            dedicated --embed-model). Feeds the offline
                             `Insights.embedding_scatter` UMAP view. Off
-                            by default; inert with any other model kind.
+                            by default; inert without an encoder source.
+      --embed-model PATH    a transformer_encoder bundle used ONLY to
+                            produce --persist-embeddings vectors, so a
+                            drain / decoder --model stream can still
+                            persist embeddings.
 
     Performance:
       --dedup MODE          off (default) | masked. `masked` memoizes

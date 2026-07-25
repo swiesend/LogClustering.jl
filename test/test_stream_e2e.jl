@@ -366,6 +366,53 @@ end
         @test Int(ev["dropped"]["webhook"]) == 7
     end
 
+    @testset "--embed-model lets a drain stream persist encoder embeddings" begin
+        mktempdir() do dir
+            data = _write_lines(vcat(["INFO request $i ok" for i in 1:60],
+                                     ["WARN retry $i backoff" for i in 1:60]))
+            drain = joinpath(dir, "drn.jld2")
+            enc   = joinpath(dir, "enc.jld2")
+            @test CLI.cmd_train(String["--kind", "drain", "--data", data,
+                "--out", drain, "--quiet"]) == 0
+            @test CLI.cmd_train(String["--kind", "transformer_encoder",
+                "--data", data, "--out", enc, "--seqlen", "8", "--d-model", "32",
+                "--n-layers", "2", "--n-heads", "4", "--epochs", "2",
+                "--batch", "32", "--quiet"]) == 0
+            db = joinpath(dir, "m.sqlite")
+            # Drain main model (produces cluster ids, no embeddings of its
+            # own) + a dedicated encoder feeding --persist-embeddings.
+            rc = CLI.cmd_stream(String["--model", drain, "--embed-model", enc,
+                "--data", data, "--memory", db, "--persist-lines", "all",
+                "--persist-embeddings", "--max-events", "120", "--quiet",
+                "--warmup-lines", "0", "--status-interval", "0"])
+            @test rc == 0
+            conn = LogClustering.Memory.SQLite.open_db(db)
+            LogClustering.Memory.SQLite.migrate!(conn)
+            rows = LogClustering.Memory.SQLite.lines_with_embeddings(conn; since = 0)
+            @test length(rows) == 120
+            @test length(rows[1].embedding) == 32       # d_model
+            @test all(r -> length(r.embedding) == 32, rows)
+            # drain still tagged clusters on those rows
+            @test any(r -> r.drain_cluster_id !== nothing, rows)
+        end
+    end
+
+    @testset "--embed-model rejects a non-encoder bundle" begin
+        mktempdir() do dir
+            data = _write_lines(["INFO a", "INFO b", "INFO c"])
+            drain = joinpath(dir, "drn.jld2")
+            @test CLI.cmd_train(String["--kind", "drain", "--data", data,
+                "--out", drain, "--quiet"]) == 0
+            # A drain bundle as --embed-model is a config error → exit 2.
+            r = _e2e_capture(() -> CLI.main(["stream", "--model", drain,
+                "--embed-model", drain, "--data", data, "--persist-lines", "all",
+                "--persist-embeddings", "--max-events", "3", "--quiet",
+                "--warmup-lines", "0", "--status-interval", "0"]))
+            @test r.code == 2
+            @test occursin("embed-model", r.err)
+        end
+    end
+
     @testset "rules --tune freezes an auto:p99 threshold to a number" begin
         mktempdir() do dir
             data = _write_lines(vcat(["INFO request $i ok" for i in 1:80],
