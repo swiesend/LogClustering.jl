@@ -1,6 +1,17 @@
 using Test
 using LogClustering
 
+# When the uv virtualenv under `py/.venv` is present, point PythonCall at
+# it before any test loads PythonCall, so the Python-backed analytics
+# tests (UMAP/HDBSCAN) run for real instead of skip-guarding. Harmless
+# when the venv is absent (the vars stay unset and those tests skip).
+let venv = abspath(joinpath(@__DIR__, "..", "py", ".venv", "bin", "python"))
+    if isfile(venv)
+        get!(ENV, "JULIA_CONDAPKG_BACKEND", "Null")
+        get!(ENV, "JULIA_PYTHONCALL_EXE", venv)
+    end
+end
+
 @testset "LogClustering.jl" begin
     include("test_KATE.jl")
     include("test_deepkate.jl")
@@ -22,6 +33,7 @@ using LogClustering
     include("test_compression.jl")
     include("test_cv.jl")
     include("test_cluster.jl")
+    include("test_python_analytics.jl")
     include("test_drain.jl")
     include("test_template_ids.jl")
     include("test_canonical.jl")

@@ -3975,6 +3975,28 @@ function cmd_doctor(args::Vector{String})::Int
         end
     end
 
+    # Python analytics venv (offline UMAP/HDBSCAN — rca --cluster hdbscan,
+    # insights embedding_scatter, report --format html scatter). Probe the
+    # venv interpreter directly so we never load PythonCall into doctor.
+    let venv = abspath(joinpath(@__DIR__, "..", "py", ".venv", "bin", "python"))
+        if !isfile(venv)
+            add!("python", :warn,
+                 "no py/.venv (offline UMAP/HDBSCAN unavailable; " *
+                 "`cd py && uv sync` to enable)")
+        else
+            ok = try
+                success(pipeline(`$venv -c "import umap, hdbscan, sklearn"`;
+                                 stdout = devnull, stderr = devnull))
+            catch
+                false
+            end
+            ok ? add!("python", :ok, "$venv (umap + hdbscan importable)") :
+                 add!("python", :fail,
+                      "$venv present but umap/hdbscan not importable " *
+                      "(`cd py && uv sync`)")
+        end
+    end
+
     if opts["json"]
         out = Any[]
         for (label, status, detail) in findings
@@ -4001,9 +4023,11 @@ function _print_doctor_help()
                              [--model PATH] [--json]
 
     Lightweight diagnostic: confirms the config file parses, the
-    SQLite store opens + is migrated to head, the rules file
-    validates, the model bundle loads, and (when supplied) Redis is
-    reachable. Exits 0 when nothing is broken, 3 otherwise.
+    SQLite store opens + is migrated to head (with row counts + last
+    session exit), the rules file validates, the model bundle loads,
+    (when supplied) Redis is reachable, and the py/.venv analytics
+    interpreter can import umap + hdbscan. Exits 0 when nothing is
+    broken, 3 otherwise.
     """)
 end
 

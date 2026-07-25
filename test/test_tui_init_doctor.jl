@@ -246,6 +246,11 @@ end
                          if String(f["status"]) == "ok"]
             @test "memory" in ok_labels
             @test "rules"  in ok_labels
+            # doctor always reports the python-analytics venv status
+            # (ok when py/.venv imports umap+hdbscan, warn when absent).
+            py = findings[findall(f -> String(f["label"]) == "python", findings)]
+            @test length(py) == 1
+            @test String(py[1]["status"]) in ("ok", "warn")
         finally
             old_data === nothing ? delete!(ENV, "XDG_DATA_HOME") :
                                     (ENV["XDG_DATA_HOME"] = old_data)

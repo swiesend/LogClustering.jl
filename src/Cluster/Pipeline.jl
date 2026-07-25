@@ -156,18 +156,27 @@ function umap_reduce(X::AbstractMatrix;
     size(X, 2) >= n_neighbors ||
         throw(ArgumentError("need at least n_neighbors=$(n_neighbors) samples; \
                              got $(size(X, 2))"))
-
+    # PythonCall is loaded lazily via `Base.require`, so its methods live
+    # in a newer world than this (precompiled) function. Load it FIRST
+    # (so the require's world bump lands before the call below), then run
+    # the Python work through `invokelatest` so those just-loaded methods
+    # are visible — without this, the first UMAP call inside a single call
+    # frame (e.g. the CLI's `main → cmd_rca → umap_reduce`) throws a
+    # world-age MethodError.
     py = _require_pythoncall()
-    umap_mod = _pyimport(py, "umap", "cd py && uv add umap-learn && uv sync")
+    return Base.invokelatest(_umap_reduce_impl, py, X, Int(n_neighbors),
+                             Float64(min_dist), Int(n_components),
+                             String(metric), random_state)
+end
 
-    kwargs = (n_neighbors = Int(n_neighbors),
-              min_dist    = Float64(min_dist),
-              n_components = Int(n_components),
-              metric      = String(metric))
+function _umap_reduce_impl(py, X, n_neighbors, min_dist, n_components,
+                           metric, random_state)
+    umap_mod = _pyimport(py, "umap", "cd py && uv add umap-learn && uv sync")
+    kwargs = (n_neighbors = n_neighbors, min_dist = min_dist,
+              n_components = n_components, metric = metric)
     reducer = random_state === nothing ?
         umap_mod.UMAP(; kwargs...) :
         umap_mod.UMAP(; kwargs..., random_state = Int(random_state))
-
     # umap-learn expects (samples, features); Julia is (features, samples).
     Xt = collect(permutedims(X))
     Y_py = reducer.fit_transform(Xt)
@@ -190,15 +199,22 @@ the per-sample outlier scores.
 function hdbscan_cluster(X::AbstractMatrix;
                          min_cluster_size::Integer = 10,
                          metric::AbstractString = "euclidean")
+    # See `umap_reduce`: load PythonCall first, then run the Python work
+    # through `invokelatest` so the just-required methods are visible.
     py = _require_pythoncall()
+    return Base.invokelatest(_hdbscan_cluster_impl, py, X,
+                             Int(min_cluster_size), String(metric))
+end
+
+function _hdbscan_cluster_impl(py, X, min_cluster_size, metric)
     hdb = _pyimport(py, "hdbscan", "cd py && uv add hdbscan && uv sync")
     clusterer = hdb.HDBSCAN(
-        min_cluster_size = Int(min_cluster_size),
-        metric = String(metric),
+        min_cluster_size = min_cluster_size,
+        metric = metric,
     )
     Xt = collect(permutedims(X))
     labels_py = clusterer.fit_predict(Xt)
-    labels = py.pyconvert(Vector{Int}, labels_py) .+ 1         # 0→noise→0 after shift? fix below
+    labels = py.pyconvert(Vector{Int}, labels_py) .+ 1
     # HDBSCAN uses -1 for noise; after +1 it becomes 0 — that's our noise tag.
     outlier = py.pyconvert(Vector{Float64}, clusterer.outlier_scores_)
     return (assignments = labels, outlier_scores = outlier)
